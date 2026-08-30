@@ -1,0 +1,48 @@
+# Vendored from crates.io: web-transport-quinn 0.12.1
+# (https://github.com/moq-dev/web-transport), for one reason: the
+# published crate does not build on wasm32-wasip2. The upstream manifest
+# unconditionally pulls rustls-native-certs (no OS trust store on wasi),
+# tokio's `net` feature via quinn/runtime-tokio (excluded on wasm), and
+# quinn's platform-verifier feature (same problem). Here those are
+# target-scoped to non-wasi builds; the source changes are the matching
+# cfg guards in src/client.rs, each marked `ffrwd patch`. Everything
+# else is upstream, byte for byte. Retire this copy when upstream
+# builds for wasip2.
+
+[package]
+name = "web-transport-quinn"
+version = "0.12.1"
+edition = "2021"
+description = "WebTransport library for Quinn (ffrwd wasip2 vendor)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/moq-dev/web-transport"
+
+[features]
+default = ["aws-lc-rs"]
+aws-lc-rs = ["quinn/rustls-aws-lc-rs", "rustls/aws-lc-rs"]
+ring = ["quinn/rustls-ring", "rustls/ring"]
+qlog = ["quinn/qlog"]
+
+[dependencies]
+bytes = "1"
+futures = "0.3"
+http = "1"
+kio = "0.5.4"
+# ffrwd patch: platform-verifier and runtime-tokio move to the non-wasi
+# dependency block below; "rt" is spelled out because tokio::spawn was
+# previously reached through quinn/runtime-tokio's feature unification.
+quinn = { version = "0.11", default-features = false, features = ["bloom"] }
+rustls = { version = "0.23", default-features = false, features = ["logging", "std"] }
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "rt", "time"] }
+tracing = "0.1"
+url = "2"
+web-transport-proto = "0.6"
+web-transport-trait = "0.4"
+
+# ffrwd patch: native-only dependencies. wasi has no OS cert store and
+# tokio's net module does not exist on wasm targets.
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
+quinn = { version = "0.11", default-features = false, features = ["platform-verifier", "runtime-tokio", "bloom"] }
+rustls-native-certs = "0.8"
+tokio = { version = "1", default-features = false, features = ["net"] }

@@ -1,0 +1,18 @@
+[package]
+name = "publish"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "publish"
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.57.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+bytes = "1"
+moq-core = { path = "../core" }
+moq-net = "0.2.15"
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "log"] }
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "time", "macros"] }

@@ -1,0 +1,14 @@
+# Build output. The module the lib SQL names is pulled back in by the
+# manifest's closure; the rest of the directory stays out of the archive.
+target/
+
+# The wit build.rs copies in, which is the sidecar's own.
+publish/wit/
+
+# The live-loop harness: receiver guest, certgen, their build state. The
+# loop runs from a checkout, never from an installed package.
+harness/
+tests/
+
+# Local development state, not package content.
+ffrwd.lock

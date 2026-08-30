@@ -1,0 +1,3 @@
+# The wit comes from the installed ffrwd/wasm package: the module's
+# build.rs asks `ffrwd path ffrwd/wasm` for it, so run
+# `ffrwd install -g ffrwd/wasm` once before building.

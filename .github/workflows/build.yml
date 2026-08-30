@@ -1,0 +1,33 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+      # ring's C sources build with wasi-sdk's clang.
+      - name: Fetch wasi-sdk
+        run: |
+          curl -fsSL -o /tmp/wasi-sdk.tar.gz \
+            https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz
+          tar -xzf /tmp/wasi-sdk.tar.gz -C /opt
+          echo "CC_wasm32_wasip2=/opt/wasi-sdk-34.0-x86_64-linux/bin/clang" >> "$GITHUB_ENV"
+          echo "AR_wasm32_wasip2=/opt/wasi-sdk-34.0-x86_64-linux/bin/llvm-ar" >> "$GITHUB_ENV"
+      - name: Install ffrwd and the wit package
+        run: |
+          pip install ffrwd
+          ffrwd install -g ffrwd/wasm
+      - name: Build the module
+        run: cargo build --target wasm32-wasip2 --release
+      - name: Unit tests
+        run: cargo test --release

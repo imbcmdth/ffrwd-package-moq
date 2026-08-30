@@ -1,0 +1,27 @@
+[package]
+name = "quinn-wasi"
+version = "0.1.0"
+edition = "2021"
+description = "quinn's pluggable I/O floor on wasm32-wasip2: wasi:sockets UDP + tokio current-thread"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# Only the Runtime/AsyncUdpSocket seam and the udp types; no crypto here.
+quinn = { version = "0.11", default-features = false }
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "time"] }
+wasi = "0.14"
+pin-project-lite = "0.2"
+
+[dev-dependencies]
+# The echo test's native side: a real quinn endpoint on the host.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+rcgen = "0.11"
+rustls-pki-types = "1"
+
+[workspace]
+
+# quinn-udp 0.5.15 does not build for wasm32-wasip2; ../quinn-udp is
+# the release with the two-line fallback.rs fix. See the comment there.
+[patch.crates-io]
+quinn-udp = { path = "../quinn-udp" }

@@ -1,0 +1,13 @@
+# The live test's certificate helper, native: writes a fresh
+# self-signed localhost certificate for the relay and prints its DER as
+# hex for the guests to trust explicitly. Its own workspace, so a
+# workspace-wide wasm build never sweeps a native-only tool in.
+[package]
+name = "certgen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rcgen = "0.11"
+
+[workspace]
