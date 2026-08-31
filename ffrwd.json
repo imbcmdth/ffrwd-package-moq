@@ -1,8 +1,9 @@
 {
   "name": "ffrwd/moq",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Live publishing over Media over QUIC, hosted in wasm: COPY a query's video stream TO a relay broadcast. The module packages the encoded stream as fragmented MP4 - init segment on its own track, one fragment per group of pictures - and publishes it over raw QUIC, one MoQ group per keyframe.",
   "license": "Apache-2.0",
+  "homepage": "https://github.com/imbcmdth/ffrwd-package-moq",
   "capabilities": [
     "udp",
     "http"
