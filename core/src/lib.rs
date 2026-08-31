@@ -14,8 +14,11 @@
 //!   muxer and ffmpeg each wrote.
 //! - [`wasi::connect`] (wasm32-wasip2 only) dials a relay over
 //!   quinn-wasi and hands back a raw-QUIC MoQ session.
+//! - [`dns`] is the wire codec under the module's DNS-over-HTTPS
+//!   relay lookup: encode a question, read the answer's addresses.
 
 pub mod avc;
+pub mod dns;
 pub mod fmp4;
 pub mod mux;
 pub mod subscribe;

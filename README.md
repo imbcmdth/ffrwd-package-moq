@@ -25,9 +25,12 @@ subscription starts at the latest group, so anything sent earlier
 would never be seen. A run with nobody watching waits at the first
 packet.
 
-The relay's host is an IP literal: the module runs under a UDP grant
-alone, with no name lookup. A private relay's certificate travels as
-the `cert` argument, DER as hex - a public value, not a secret; left
+The relay's host is a name or an IP literal. The runner links no name
+lookup, so a name is resolved over DNS-over-HTTPS against 1.1.1.1,
+then 8.8.8.8 - both pinned by IP in the module - and every address
+the answer carries is tried in turn. A private relay's certificate
+travels as the `cert` argument, DER as hex - a public value, not a
+secret; left
 empty, the webpki roots baked into the module decide, which is what a
 public relay's certificate chains to. One row leaves per published
 group - packets, bytes, pts range - and a summary follows the last.

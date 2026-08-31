@@ -785,6 +785,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "wasi 0.14.7+wasi-0.2.4",
  "wit-bindgen",
 ]
 

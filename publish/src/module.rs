@@ -4,7 +4,7 @@ wit_bindgen::generate!({
 });
 
 use std::cell::RefCell;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -13,7 +13,7 @@ use exports::ffrwd::av::packet_sink::{
 };
 use serde::{Deserialize, Serialize};
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://203.0.113.7:4443 - the host by IP"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"track":{"type":"string","default":"video","description":"media track name; the init segment rides <track>.init"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"track":{"type":"string","default":"video","description":"media track name; the init segment rides <track>.init"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
 
 /// One schema covers both row shapes: a group row carries `group`, the
 /// trailing summary carries `groups`, and each leaves the other's
@@ -107,11 +107,11 @@ fn parse_params(params: &str) -> Result<Params, String> {
 	serde_json::from_str(params).map_err(|err| format!("params: {err}"))
 }
 
-/// The relay URL taken apart: UDP address and TLS server name. The
-/// scheme is decorative; the host must resolve where the runner grants
-/// UDP alone, so an IP literal always works and a name only where the
-/// runner can look it up.
-fn resolve_relay(url: &str) -> Result<(SocketAddr, String), String> {
+/// The relay URL taken apart: host and port. The scheme is
+/// decorative. An IP-literal host is dialed as written; a name goes
+/// through the DNS-over-HTTPS lookup in [`crate::doh`], since the
+/// runner grants UDP and outgoing HTTP but no name lookup.
+fn parse_relay(url: &str) -> Result<(String, u16), String> {
 	let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
 	let rest = rest.split(['/', '?']).next().unwrap_or(rest);
 	let (host, port) = match rest.rsplit_once(':') {
@@ -127,20 +127,7 @@ fn resolve_relay(url: &str) -> Result<(SocketAddr, String), String> {
 	if host.is_empty() {
 		return Err(format!("relay '{url}' names no host"));
 	}
-	if let Ok(ip) = host.parse::<IpAddr>() {
-		return Ok((SocketAddr::new(ip, port), host.to_string()));
-	}
-	let resolved = (host, port)
-		.to_socket_addrs()
-		.map_err(|err| {
-			format!(
-				"relay '{url}': could not resolve '{host}' ({err}); name the relay by IP - \
-				 the runner grants UDP alone, not name lookup"
-			)
-		})?
-		.next()
-		.ok_or_else(|| format!("relay '{url}': '{host}' resolved to no address"))?;
-	Ok((resolved, host.to_string()))
+	Ok((host.to_string(), port))
 }
 
 fn unhex(hex: &str) -> Result<Vec<u8>, String> {
@@ -291,7 +278,7 @@ impl Guest for Publish {
 		PacketSinkMeta {
 			meta: Meta {
 				name: "publish".to_string(),
-				version: "0.1.0".to_string(),
+				version: "0.2.0".to_string(),
 				params_schema: PARAMS_SCHEMA.to_string(),
 				rows_schema: ROWS_SCHEMA.to_string(),
 				// No decoded payload ever arrives, so no format list fills in.
@@ -325,7 +312,13 @@ impl Guest for Publish {
 			coded_stream.time_base.num,
 			coded_stream.time_base.den,
 		)?;
-		let (addr, server_name) = resolve_relay(&params.relay)?;
+		let (host, port) = parse_relay(&params.relay)?;
+		let literal: Option<IpAddr> = host.parse().ok();
+		let addrs = match literal {
+			Some(ip) => vec![ip],
+			None => crate::doh::resolve(&host)
+				.map_err(|err| format!("relay '{}': {err}", params.relay))?,
+		};
 		let cert_der = match params.cert.trim() {
 			"" => None,
 			hex => Some(unhex(hex)?),
@@ -338,11 +331,6 @@ impl Guest for Publish {
 		let local = tokio::task::LocalSet::new();
 		let executor = Executor { runtime, local };
 
-		let relay = moq_core::wasi::Relay {
-			addr,
-			server_name,
-			cert_der,
-		};
 		// Everything moq-net touches runs on the runtime, model setup
 		// included. The broadcast and its tracks exist before the
 		// session: the session's driver announces whatever the origin
@@ -366,16 +354,39 @@ impl Guest for Publish {
 			let track = broadcast
 				.create_track(params.track.as_str(), media_info)
 				.map_err(|err| format!("track '{}': {err}", params.track))?;
-			let connected = tokio::time::timeout(
-				CONNECT_TIMEOUT,
-				moq_core::wasi::connect(
-					&relay,
-					moq_net::Client::new().with_publisher(origin.consume()),
+			// A looked-up name can carry several addresses; each gets
+			// the full connect timeout before the next is tried.
+			let client = moq_net::Client::new().with_publisher(origin.consume());
+			let mut connected = None;
+			let mut last_err = String::new();
+			for addr in &addrs {
+				let relay = moq_core::wasi::Relay {
+					addr: SocketAddr::new(*addr, port),
+					server_name: host.clone(),
+					cert_der: cert_der.clone(),
+				};
+				match tokio::time::timeout(
+					CONNECT_TIMEOUT,
+					moq_core::wasi::connect(&relay, client.clone()),
+				)
+				.await
+				{
+					Ok(Ok(session)) => {
+						connected = Some(session);
+						break;
+					}
+					Ok(Err(err)) => last_err = err.to_string(),
+					Err(_) => last_err = "no answer within 10s".to_string(),
+				}
+			}
+			let connected = connected.ok_or_else(|| match literal {
+				Some(_) => format!("relay '{}': {last_err}", params.relay),
+				None => format!(
+					"relay '{}': no address of '{host}' answered ({} tried; last: {last_err})",
+					params.relay,
+					addrs.len()
 				),
-			)
-			.await
-			.map_err(|_| format!("relay '{}': no answer within 10s", params.relay))?
-			.map_err(|err| format!("relay '{}': {err}", params.relay))?;
+			})?;
 			Ok::<_, String>((broadcast, init_track, track, connected))
 		})?;
 
