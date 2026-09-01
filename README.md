@@ -1,8 +1,8 @@
 # ffrwd/moq
 
 Live publishing over Media over QUIC, hosted in wasm. `publish` is a
-COPY destination: the query's video stream leaves the graph for a
-relay broadcast, encoded on the way out.
+COPY destination: the query's streams leave the graph for a relay
+broadcast, encoded on the way out.
 
 ```pgsql
 COPY (
@@ -11,14 +11,31 @@ COPY (
 ) TO ffrwd.moq.publish('moqt://203.0.113.7:4443', 'live/demo')
 ```
 
+One stream is one track. Gather several and they are one broadcast -
+a rendition ladder is `array_agg` over the rungs:
+
+```pgsql
+COPY (
+  SELECT array_agg(scale(f.video[1], :widths[i.i], -2))
+  FROM input(:'source') f, generate_series(1, :rungs) i
+) TO ffrwd.moq.publish(:'relay', :'broadcast')
+  WITH (video_bitrate :'bitrates'[i.i], gop 30)
+```
+
 The compiler places the sink behind an encoder - shape it with the
-COPY's `WITH` options, h264 - and the module packages the packets as
-fragmented MP4: an init segment built from the stream's SPS/PPS,
-published on its own track (`<track>.init`) so a late subscriber
-always reads the decoder config first, then one `moof`+`mdat`
-fragment per group of pictures, one MoQ frame each, a new MoQ group
-at every keyframe. Any fmp4-speaking MoQ subscriber can reassemble
-and play it.
+COPY's `WITH` options, and a value read once per row shapes each
+rung's encoder separately. The module packages each stream as
+fragmented MP4: one `moof`+`mdat` fragment per group of pictures, one
+MoQ frame each, a new MoQ group at every keyframe. Audio rides beside
+the video as AAC, cut on frame edges about once a second.
+
+A `catalog.json` track names what the broadcast carries, in the
+[hang](https://github.com/kixelated/moq) catalog schema: renditions
+keyed by name, each with its codec string, its geometry or sample
+rate, and its init segment carried in the entry. A hang player - or
+anything speaking that catalog - picks a rendition and plays it; the
+versions the claim was proven against are pinned in
+`harness/hang-recv`.
 
 The first publish is held until the track gains a subscriber: a MoQ
 subscription starts at the latest group, so anything sent earlier
@@ -30,10 +47,10 @@ lookup, so a name is resolved over DNS-over-HTTPS against 1.1.1.1,
 then 8.8.8.8 - both pinned by IP in the module - and every address
 the answer carries is tried in turn. A private relay's certificate
 travels as the `cert` argument, DER as hex - a public value, not a
-secret; left
-empty, the webpki roots baked into the module decide, which is what a
-public relay's certificate chains to. One row leaves per published
-group - packets, bytes, pts range - and a summary follows the last.
+secret; left empty, the webpki roots baked into the module decide,
+which is what a public relay's certificate chains to. One row leaves
+per published group - packets, bytes, pts range - and a summary
+follows the last.
 
 ## License
 
@@ -41,19 +58,25 @@ This package is **MIT OR Apache-2.0**, and so is everything vendored
 into it (`web-transport-quinn`, `quinn-udp`, `quinn-wasi` - each
 carried for wasm32-wasip2 fixes upstream does not ship yet).
 
-## Export
+## Exports
 
 - `publish(v, relay, broadcast, track DEFAULT 'video', cert DEFAULT '')`
-  returns `sink`: a COPY destination, nothing comes back.
+  returns `sink`: a COPY destination, nothing comes back. `v` is
+  `video_stream[]` - every video stream the SELECT carries.
+- `publish_av(v, a, relay, broadcast, track DEFAULT 'video',
+  audio_track DEFAULT 'audio', cert DEFAULT '')` - the same, plus one
+  audio stream.
 
 ## Recipes
 
 - `publish` - a file's first video track to a relay.
 - `publish-live` - the same shape from a live source URL; the run ends
   when the source does.
+- `publish-ladder` - a rendition ladder, one broadcast.
+- `publish-ladder-audio` - the ladder with the file's audio beside it.
 
 ```
-ffrwd ffrwd.moq.publish -v source=film.mp4 -v relay=moqt://203.0.113.7:4443 -v broadcast=live/demo
+ffrwd ffrwd.moq.publish-ladder -v source=film.mp4 -v relay=moqt://203.0.113.7:4443 -v broadcast=live/demo -v rungs=3 -v widths=1920,1280,854 -v bitrates=6000k,3000k,1000k
 ```
 
 ## Building

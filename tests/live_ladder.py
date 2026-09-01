@@ -145,17 +145,16 @@ def run_publisher(
     print(shown.stdout.strip())
     if shown.stdout.count("ffrwd-wasm") != 1:
         sys.exit("the ladder must reach ONE sidecar process, and this plan has more")
-    # One decode of the VIDEO: the rungs leave one ffmpeg through a split,
-    # not one ffmpeg apiece each opening the source again.
+    # One decode: every leg - the rungs through a split, the audio mapped
+    # bare - leaves ONE ffmpeg, not one apiece each opening the source again.
     if f"split={rungs}" not in shown.stdout:
         sys.exit(f"the one decode must split {rungs} ways, and this plan does not")
-    if audio:
+    if shown.stdout.count("ffmpeg -i") != 1:
+        sys.exit("the ladder must decode its source ONCE, and this plan opens it more")
+    if audio and shown.stdout.count("-c:0 aac") != 1:
         # The audio reaches the sink on a pad of its own, encoded on the way
         # in rather than as the pcm every other audio edge carries.
-        if shown.stdout.count("-c:0 aac") != 1:
-            sys.exit("the audio must reach the sink as ONE encoded pad")
-    elif shown.stdout.count("ffmpeg -i") != 1:
-        sys.exit("the ladder must decode its source ONCE, and this plan opens it more")
+        sys.exit("the audio must reach the sink as ONE encoded pad")
 
     started = time.monotonic()
     done = run(

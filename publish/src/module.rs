@@ -419,7 +419,7 @@ impl Guest for Publish {
 			},
 			// The fmp4 packaging is codec-shaped: avcC from SPS/PPS for
 			// video, esds from the AudioSpecificConfig for audio.
-			codecs: vec!["h264".to_string()],
+			video_codecs: vec!["h264".to_string()],
 			audio_codecs: vec!["aac".to_string()],
 			// One broadcast carries as many renditions as the query names,
 			// and the audio it names beside them - or none, for a query
