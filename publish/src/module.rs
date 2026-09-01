@@ -1,6 +1,6 @@
 wit_bindgen::generate!({
 	path: "wit",
-	world: "packet-module",
+	world: "packet-sink-module",
 });
 
 use std::cell::RefCell;
