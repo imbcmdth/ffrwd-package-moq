@@ -2,17 +2,18 @@
 //! fmp4 broadcast into a file a decoder must then accept whole.
 //!
 //! Connects to the relay, waits for the broadcast to be announced,
-//! reads `catalog.json` to find out what the broadcast carries, then
-//! the init segment off its own track and every fragment off the media
-//! track - subscribed from group 0, ordered, tolerating backlog -
-//! writing the bytes in arrival order. Prints `sub:` lines the test
-//! asserts, the catalog's tracks among them.
+//! reads `catalog.json` - hang's shape, the init segment base64 inside
+//! each rendition's `cmaf` container - then every fragment off the
+//! media track, subscribed from group 0, ordered, tolerating backlog,
+//! writing init then fragments in arrival order. Prints `sub:` lines
+//! the test asserts, the catalog's tracks among them.
 //!
 //! Environment: `RELAY_PORT`, `RELAY_CERT_HEX` (the relay certificate,
 //! DER as hex), `BROADCAST` (path), `OUTPUT` (file path inside a
-//! preopened directory). `TRACK` and `INIT_TRACK` name the tracks to
-//! read; left unset, they come from the catalog - `RENDITION` picks
-//! which of its tracks by index, and defaults to the first.
+//! preopened directory). `TRACK` names the track to read; left unset,
+//! it comes from the catalog - `RENDITION` picks a track by index over
+//! the video renditions then the audio ones, each set in the
+//! document's own (alphabetical) order, and defaults to the first.
 
 #[cfg(target_os = "wasi")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -69,25 +70,30 @@ mod live {
 		println!("sub: catalog {}", catalog.trim());
 		let tracks = catalog_tracks(&catalog)?;
 		println!("sub: catalog names {} track(s)", tracks.len());
-		for (name, init, codec, size) in &tracks {
-			println!("sub: catalog track {name} init {init} codec {codec} {size}");
+		for track in &tracks {
+			println!(
+				"sub: catalog track {} codec {} {} init {} bytes",
+				track.name,
+				track.codec,
+				track.shape,
+				track.init.len()
+			);
 		}
 		let rendition: usize = std::env::var("RENDITION")
 			.ok()
 			.map(|written| written.parse())
 			.transpose()?
 			.unwrap_or(0);
-		let chosen = tracks
-			.get(rendition)
-			.ok_or("the catalog has no track at RENDITION")?;
-        let track_name = std::env::var("TRACK").unwrap_or_else(|_| chosen.0.clone());
-        let init_track_name = std::env::var("INIT_TRACK").unwrap_or_else(|_| chosen.1.clone());
+		let chosen = match std::env::var("TRACK") {
+			Ok(name) => tracks
+				.iter()
+				.find(|track| track.name == name)
+				.ok_or("the catalog has no track named TRACK")?,
+			Err(_) => tracks.get(rendition).ok_or("the catalog has no track at RENDITION")?,
+		};
+		let track_name = chosen.name.clone();
 		println!("sub: subscribing to {track_name}");
 
-		// Both subscriptions exist before any frame is read, so no
-		// media group can slip past while the init segment is fetched.
-		let init_track = broadcast.track(init_track_name.as_str())?;
-		let init_subscriber = init_track.subscribe(None).await?;
 		let track = broadcast.track(track_name.as_str())?;
 		// A default subscription is live-edge: start at the latest
 		// group and skip any older one the moment a newer exists.
@@ -99,43 +105,46 @@ mod live {
 			.with_group_start(0);
 		let subscriber = track.subscribe(subscription).await?;
 
-		let mut file = std::fs::File::create(&output)?;
-
-		let mut init_stream = moq_core::subscribe::FrameStream::new(init_subscriber);
-		let init = init_stream
-			.next()
-			.await?
-			.ok_or("init track finished without an init segment")?;
-		file.write_all(&init.payload)?;
-		println!("sub: init segment {} bytes", init.payload.len());
+		// The init segment came with the catalog, not off a track.
+		println!("sub: init segment {} bytes", chosen.init.len());
+		let init = chosen.init.clone();
 
 		let mut stream = moq_core::subscribe::FrameStream::new(subscriber)
 			.on_group(|group, count| println!("sub: group {group} complete with {count} fragments"));
+		// A backlogged subscription may hand groups out of order - the
+		// relay serves them over parallel streams - so the fragments are
+		// collected and written in GROUP order, which is decode order.
+		let mut collected: Vec<(u64, Vec<u8>)> = Vec::new();
 		let mut fragments = 0u64;
-		let mut groups_seen = 0u64;
-		let mut last_group = None;
-		let mut bytes = init.payload.len() as u64;
+		let mut bytes = init.len() as u64;
 		while let Some(frame) = stream.next().await? {
-			file.write_all(&frame.payload)?;
 			bytes += frame.payload.len() as u64;
-			if last_group != Some(frame.group) {
-				last_group = Some(frame.group);
-				groups_seen += 1;
-			}
 			println!(
 				"sub: fragment {fragments} group {} bytes {} pts {:.3}s",
 				frame.group,
 				frame.payload.len(),
 				frame.timestamp_us as f64 / 1_000_000.0,
 			);
+			collected.push((frame.group, frame.payload.to_vec()));
 			fragments += 1;
 		}
-		file.flush()?;
-		drop(file);
 
 		if fragments == 0 {
 			return Err("no fragments received".into());
 		}
+		collected.sort_by_key(|(group, _)| *group);
+		let groups_seen = {
+			let mut distinct = collected.iter().map(|(group, _)| *group).collect::<Vec<_>>();
+			distinct.dedup();
+			distinct.len() as u64
+		};
+		let mut file = std::fs::File::create(&output)?;
+		file.write_all(&init)?;
+		for (_, payload) in &collected {
+			file.write_all(payload)?;
+		}
+		file.flush()?;
+		drop(file);
 		println!("sub: reassembled {fragments} fragments in {groups_seen} groups, {bytes} bytes");
 
 		drop(broadcast);
@@ -168,21 +177,47 @@ mod live {
 		Ok(String::from_utf8(frame.payload.to_vec())?)
 	}
 
-	/// Each catalog track as `(name, init, codec, WxH)`.
-	///
-	/// Read with a small scan rather than a JSON crate: the harness has no
-	/// serde dependency, and the document is this package's own.
-	fn catalog_tracks(
-		document: &str,
-	) -> Result<Vec<(String, String, String, String)>, Box<dyn Error>> {
+	/// One track the catalog names: its name, codec, a shape line for
+	/// the transcript, and the decoded init segment.
+	struct CatalogTrack {
+		name: String,
+		codec: String,
+		shape: String,
+		init: Vec<u8>,
+	}
+
+	/// The catalog's tracks: the video renditions then the audio ones,
+	/// each set in the document's own (alphabetical) order.
+	fn catalog_tracks(document: &str) -> Result<Vec<CatalogTrack>, Box<dyn Error>> {
+		let parsed: serde_json::Value = serde_json::from_str(document)?;
 		let mut found = Vec::new();
-		for entry in document.split("{\"name\"").skip(1) {
-			let name = field(entry, "")?;
-			let init = field(entry, "\"init\"")?;
-			let codec = field(entry, "\"codec\"")?;
-			let width = number(entry, "\"width\"")?;
-			let height = number(entry, "\"height\"")?;
-			found.push((name, init, codec, format!("{width}x{height}")));
+		for kind in ["video", "audio"] {
+			let Some(renditions) = parsed
+				.get(kind)
+				.and_then(|section| section.get("renditions"))
+				.and_then(|map| map.as_object())
+			else {
+				continue;
+			};
+			for (name, entry) in renditions {
+				let codec = string(entry, "codec")?;
+				let shape = if kind == "audio" {
+					format!("{}Hz {}ch", number(entry, "sampleRate")?, number(entry, "numberOfChannels")?)
+				} else {
+					format!("{}x{}", number(entry, "codedWidth")?, number(entry, "codedHeight")?)
+				};
+				let container = entry.get("container").ok_or("catalog entry has no container")?;
+				if string(container, "kind")? != "cmaf" {
+					return Err(format!("track {name} is not cmaf").into());
+				}
+				let init = unbase64(&string(container, "init")?)?;
+				found.push(CatalogTrack {
+					name: name.clone(),
+					codec,
+					shape,
+					init,
+				});
+			}
 		}
 		if found.is_empty() {
 			return Err(format!("no tracks in catalog {document}").into());
@@ -190,32 +225,52 @@ mod live {
 		Ok(found)
 	}
 
-	/// One string field's value, after `key` (empty for the entry's first).
-	fn field(entry: &str, key: &str) -> Result<String, Box<dyn Error>> {
-		let rest = match entry.split_once(key) {
-			Some((_, rest)) => rest,
-			None => return Err(format!("catalog entry has no {key}").into()),
-		};
-		let (_, rest) = rest
-			.split_once('"')
-			.ok_or_else(|| format!("catalog {key} has no value"))?;
-		let (value, _) = rest
-			.split_once('"')
-			.ok_or_else(|| format!("catalog {key} is unterminated"))?;
-		Ok(value.to_string())
+	fn string(entry: &serde_json::Value, key: &str) -> Result<String, Box<dyn Error>> {
+		entry
+			.get(key)
+			.and_then(|value| value.as_str())
+			.map(str::to_string)
+			.ok_or_else(|| format!("catalog entry has no {key}").into())
 	}
 
-	/// One numeric field's value, after `key`.
-	fn number(entry: &str, key: &str) -> Result<u32, Box<dyn Error>> {
-		let (_, rest) = entry
-			.split_once(key)
-			.ok_or_else(|| format!("catalog entry has no {key}"))?;
-		let digits: String = rest
-			.chars()
-			.skip_while(|c| !c.is_ascii_digit())
-			.take_while(|c| c.is_ascii_digit())
-			.collect();
-		Ok(digits.parse()?)
+	fn number(entry: &serde_json::Value, key: &str) -> Result<u64, Box<dyn Error>> {
+		entry
+			.get(key)
+			.and_then(|value| value.as_u64())
+			.ok_or_else(|| format!("catalog entry has no {key}").into())
+	}
+
+	/// Standard base64 with padding, the coding the catalog's init uses.
+	fn unbase64(text: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+		fn value(c: u8) -> Result<u32, Box<dyn Error>> {
+			match c {
+				b'A'..=b'Z' => Ok(u32::from(c - b'A')),
+				b'a'..=b'z' => Ok(u32::from(c - b'a') + 26),
+				b'0'..=b'9' => Ok(u32::from(c - b'0') + 52),
+				b'+' => Ok(62),
+				b'/' => Ok(63),
+				_ => Err("bad base64 digit".into()),
+			}
+		}
+		let digits: Vec<u8> = text.trim().trim_end_matches('=').bytes().collect();
+		let mut out = Vec::with_capacity(digits.len() * 3 / 4);
+		for chunk in digits.chunks(4) {
+			if chunk.len() == 1 {
+				return Err("truncated base64".into());
+			}
+			let mut word = 0u32;
+			for (i, c) in chunk.iter().enumerate() {
+				word |= value(*c)? << (18 - 6 * i);
+			}
+			out.push((word >> 16) as u8);
+			if chunk.len() > 2 {
+				out.push((word >> 8) as u8);
+			}
+			if chunk.len() > 3 {
+				out.push(word as u8);
+			}
+		}
+		Ok(out)
 	}
 
 	fn env(name: &str) -> Result<String, Box<dyn Error>> {

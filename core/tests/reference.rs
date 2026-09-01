@@ -31,7 +31,7 @@ fn the_muxer_agrees_with_ffmpeg_fragment_by_fragment() {
 	let reference = Reference::read();
 	let extradata = annexb_extradata(&reference.avcc);
 
-	let mut muxer = Muxer::new(
+	let mut muxer = Muxer::video(
 		&extradata,
 		reference.width,
 		reference.height,
@@ -41,7 +41,7 @@ fn the_muxer_agrees_with_ffmpeg_fragment_by_fragment() {
 	.expect("a muxer from the reference's own parameter sets");
 
 	assert_eq!(
-		muxer.avcc(),
+		muxer.avcc().expect("a video muxer builds an avcC"),
 		&reference.avcc[..],
 		"the avcC built from the SPS/PPS is not the reference's"
 	);

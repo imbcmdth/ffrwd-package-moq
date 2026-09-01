@@ -1,15 +1,25 @@
-//! Fragmented-MP4 construction from encoded h264 packets.
+//! Fragmented-MP4 construction from encoded h264 and AAC packets.
 //!
 //! The inverse of [`crate::fmp4`]: where that module cuts a muxed byte
 //! stream into segments, this one builds the segments from the packets
 //! an encoder emits. One [`Muxer`] serves one coded stream: its
 //! [`init_segment`](Muxer::init_segment) is the `ftyp`+`moov` a decoder
-//! needs before any sample - the `avcC` built from the stream's
-//! out-of-band SPS/PPS - and each [`push`](Muxer::push) collects one
-//! packet into the open group of pictures, closing the group into a
-//! `moof`+`mdat` fragment when the next keyframe arrives. Samples are
-//! stored AVCC-framed (4-byte NAL lengths), reframed from the Annex-B
-//! bytes the packets carry.
+//! needs before any sample, and each [`push`](Muxer::push) collects one
+//! packet into the open group, closing it into a `moof`+`mdat` fragment
+//! when the next group starts.
+//!
+//! [`Muxer::video`] packages h264: an `avc1` sample entry whose `avcC`
+//! is built from the stream's out-of-band SPS/PPS, samples stored
+//! AVCC-framed (4-byte NAL lengths) after reframing the Annex-B bytes
+//! the packets carry, and a group that closes at every keyframe.
+//!
+//! [`Muxer::audio`] packages AAC: an `mp4a` sample entry whose `esds`
+//! carries the stream's AudioSpecificConfig, samples stored exactly as
+//! the packets carry them. Every AAC frame is a sync sample, so there
+//! is no keyframe to rotate on and the group closes on a target
+//! duration instead - see [`AUDIO_GROUP_SECONDS`]. A group therefore
+//! always begins on a whole AAC frame, which is what a decoder needs;
+//! it does not align with any video group, which is a later concern.
 //!
 //! Timestamps: the media timescale is the stream time base's
 //! denominator, so a tick value crosses unchanged when the numerator is
@@ -60,15 +70,36 @@ struct Sample {
 	keyframe: bool,
 }
 
+/// How long an audio group runs before it closes. One second, so a
+/// group holds a whole number of AAC frames and lands near a video
+/// group of the GOP lengths this publishes at; the frame boundary is
+/// exact, the video boundary is not.
+pub const AUDIO_GROUP_SECONDS: i64 = 1;
+
+/// What a muxer packages, and the sample entry that calls for.
+enum Kind {
+	Video {
+		width: u32,
+		height: u32,
+		avcc: Vec<u8>,
+	},
+	Audio {
+		sample_rate: u32,
+		channels: u32,
+		/// The AudioSpecificConfig, as the stream header carried it.
+		asc: Vec<u8>,
+		/// How long a group runs, in stream ticks.
+		group_ticks: i64,
+	},
+}
+
 /// Builds an init segment once and fragments as packets arrive.
 pub struct Muxer {
 	timescale: u32,
 	/// Ticks multiply by this on the way to media time (the time
 	/// base's numerator).
 	tick_scale: i64,
-	width: u32,
-	height: u32,
-	avcc: Vec<u8>,
+	kind: Kind,
 	sequence: u32,
 	pending: Vec<Sample>,
 	/// Added to every decode time; set when the first fragment closes.
@@ -78,28 +109,71 @@ pub struct Muxer {
 }
 
 impl Muxer {
-	/// A muxer for one coded stream: Annex-B SPS/PPS extradata, the
+	/// A muxer for one coded h264 stream: Annex-B SPS/PPS extradata, the
 	/// declared frame size, and the stream time base.
-	pub fn new(
+	pub fn video(
 		extradata: &[u8],
 		width: u32,
 		height: u32,
 		time_base_num: i32,
 		time_base_den: i32,
 	) -> Result<Self, String> {
+		let (sps, pps) = avc::parse_parameter_sets(extradata);
+		let avcc = avc::build_avcc(&sps, &pps)?;
+		Self::build(
+			Kind::Video {
+				width,
+				height,
+				avcc,
+			},
+			time_base_num,
+			time_base_den,
+		)
+	}
+
+	/// A muxer for one coded AAC stream: the AudioSpecificConfig the
+	/// stream header carried, the samples it declares, and the stream
+	/// time base - whose tick is one sample, so the group target is the
+	/// rate itself.
+	pub fn audio(
+		extradata: &[u8],
+		sample_rate: u32,
+		channels: u32,
+		time_base_num: i32,
+		time_base_den: i32,
+	) -> Result<Self, String> {
+		if extradata.is_empty() {
+			return Err(
+				"the audio stream carries no AudioSpecificConfig, so no esds can be built".into(),
+			);
+		}
+		if channels == 0 {
+			return Err("the audio stream declares no channels".into());
+		}
+		let group_ticks = AUDIO_GROUP_SECONDS * time_base_den.max(1) as i64
+			/ time_base_num.max(1) as i64;
+		Self::build(
+			Kind::Audio {
+				sample_rate,
+				channels,
+				asc: extradata.to_vec(),
+				group_ticks: group_ticks.max(1),
+			},
+			time_base_num,
+			time_base_den,
+		)
+	}
+
+	fn build(kind: Kind, time_base_num: i32, time_base_den: i32) -> Result<Self, String> {
 		if time_base_num <= 0 || time_base_den <= 0 {
 			return Err(format!(
 				"time base {time_base_num}/{time_base_den} is not positive"
 			));
 		}
-		let (sps, pps) = avc::parse_parameter_sets(extradata);
-		let avcc = avc::build_avcc(&sps, &pps)?;
 		Ok(Self {
 			timescale: time_base_den as u32,
 			tick_scale: time_base_num as i64,
-			width,
-			height,
-			avcc,
+			kind,
 			sequence: 1,
 			pending: Vec::new(),
 			dts_shift: None,
@@ -108,8 +182,21 @@ impl Muxer {
 	}
 
 	/// The `avcC` payload built from the extradata, for inspection.
-	pub fn avcc(&self) -> &[u8] {
-		&self.avcc
+	/// None for an audio muxer, which builds an `esds` instead.
+	pub fn avcc(&self) -> Option<&[u8]> {
+		match &self.kind {
+			Kind::Video { avcc, .. } => Some(avcc),
+			Kind::Audio { .. } => None,
+		}
+	}
+
+	/// The decoder configuration a WebCodecs `description` carries: the
+	/// `avcC` record for video, the AudioSpecificConfig for audio.
+	pub fn decoder_config(&self) -> &[u8] {
+		match &self.kind {
+			Kind::Video { avcc, .. } => avcc,
+			Kind::Audio { asc, .. } => asc,
+		}
 	}
 
 	/// The `ftyp`+`moov` a decoder reads before any fragment.
@@ -119,27 +206,53 @@ impl Muxer {
 		out
 	}
 
-	/// Collects one packet; a keyframe closes the open group first, and
-	/// the closed fragment comes back.
+	/// Collects one packet; a packet that starts a new group closes the
+	/// open one first, and the closed fragment comes back.
 	pub fn push(&mut self, packet: Packet<'_>) -> Result<Option<Fragment>, String> {
-		let data = avc::annexb_to_avcc(packet.data);
-		if data.is_empty() {
-			return Err(format!(
-				"the packet at pts {} carries no Annex-B start code",
-				packet.pts
-			));
-		}
+		let (data, sync) = match &self.kind {
+			Kind::Video { .. } => {
+				let data = avc::annexb_to_avcc(packet.data);
+				if data.is_empty() {
+					return Err(format!(
+						"the packet at pts {} carries no Annex-B start code",
+						packet.pts
+					));
+				}
+				(data, packet.keyframe)
+			}
+			// An AAC frame is stored as it arrived, and every one of
+			// them can be decoded from.
+			Kind::Audio { .. } => {
+				if packet.data.is_empty() {
+					return Err(format!("the packet at pts {} carries no bytes", packet.pts));
+				}
+				(packet.data.to_vec(), true)
+			}
+		};
 		let mut closed = None;
-		if packet.keyframe && !self.pending.is_empty() {
+		if self.starts_a_group(&packet) {
 			closed = Some(self.close(packet.dts)?);
 		}
 		self.pending.push(Sample {
 			data,
 			pts: packet.pts,
 			dts: packet.dts,
-			keyframe: packet.keyframe,
+			keyframe: sync,
 		});
 		Ok(closed)
+	}
+
+	/// Whether `packet` opens a new group, so the pending one closes
+	/// before it. Video rotates where the encoder put its keyframes;
+	/// audio has none to rotate on and rotates on elapsed ticks.
+	fn starts_a_group(&self, packet: &Packet<'_>) -> bool {
+		let Some(first) = self.pending.first() else {
+			return false;
+		};
+		match self.kind {
+			Kind::Video { .. } => packet.keyframe,
+			Kind::Audio { group_ticks, .. } => packet.pts - first.pts >= group_ticks,
+		}
 	}
 
 	/// Closes whatever group is open. The stream's last fragment, at
@@ -279,7 +392,30 @@ impl Muxer {
 	}
 
 	fn moov(&self) -> Vec<u8> {
-		let stsd_child = avc1(self.width, self.height, &self.avcc);
+		let (stsd_child, handler, handler_name, media_header) = match &self.kind {
+			Kind::Video {
+				width,
+				height,
+				avcc,
+			} => (
+				avc1(*width, *height, avcc),
+				b"vide",
+				&b"VideoHandler\0"[..],
+				full_boxed(b"vmhd", 0, 1, vec![0; 8]),
+			),
+			Kind::Audio {
+				sample_rate,
+				channels,
+				asc,
+				..
+			} => (
+				mp4a(*sample_rate, *channels, asc),
+				b"soun",
+				&b"SoundHandler\0"[..],
+				// balance and reserved, both zero.
+				full_boxed(b"smhd", 0, 0, vec![0; 4]),
+			),
+		};
 		let stbl = boxed(
 			b"stbl",
 			[
@@ -304,15 +440,12 @@ impl Muxer {
 				p
 			}),
 		);
-		let minf = boxed(
-			b"minf",
-			[full_boxed(b"vmhd", 0, 1, vec![0; 8]), dinf, stbl].concat(),
-		);
+		let minf = boxed(b"minf", [media_header, dinf, stbl].concat());
 		let hdlr = full_boxed(b"hdlr", 0, 0, {
 			let mut p = vec![0; 4]; // pre_defined
-			p.extend_from_slice(b"vide");
+			p.extend_from_slice(handler);
 			p.extend_from_slice(&[0; 12]);
-			p.extend_from_slice(b"VideoHandler\0");
+			p.extend_from_slice(handler_name);
 			p
 		});
 		let mdhd = full_boxed(b"mdhd", 0, 0, {
@@ -324,16 +457,24 @@ impl Muxer {
 			p
 		});
 		let mdia = boxed(b"mdia", [mdhd, hdlr, minf].concat());
+		// A video track states its frame size and no volume; an audio
+		// track states full volume and no frame size.
+		let (volume, width, height) = match self.kind {
+			Kind::Video { width, height, .. } => (0u16, width, height),
+			Kind::Audio { .. } => (0x0100, 0, 0),
+		};
 		let tkhd = full_boxed(b"tkhd", 0, 3, {
 			let mut p = vec![0; 8]; // creation, modification
 			p.extend_from_slice(&1u32.to_be_bytes()); // track_ID
 			p.extend_from_slice(&[0; 4]); // reserved
 			p.extend_from_slice(&[0; 4]); // duration: told by fragments
 			p.extend_from_slice(&[0; 8]); // reserved
-			p.extend_from_slice(&[0; 8]); // layer, group, volume, reserved
+			p.extend_from_slice(&[0; 4]); // layer, alternate group
+			p.extend_from_slice(&volume.to_be_bytes());
+			p.extend_from_slice(&[0; 2]); // reserved
 			p.extend_from_slice(&MATRIX);
-			p.extend_from_slice(&(self.width << 16).to_be_bytes());
-			p.extend_from_slice(&(self.height << 16).to_be_bytes());
+			p.extend_from_slice(&(width << 16).to_be_bytes());
+			p.extend_from_slice(&(height << 16).to_be_bytes());
 			p
 		});
 		let trak = boxed(b"trak", [tkhd, mdia].concat());
@@ -442,6 +583,70 @@ fn avc1(width: u32, height: u32, avcc: &[u8]) -> Vec<u8> {
 	boxed(b"avc1", p)
 }
 
+/// The mp4a sample entry, its `esds` inside.
+fn mp4a(sample_rate: u32, channels: u32, asc: &[u8]) -> Vec<u8> {
+	let mut p = Vec::new();
+	p.extend_from_slice(&[0; 6]); // reserved
+	p.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
+	p.extend_from_slice(&[0; 8]); // version, revision, vendor
+	p.extend_from_slice(&(channels.min(0xffff) as u16).to_be_bytes());
+	p.extend_from_slice(&16u16.to_be_bytes()); // samplesize
+	p.extend_from_slice(&[0; 4]); // pre_defined, reserved
+	// 16.16 fixed point, so a rate past 65535 does not fit and is left
+	// at zero - the esds below carries the real one either way.
+	let rate = if sample_rate > u32::from(u16::MAX) {
+		0
+	} else {
+		sample_rate << 16
+	};
+	p.extend_from_slice(&rate.to_be_bytes());
+	p.extend_from_slice(&full_boxed(b"esds", 0, 0, esds(asc)));
+	boxed(b"mp4a", p)
+}
+
+/// The `esds` payload: the ES descriptor holding a decoder config whose
+/// specific info is the stream's own AudioSpecificConfig.
+fn esds(asc: &[u8]) -> Vec<u8> {
+	let specific = descriptor(0x05, asc.to_vec());
+	let config = descriptor(0x04, {
+		let mut p = vec![
+			0x40, // MPEG-4 audio
+			0x15, // audio stream, not upstream
+			0, 0, 0, // buffer size
+		];
+		p.extend_from_slice(&0u32.to_be_bytes()); // max bitrate: unstated
+		p.extend_from_slice(&0u32.to_be_bytes()); // average bitrate: unstated
+		p.extend_from_slice(&specific);
+		p
+	});
+	// SLConfigDescriptor, predefined 2: the timing an mp4 track carries.
+	let sl = descriptor(0x06, vec![0x02]);
+	descriptor(0x03, {
+		let mut p = 0u16.to_be_bytes().to_vec(); // ES_ID
+		p.push(0); // stream priority, no dependency, no URL
+		p.extend_from_slice(&config);
+		p.extend_from_slice(&sl);
+		p
+	})
+}
+
+/// One MPEG-4 descriptor: a tag, its length in the seven-bits-a-byte
+/// coding descriptors use, then the payload.
+fn descriptor(tag: u8, payload: Vec<u8>) -> Vec<u8> {
+	let mut out = vec![tag];
+	let mut length = payload.len();
+	let mut coded = vec![(length & 0x7f) as u8];
+	length >>= 7;
+	while length > 0 {
+		coded.push((length & 0x7f) as u8 | 0x80);
+		length >>= 7;
+	}
+	coded.reverse();
+	out.extend_from_slice(&coded);
+	out.extend_from_slice(&payload);
+	out
+}
+
 fn boxed(kind: &[u8; 4], payload: Vec<u8>) -> Vec<u8> {
 	let mut out = Vec::with_capacity(8 + payload.len());
 	out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
@@ -470,7 +675,23 @@ mod tests {
 	];
 
 	fn muxer() -> Muxer {
-		Muxer::new(EXTRADATA, 320, 180, 1, 30).expect("a muxer")
+		Muxer::video(EXTRADATA, 320, 180, 1, 30).expect("a muxer")
+	}
+
+	/// The 5-byte AudioSpecificConfig ffmpeg writes for 48 kHz mono
+	/// AAC-LC, as the NUT stream header carries it.
+	const ASC: &[u8] = &[0x11, 0x88, 0x56, 0xe5, 0x00];
+
+	/// An audio muxer at the time base a NUT audio stream declares: one
+	/// tick per sample.
+	fn audio_muxer() -> Muxer {
+		Muxer::audio(ASC, 48000, 1, 1, 48000).expect("a muxer")
+	}
+
+	/// One AAC frame's worth of packet: 1024 samples on, and bytes that
+	/// cross unchanged.
+	fn aac_frame(index: i64) -> Vec<u8> {
+		vec![0x21, index as u8, 0x10, 0x04]
 	}
 
 	fn packet(pts: i64, keyframe: bool) -> Vec<u8> {
@@ -551,6 +772,114 @@ mod tests {
 			})
 			.expect_err("no start code");
 		assert!(err.contains("start code"), "{err}");
+	}
+
+	#[test]
+	fn an_audio_group_closes_on_the_target_duration() {
+		let mut mux = audio_muxer();
+		// 1024 samples a frame at 48 kHz: the 47th frame is the first
+		// whose timestamp stands a whole second past the group's first,
+		// so it is the one that closes it.
+		let mut closed_at = None;
+		for index in 0..60i64 {
+			let data = aac_frame(index);
+			let closed = mux
+				.push(Packet {
+					pts: index * 1024,
+					dts: Some(index * 1024),
+					keyframe: true,
+					data: &data,
+				})
+				.expect("push");
+			if let Some(fragment) = closed {
+				closed_at = Some((index, fragment));
+				break;
+			}
+		}
+		let (index, fragment) = closed_at.expect("a group closed within 60 frames");
+		assert_eq!(index, 47);
+		assert_eq!(fragment.samples, 47);
+		assert!(fragment.keyframe, "every AAC frame is a sync sample");
+		assert_eq!((fragment.pts_min, fragment.pts_max), (0, 46 * 1024));
+	}
+
+	#[test]
+	fn an_audio_packet_crosses_without_reframing() {
+		let mut mux = audio_muxer();
+		// Bytes that would be an Annex-B start code are still just
+		// bytes here: audio is stored exactly as it arrived.
+		let data = vec![0, 0, 0, 1, 0x65, 0x2a];
+		mux.push(Packet {
+			pts: 0,
+			dts: Some(0),
+			keyframe: true,
+			data: &data,
+		})
+		.expect("push");
+		let fragment = mux.finish().expect("finish").expect("a fragment");
+		let mdat = past_tag(&fragment.bytes, b"mdat");
+		assert_eq!(&fragment.bytes[mdat..], &data[..]);
+	}
+
+	#[test]
+	fn an_empty_audio_packet_is_refused() {
+		let mut mux = audio_muxer();
+		let err = mux
+			.push(Packet {
+				pts: 0,
+				dts: Some(0),
+				keyframe: true,
+				data: &[],
+			})
+			.expect_err("no bytes");
+		assert!(err.contains("no bytes"), "{err}");
+	}
+
+	#[test]
+	fn an_audio_stream_without_a_config_has_no_esds_to_build() {
+		let err = match Muxer::audio(&[], 48000, 2, 1, 48000) {
+			Ok(_) => panic!("an audio muxer needs a config to build an esds from"),
+			Err(err) => err,
+		};
+		assert!(err.contains("AudioSpecificConfig"), "{err}");
+	}
+
+	#[test]
+	fn the_audio_init_segment_carries_an_mp4a_entry_around_the_config() {
+		let init = audio_muxer().init_segment();
+		assert!(audio_muxer().avcc().is_none(), "an audio muxer builds esds");
+		let mp4a = past_tag(&init, b"mp4a");
+		// Past the tag: 6 reserved, data_reference_index, 8 more
+		// reserved, then the channel count and sample size.
+		assert_eq!(&init[mp4a + 16..mp4a + 20], &[0, 1, 0, 16]);
+		// The rate is 16.16 fixed point, so 48000 sits in the top half.
+		assert_eq!(&init[mp4a + 24..mp4a + 28], &(48000u32 << 16).to_be_bytes());
+		// The esds descriptor chain ends with the config verbatim.
+		let esds = past_tag(&init, b"esds");
+		let config = init[esds..]
+			.windows(ASC.len())
+			.position(|w| w == ASC)
+			.expect("the config is in the esds");
+		// Tag 0x05 and its length byte stand immediately before it.
+		assert_eq!(
+			&init[esds + config - 2..esds + config],
+			&[0x05, ASC.len() as u8]
+		);
+		// The handler is sound, not video.
+		assert!(init.windows(4).any(|w| w == b"soun"));
+		assert!(init.windows(4).any(|w| w == b"smhd"));
+		assert!(!init.windows(4).any(|w| w == b"vmhd"));
+	}
+
+	#[test]
+	fn a_long_config_codes_its_descriptor_length_across_bytes() {
+		// A payload past 127 bytes needs the continuation coding, and
+		// the length must still read back as the payload's own.
+		let long = vec![0x11u8; 200];
+		let coded = descriptor(0x05, long.clone());
+		assert_eq!(coded[0], 0x05);
+		assert_eq!(&coded[1..3], &[0x81, 0x48]);
+		assert_eq!(&coded[3..], &long[..]);
 	}
 
 	#[test]

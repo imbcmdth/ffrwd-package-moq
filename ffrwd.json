@@ -21,11 +21,13 @@
     "fmp4"
   ],
   "lib": {
-    "publish": "src/moq.sql"
+    "publish": "src/moq.sql",
+    "publish_av": "src/moq-av.sql"
   },
   "bin": {
     "publish": "recipes/publish.sql",
     "publish-live": "recipes/publish-live.sql",
-    "publish-ladder": "recipes/publish-ladder.sql"
+    "publish-ladder": "recipes/publish-ladder.sql",
+    "publish-ladder-audio": "recipes/publish-ladder-audio.sql"
   }
 }

@@ -1,14 +1,16 @@
 //! MoQ publishing for ffrwd: the transport, the group discipline, and
 //! the fmp4 packaging a packet sink needs.
 //!
-//! - [`mux`] builds fragmented MP4 from encoded h264 packets: an init
-//!   segment from the stream's out-of-band SPS/PPS, then one
-//!   `moof`+`mdat` fragment per group of pictures, rotated at keyframe
-//!   packets.
+//! - [`mux`] builds fragmented MP4 from encoded packets: an init
+//!   segment from the stream's out-of-band header - h264's SPS/PPS into
+//!   an `avc1`, AAC's AudioSpecificConfig into an `mp4a` - then one
+//!   `moof`+`mdat` fragment per group, rotated at keyframe packets for
+//!   video and on a target duration for audio, which has none.
 //! - [`avc`] is the h264 byte-level knowledge under it: Annex-B NAL
 //!   cutting, AVCC length-prefix framing, and the `avcC` record.
-//! - [`catalog`] is the document a broadcast describes itself with, and
-//!   the names its renditions publish under.
+//! - [`catalog`] is the document a broadcast describes itself with - in
+//!   the hang media layer's shape, each rendition's init segment inside
+//!   - and the names its renditions publish under.
 //! - [`subscribe::FrameStream`] pulls groups and frames off a track
 //!   subscription in arrival order (the test harness's receiving side).
 //! - [`fmp4`] cuts a fragmented-MP4 byte stream back into segments -

@@ -1,11 +1,15 @@
-//! A packet sink that publishes MoQ: encoded h264 packets in, a live
-//! broadcast on a relay out.
+//! A packet sink that publishes MoQ: encoded h264 and aac packets in, a
+//! live broadcast on a relay out.
 //!
-//! The stream's out-of-band SPS/PPS become an init segment, published
-//! on its own track so a late subscriber always reads the decoder
-//! config before the media. Each group of pictures becomes one
-//! `moof`+`mdat` fragment - one MoQ frame - in a MoQ group of its own,
-//! rotated where the encoder put its keyframes. The first publish is
+//! The stream's out-of-band header - h264's SPS/PPS, aac's
+//! AudioSpecificConfig - becomes an init segment, carried inside the
+//! rendition's catalog entry as hang's `cmaf` container declares, so a
+//! subscriber reads the decoder config with the catalog. Each group
+//! becomes one `moof`+`mdat` fragment - one MoQ frame - in a MoQ group
+//! of its own, rotated where the encoder put its keyframes, or on a
+//! target duration for audio, which has none. The query's audio is
+//! optional: a query naming only video publishes only video. The first
+//! publish is
 //! held until the media track gains a consumer: a MoQ subscription
 //! starts at the latest group, so anything published into a
 //! subscriberless broadcast would be gone before it could be watched.

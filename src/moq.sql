@@ -12,8 +12,13 @@
 -- the runner links no name lookup. cert is a private relay's own
 -- certificate, DER as hex - a public value, not a secret; left empty,
 -- the webpki roots baked into the module decide, which is what a
--- public relay's certificate chains to. Each track's init segment
--- rides its own track, <track>.init.
+-- public relay's certificate chains to. The catalog is the hang media
+-- layer's (github.com/kixelated/moq): each rendition entry carries its
+-- codec, its geometry and its fmp4 init segment, so a hang player can
+-- play the broadcast as published.
+--
+-- publish_av() is the same module and the same export with an audio
+-- parameter, for a query that has audio to publish beside the video.
 CREATE FUNCTION publish(v video_stream[], relay text, broadcast text,
                         track text DEFAULT 'video', cert text DEFAULT '')
 RETURNS sink

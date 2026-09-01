@@ -1238,6 +1238,7 @@ version = "0.1.0"
 dependencies = [
  "moq-core",
  "moq-net",
+ "serde_json",
  "tokio",
 ]
 

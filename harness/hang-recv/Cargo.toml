@@ -1,0 +1,21 @@
+# The acceptance test's THIRD-PARTY subscriber: everything between the
+# relay and the output file is hang's own stack (github.com/kixelated/moq),
+# not this package's. moq-native dials the relay, moq-mux reads OUR
+# catalog with hang's parser, picks the renditions it is told to, decodes
+# the CMAF fragments with their container code and re-encodes them as one
+# fmp4 byte stream - which ffprobe must then accept. The pins are what
+# make the claim reproducible: hang's catalog is a convention, not a
+# standard, and these are the versions it was proven against.
+[package]
+name = "hang-recv"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hang = "=0.20.7"
+moq-mux = "=0.9.10"
+moq-native = { version = "=0.19.14", default-features = false, features = ["quinn", "ring"] }
+moq-net = "0.2.15"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+anyhow = "1"
+url = "2"

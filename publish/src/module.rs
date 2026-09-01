@@ -13,7 +13,7 @@ use exports::ffrwd::av::packet_sink::{
 };
 use serde::{Deserialize, Serialize};
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"track":{"type":"string","default":"video","description":"media track name; one stream publishes it as written, several name a rendition apiece under it"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"track":{"type":"string","default":"video","description":"media track name; one stream publishes it as written, several name a rendition apiece under it"},"audio_track":{"type":"string","default":"audio","description":"the audio track's name"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
 
 /// One schema covers both row shapes: a group row carries `group`, the
 /// trailing summary carries `groups`, and each leaves the other's
@@ -29,7 +29,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a non-latest group is kept for a backlogged subscriber. The
 /// default evicts after 5s, which is not enough for one that arrives
-/// mid-broadcast and asks for the init segment or the catalog.
+/// mid-broadcast and asks for the catalog.
 const KEEP: Duration = Duration::from_secs(30);
 
 /// How often the publisher re-checks for its first subscriber. Nothing is
@@ -44,12 +44,18 @@ struct Params {
 	broadcast: String,
 	#[serde(default = "default_track")]
 	track: String,
+	#[serde(default = "default_audio_track")]
+	audio_track: String,
 	#[serde(default)]
 	cert: String,
 }
 
 fn default_track() -> String {
 	"video".into()
+}
+
+fn default_audio_track() -> String {
+	"audio".into()
 }
 
 /// One published group's row.
@@ -88,16 +94,29 @@ impl Executor {
 	}
 }
 
-/// One rendition: one encoded stream, its own fmp4 muxer, and the pair of
-/// MoQ tracks carrying its init segment and its fragments.
+/// What one track carries, past the fields every track has.
+#[derive(Clone, Copy)]
+enum Media {
+	Video { width: u32, height: u32 },
+	Audio { sample_rate: u32, channels: u32 },
+}
+
+/// One stream packaged before the relay is dialed, waiting for the MoQ
+/// tracks it will publish on.
+struct Built {
+	muxer: moq_core::mux::Muxer,
+	codec: String,
+	media: Media,
+	time_base: (i32, i32),
+}
+
+/// One track: one encoded stream, its own fmp4 muxer, and the MoQ track
+/// carrying its fragments. The init segment rides inside the catalog.
 struct Rendition {
 	name: String,
-	init_name: String,
 	codec: String,
-	width: u32,
-	height: u32,
+	media: Media,
 	track: Option<moq_net::track::Producer>,
-	init_track: Option<moq_net::track::Producer>,
 	muxer: moq_core::mux::Muxer,
 	time_base: (i32, i32),
 	init_bytes: u64,
@@ -132,22 +151,31 @@ impl Rendition {
 		Ok(serde_json::to_string(&row).expect("a group row serializes"))
 	}
 
-	/// The init segment onto its own track, once.
-	fn publish_init(&mut self) -> Result<(), String> {
+	/// The catalog entry naming this track: its decoder configuration
+	/// and its init segment inside.
+	fn catalog_entry(&mut self) -> moq_core::catalog::Track {
 		let init = self.muxer.init_segment();
 		self.init_bytes = init.len() as u64;
-		let track = self.init_track.as_mut().expect("init track lives until last");
-		write_group(track, 0, init)
-	}
-
-	fn catalog_entry(&self) -> moq_core::catalog::Track {
-		moq_core::catalog::Track {
-			name: self.name.clone(),
-			init: self.init_name.clone(),
-			kind: "video",
-			codec: self.codec.clone(),
-			width: self.width,
-			height: self.height,
+		match self.media {
+			Media::Video { width, height } => moq_core::catalog::Track::video(
+				self.name.clone(),
+				self.codec.clone(),
+				self.muxer.decoder_config(),
+				width,
+				height,
+				init,
+			),
+			Media::Audio {
+				sample_rate,
+				channels,
+			} => moq_core::catalog::Track::audio(
+				self.name.clone(),
+				self.codec.clone(),
+				self.muxer.decoder_config(),
+				sample_rate,
+				channels,
+				init,
+			),
 		}
 	}
 }
@@ -244,7 +272,7 @@ impl Session {
 		let tracks = self
 			.renditions
 			.iter()
-			.flat_map(|rendition| [rendition.track.as_ref(), rendition.init_track.as_ref()])
+			.map(|rendition| rendition.track.as_ref())
 			.chain(std::iter::once(self.catalog.as_ref()));
 		tracks
 			.flatten()
@@ -255,18 +283,20 @@ impl Session {
 	/// reader has got past the catalog and named the rung it wants.
 	fn rendition_wanted(&self) -> bool {
 		self.renditions.iter().any(|rendition| {
-			[rendition.track.as_ref(), rendition.init_track.as_ref()]
-				.into_iter()
-				.flatten()
-				.any(|track| track.subscription().is_some())
+			rendition
+				.track
+				.as_ref()
+				.is_some_and(|track| track.subscription().is_some())
 		})
 	}
 
-	/// The catalog onto its own track, once, before any fragment.
+	/// The catalog onto its own track, once, before any fragment. It
+	/// carries every rendition's init segment, so nothing else has to go
+	/// out before the media.
 	fn publish_catalog(&mut self) -> Result<(), String> {
 		let catalog = moq_core::catalog::Catalog::new(
 			self.renditions
-				.iter()
+				.iter_mut()
 				.map(Rendition::catalog_entry)
 				.collect(),
 		);
@@ -291,9 +321,6 @@ impl Session {
 			}
 			self.publish_catalog()?;
 			// Then the media, once a rung has actually been asked for.
-			// Every init goes out together, so a subscriber that switches
-			// renditions mid-broadcast finds the one it moves to already
-			// described.
 			//
 			// A reader still choosing when this fires starts at the group
 			// it arrives in, as a reader of any live broadcast does: a
@@ -302,9 +329,6 @@ impl Session {
 			// asked yet.
 			while !self.rendition_wanted() {
 				tokio::time::sleep(POLL).await;
-			}
-			for index in 0..self.renditions.len() {
-				self.renditions[index].publish_init()?;
 			}
 			self.started = true;
 		}
@@ -342,9 +366,7 @@ impl Session {
 			}
 			tokio::time::sleep(DRAIN).await;
 			for rendition in &mut self.renditions {
-				let closing = [rendition.track.take(), rendition.init_track.take()];
-				for track in closing.into_iter().flatten() {
-					let mut track = track;
+				if let Some(mut track) = rendition.track.take() {
 					track.finish().map_err(|err| format!("moq track: {err}"))?;
 				}
 			}
@@ -395,45 +417,108 @@ impl Guest for Publish {
 				channel_counts: vec![],
 				rows_language: vec![],
 			},
-			// The fmp4 packaging is h264-shaped: avcC from SPS/PPS.
+			// The fmp4 packaging is codec-shaped: avcC from SPS/PPS for
+			// video, esds from the AudioSpecificConfig for audio.
 			codecs: vec!["h264".to_string()],
-			audio_codecs: vec![],
-			// One broadcast carries as many renditions as the query names.
+			audio_codecs: vec!["aac".to_string()],
+			// One broadcast carries as many renditions as the query names,
+			// and the audio it names beside them - or none, for a query
+			// that has none.
 			video: Arity::Many,
-			audio: Arity::Zero,
+			audio: Arity::Any,
 		}
 	}
 
 	fn init(streams: Vec<InputStream>, params: String) -> Result<(), String> {
 		let params = parse_params(&params)?;
 		if streams.is_empty() {
-			return Err("publish reads at least one video stream".into());
+			return Err("publish reads at least one stream".into());
 		}
 		// Every muxer is built before the session, so a stream this
 		// module cannot package is refused before anything is dialed.
 		let mut built = Vec::with_capacity(streams.len());
 		for stream in &streams {
 			let coded = &stream.coded;
-			if coded.codec != "h264" {
-				return Err(format!(
-					"publish packages h264, and this stream is {}",
-					coded.codec
-				));
-			}
-			let CodedFormat::Video(video) = coded.format else {
-				return Err("publish packages video, and this stream is audio".into());
-			};
-			let muxer = moq_core::mux::Muxer::new(
-				&coded.extradata,
-				video.width,
-				video.height,
-				coded.time_base.num,
-				coded.time_base.den,
-			)?;
-			built.push((muxer, video.width, video.height, coded.time_base));
+			built.push(match coded.format {
+				CodedFormat::Video(video) => {
+					if coded.codec != "h264" {
+						return Err(format!(
+							"publish packages h264 video, and this stream is {}",
+							coded.codec
+						));
+					}
+					let muxer = moq_core::mux::Muxer::video(
+						&coded.extradata,
+						video.width,
+						video.height,
+						coded.time_base.num,
+						coded.time_base.den,
+					)?;
+					let codec = moq_core::catalog::avc_codec(
+						muxer.avcc().expect("a video muxer builds an avcC"),
+					);
+					Built {
+						muxer,
+						codec,
+						media: Media::Video {
+							width: video.width,
+							height: video.height,
+						},
+						time_base: (coded.time_base.num, coded.time_base.den),
+					}
+				}
+				CodedFormat::Audio(audio) => {
+					if coded.codec != "aac" {
+						return Err(format!(
+							"publish packages aac audio, and this stream is {}",
+							coded.codec
+						));
+					}
+					let muxer = moq_core::mux::Muxer::audio(
+						&coded.extradata,
+						audio.sample_rate,
+						audio.channels,
+						coded.time_base.num,
+						coded.time_base.den,
+					)?;
+					Built {
+						muxer,
+						// The AudioSpecificConfig crosses as extradata,
+						// and is what names the codec.
+						codec: moq_core::catalog::aac_codec(&coded.extradata),
+						media: Media::Audio {
+							sample_rate: audio.sample_rate,
+							channels: audio.channels,
+						},
+						time_base: (coded.time_base.num, coded.time_base.den),
+					}
+				}
+			});
 		}
-		let heights: Vec<u32> = built.iter().map(|(_, _, height, _)| *height).collect();
-		let names = moq_core::catalog::track_names(&params.track, &heights);
+		// The video streams name a rendition apiece by height; the audio
+		// stream takes the track name it was given.
+		let heights: Vec<u32> = built
+			.iter()
+			.filter_map(|b| match b.media {
+				Media::Video { height, .. } => Some(height),
+				Media::Audio { .. } => None,
+			})
+			.collect();
+		let mut video_names = moq_core::catalog::track_names(&params.track, &heights).into_iter();
+		let mut audio_names = 0u32;
+		let names: Vec<String> = built
+			.iter()
+			.map(|b| match b.media {
+				Media::Video { .. } => video_names.next().expect("one name per video stream"),
+				Media::Audio { .. } => {
+					audio_names += 1;
+					match audio_names {
+						1 => params.audio_track.clone(),
+						nth => format!("{}.{}", params.audio_track, nth - 1),
+					}
+				}
+			})
+			.collect();
 
 		let (host, port) = parse_relay(&params.relay)?;
 		let literal: Option<IpAddr> = host.parse().ok();
@@ -475,14 +560,10 @@ impl Guest for Publish {
 				.map_err(|err| format!("track '{catalog_name}': {err}"))?;
 			let mut tracks = Vec::with_capacity(names.len());
 			for name in &names {
-				let init_name = moq_core::catalog::init_name(name);
-				let init_track = broadcast
-					.create_track(init_name.as_str(), info.clone())
-					.map_err(|err| format!("track '{init_name}': {err}"))?;
 				let track = broadcast
 					.create_track(name.as_str(), info.clone())
 					.map_err(|err| format!("track '{name}': {err}"))?;
-				tracks.push((init_name, init_track, track));
+				tracks.push(track);
 			}
 			// A looked-up name can carry several addresses; each gets
 			// the full connect timeout before the next is tried.
@@ -524,25 +605,18 @@ impl Guest for Publish {
 			.into_iter()
 			.zip(names)
 			.zip(tracks)
-			.map(
-				|(((muxer, width, height, time_base), name), (init_name, init_track, track))| {
-					Rendition {
-						codec: moq_core::catalog::avc_codec(muxer.avcc()),
-						name,
-						init_name,
-						width,
-						height,
-						track: Some(track),
-						init_track: Some(init_track),
-						muxer,
-						time_base: (time_base.num, time_base.den),
-						init_bytes: 0,
-						groups: 0,
-						packets: 0,
-						bytes: 0,
-					}
-				},
-			)
+			.map(|((built, name), track)| Rendition {
+				name,
+				codec: built.codec,
+				media: built.media,
+				track: Some(track),
+				muxer: built.muxer,
+				time_base: built.time_base,
+				init_bytes: 0,
+				groups: 0,
+				packets: 0,
+				bytes: 0,
+			})
 			.collect();
 
 		let driver = connected.driver;

@@ -162,7 +162,7 @@ def start_subscriber(
             "--env", f"RENDITION={rendition}",
             "--env", f"OUTPUT=/out/{output}"]
     if track is not None:
-        argv += ["--env", f"TRACK={track}", "--env", f"INIT_TRACK={track}.init"]
+        argv += ["--env", f"TRACK={track}"]
     return spawn(
         [*argv, str(wasm)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -205,6 +205,64 @@ def build_guests(deadline: int) -> tuple[Path, Path, Path]:
     release = PACKAGE / "target" / "wasm32-wasip2" / "release"
     certgen = PACKAGE / "harness" / "certgen" / "target" / "release" / f"certgen{EXE}"
     return release / "publish.wasm", release / "sub-recv.wasm", certgen
+
+
+def build_hang_recv(deadline: int) -> Path:
+    """The third-party subscriber, built from the pinned hang stack."""
+    done = run(
+        ["cargo", "build", "--release", "--manifest-path",
+         PACKAGE / "harness" / "hang-recv" / "Cargo.toml"],
+        deadline, cwd=PACKAGE,
+    )
+    if done.returncode != 0:
+        sys.exit("the hang-recv build failed")
+    return PACKAGE / "harness" / "hang-recv" / "target" / "release" / f"hang-recv{EXE}"
+
+
+def start_hang_recv(
+    exe: Path,
+    port: int,
+    cert_pem: Path,
+    out_path: Path,
+    broadcast: str,
+    *,
+    video: str | None = None,
+    audio: str | None = None,
+) -> subprocess.Popen:
+    """hang's own stack against the broadcast: their catalog parser, their
+    CMAF depacketizer, their fmp4 writer. See harness/hang-recv."""
+    env = dict(os.environ)
+    env["RELAY_PORT"] = str(port)
+    env["RELAY_CERT_PEM"] = str(cert_pem)
+    env["BROADCAST"] = broadcast
+    env["OUTPUT"] = str(out_path)
+    for name in ("VIDEO", "AUDIO"):
+        env.pop(name, None)
+    if video is not None:
+        env["VIDEO"] = video
+    if audio is not None:
+        env["AUDIO"] = audio
+    return spawn(
+        [str(exe)], env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+
+
+def wait_hang_recv(sub: subprocess.Popen, deadline: int) -> str:
+    try:
+        stdout, stderr = sub.communicate(timeout=deadline)
+    except subprocess.TimeoutExpired:
+        kill_tree(sub)
+        stdout, stderr = sub.communicate()
+        sys.exit(f"hang-recv did not finish:\n{stdout}\n{stderr[-800:]}")
+    print("--- hang-recv transcript ---")
+    print(stdout)
+    if stderr.strip():
+        print("--- hang-recv stderr ---")
+        print(stderr[-1200:])
+    if sub.returncode != 0 or "hang: PASS" not in stdout:
+        sys.exit("hang-recv did not pass")
+    return stdout
 
 
 def ffprobe_frames(path: Path, deadline: int) -> int:
