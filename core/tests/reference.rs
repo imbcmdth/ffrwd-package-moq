@@ -13,12 +13,13 @@
 //! reference's own fragments - sample bytes reframed to the Annex-B
 //! the encoded edge carries, decode and presentation times off `tfdt`
 //! and the `trun` entries, keyframes off the sample flags - and fed to
-//! the muxer, whose output must then agree with the reference fragment
-//! by fragment: sequence numbers, decode times, sample sizes,
-//! durations, presentation offsets, sync flags, and the `mdat` payload
-//! byte for byte. The `avcC` built from the SPS/PPS must equal the
-//! reference's exactly. When ffprobe is on the PATH the muxer's own
-//! output must also decode whole.
+//! the muxer, whose output must then agree with the reference sample
+//! by sample: one fragment apiece, group starts exactly at the
+//! reference's own keyframe cuts, decode times, sizes, durations,
+//! presentation offsets, sync flags, and the `mdat` payload byte for
+//! byte. The `avcC` built from the SPS/PPS must equal the reference's
+//! exactly. When ffprobe is on the PATH the muxer's own output must
+//! also decode whole.
 
 use moq_core::fmp4::{Scanner, Segment};
 use moq_core::mux::{Muxer, Packet};
@@ -60,61 +61,70 @@ fn the_muxer_agrees_with_ffmpeg_fragment_by_fragment() {
 	let mut ours = Vec::new();
 	for sample in &reference.samples {
 		let annexb = avcc_to_annexb(&sample.data);
-		let closed = muxer
-			.push(Packet {
-				pts: sample.pts,
-				dts: Some(sample.dts),
-				keyframe: sample.keyframe,
-				data: &annexb,
-			})
-			.expect("push");
-		if let Some(fragment) = closed {
-			ours.push(fragment);
-		}
+		ours.extend(
+			muxer
+				.push(Packet {
+					pts: sample.pts,
+					dts: Some(sample.dts),
+					// The NUT wire supplies no duration for a reordering
+					// stream, and this reference has B-frames: the muxer's
+					// lookahead is the path under test, byte-identically.
+					duration: None,
+					keyframe: sample.keyframe,
+					data: &annexb,
+				})
+				.expect("push"),
+		);
 	}
-	if let Some(fragment) = muxer.finish().expect("finish") {
-		ours.push(fragment);
-	}
+	ours.extend(muxer.finish().expect("finish"));
 
+	// One fragment per sample; everything asserted is still the
+	// reference's own numbers, read at the sample level.
 	assert_eq!(
 		ours.len(),
-		reference.fragments.len(),
-		"fragment counts diverge"
+		reference.samples.len(),
+		"one fragment per reference sample"
 	);
-	for (mine, theirs) in ours.iter().zip(&reference.fragments) {
+	// Group starts land exactly where the reference cut its fragments.
+	let starts: Vec<usize> = ours
+		.iter()
+		.enumerate()
+		.filter(|(_, fragment)| fragment.starts_group)
+		.map(|(i, _)| i)
+		.collect();
+	let mut cuts = Vec::with_capacity(reference.fragments.len());
+	let mut at = 0usize;
+	for fragment in &reference.fragments {
+		cuts.push(at);
+		at += fragment.samples.len();
+	}
+	assert_eq!(starts, cuts, "group starts are the reference's fragment cuts");
+
+	for (i, (mine, theirs)) in ours.iter().zip(&reference.samples).enumerate() {
 		let parsed = parse_fragment(&mine.bytes);
-		assert_eq!(mine.sequence, theirs.sequence, "mfhd sequence");
-		assert_eq!(parsed.sequence, theirs.sequence, "mfhd sequence as written");
+		assert_eq!(mine.sequence, i as u32 + 1, "mfhd sequence");
+		assert_eq!(parsed.sequence, mine.sequence, "mfhd sequence as written");
 		assert_eq!(
-			parsed.base_decode_time, theirs.base_decode_time,
-			"tfdt of fragment {}",
-			theirs.sequence
+			parsed.base_decode_time, theirs.dts as u64,
+			"tfdt of sample {i}"
+		);
+		assert_eq!(parsed.samples.len(), 1, "sample count of fragment {i}");
+		let entry = parsed.samples[0];
+		assert_eq!(entry.size as usize, theirs.data.len(), "size of sample {i}");
+		assert_eq!(entry.duration, theirs.duration, "duration of sample {i}");
+		assert_eq!(
+			entry.cts,
+			theirs.pts - theirs.dts,
+			"presentation offset of sample {i}"
 		);
 		assert_eq!(
-			parsed.samples.len(),
-			theirs.samples.len(),
-			"sample count of fragment {}",
-			theirs.sequence
+			entry.flags & NON_SYNC == 0,
+			theirs.keyframe,
+			"sync flag of sample {i}"
 		);
-		for (a, b) in parsed.samples.iter().zip(&theirs.samples) {
-			assert_eq!(a.size, b.size, "sample size in fragment {}", theirs.sequence);
-			assert_eq!(
-				a.duration, b.duration,
-				"sample duration in fragment {}",
-				theirs.sequence
-			);
-			assert_eq!(a.cts, b.cts, "presentation offset in fragment {}", theirs.sequence);
-			assert_eq!(
-				a.flags & NON_SYNC,
-				b.flags & NON_SYNC,
-				"sync flag in fragment {}",
-				theirs.sequence
-			);
-		}
 		assert_eq!(
-			parsed.mdat, theirs.mdat,
-			"mdat payload of fragment {} is not byte-identical",
-			theirs.sequence
+			parsed.mdat, theirs.data,
+			"mdat payload of sample {i} is not byte-identical"
 		);
 	}
 
@@ -160,6 +170,7 @@ struct RefSample {
 	data: Vec<u8>,
 	dts: i64,
 	pts: i64,
+	duration: u32,
 	keyframe: bool,
 }
 
@@ -221,6 +232,7 @@ impl Reference {
 					data,
 					dts,
 					pts: dts + sample.cts,
+					duration: sample.duration,
 					keyframe: sample.flags & NON_SYNC == 0,
 				});
 				dts += sample.duration as i64;

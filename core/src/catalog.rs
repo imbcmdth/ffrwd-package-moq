@@ -21,6 +21,13 @@ use serde::Serialize;
 /// The track a broadcast describes itself on: hang's `Catalog::DEFAULT_NAME`.
 pub const TRACK: &str = "catalog.json";
 
+/// The buffer depth recommended to AUDIO readers, in milliseconds.
+/// Live capture hands the pipeline audio in bursts hundreds of
+/// milliseconds wide; a reader holding this much plays through them.
+/// Video gets no recommendation: it arrives smoothly, and a held-back
+/// picture at the live edge is skipped rather than shown.
+pub const AUDIO_JITTER_MS: u32 = 600;
+
 /// One video rendition's entry, hang's `VideoConfig` subset.
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,6 +53,8 @@ pub struct AudioRendition {
 	pub description: String,
 	pub sample_rate: u32,
 	pub number_of_channels: u32,
+	/// Capture bursts become latency, not gaps.
+	pub jitter: u32,
 	pub container: Container,
 }
 
@@ -119,6 +128,7 @@ impl Track {
 				description: hex(config),
 				sample_rate,
 				number_of_channels: channels,
+				jitter: AUDIO_JITTER_MS,
 				container: Container { init },
 			},
 		)
@@ -222,12 +232,25 @@ pub fn track_names(base: &str, heights: &[u32]) -> Vec<String> {
 }
 
 /// The RFC 6381 codec string an `avcC` record spells: the profile, the
-/// constraint flags and the level, which are its bytes 1 through 3.
+/// constraint flags and the level, which are its bytes 1 through 3. The
+/// fallback for a stream that names no profile or level of its own.
 pub fn avc_codec(avcc: &[u8]) -> String {
 	match avcc.get(1..4) {
 		Some(triple) => format!("avc1.{:02x}{:02x}{:02x}", triple[0], triple[1], triple[2]),
 		None => "avc1".to_string(),
 	}
+}
+
+/// The same codec string from the stream's own profile and level, the
+/// preferred source: a stream whose extradata is empty still names them.
+/// The constraint flags are the one byte they do not carry, read off the
+/// `avcC` where it has one and zero otherwise.
+pub fn avc_codec_from(profile: i32, level: i32, avcc: &[u8]) -> String {
+	let constraints = avcc.get(2).copied().unwrap_or(0);
+	format!(
+		"avc1.{:02x}{constraints:02x}{:02x}",
+		profile as u8, level as u8
+	)
 }
 
 /// The RFC 6381 codec string an AudioSpecificConfig spells: `mp4a.40`,
@@ -286,6 +309,25 @@ mod tests {
 	#[test]
 	fn an_unreadable_avcc_still_names_the_codec() {
 		assert_eq!(avc_codec(&[1, 0x64]), "avc1");
+	}
+
+	#[test]
+	fn the_streams_own_profile_and_level_agree_with_the_avcc() {
+		// An intact avcC and the stream's numbers spell the same string;
+		// the middle byte is the avcC's, the outer two the stream's.
+		let avcc = [1u8, 0x64, 0x00, 0x1f, 0xff];
+		assert_eq!(avc_codec_from(0x64, 0x1f, &avcc), avc_codec(&avcc));
+		assert_eq!(avc_codec_from(0x64, 0x1f, &avcc), "avc1.64001f");
+		// Constrained baseline: the constraint flags come off the avcC.
+		assert_eq!(
+			avc_codec_from(66, 30, &[1, 0x42, 0xc0, 0x1e]),
+			"avc1.42c01e"
+		);
+	}
+
+	#[test]
+	fn without_an_avcc_the_constraint_flags_read_zero() {
+		assert_eq!(avc_codec_from(0x64, 0x28, &[]), "avc1.640028");
 	}
 
 	#[test]
@@ -365,7 +407,7 @@ mod tests {
 		let document = String::from_utf8(catalog.document().expect("serializes")).unwrap();
 		assert_eq!(
 			document,
-			r#"{"video":{"renditions":{}},"audio":{"renditions":{"audio":{"codec":"mp4a.40.2","description":"1190","sampleRate":48000,"numberOfChannels":2,"container":{"kind":"cmaf","init":"AAEC"}}}}}"#
+			r#"{"video":{"renditions":{}},"audio":{"renditions":{"audio":{"codec":"mp4a.40.2","description":"1190","sampleRate":48000,"numberOfChannels":2,"jitter":600,"container":{"kind":"cmaf","init":"AAEC"}}}}}"#
 		);
 	}
 }

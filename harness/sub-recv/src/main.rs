@@ -117,14 +117,12 @@ mod live {
 		let mut collected: Vec<(u64, Vec<u8>)> = Vec::new();
 		let mut fragments = 0u64;
 		let mut bytes = init.len() as u64;
+		// No per-frame print: a fragment is one sample now, and the
+		// harness reads these pipes only at the end - hundreds of lines
+		// would fill the pipe and block the guest mid-broadcast. The
+		// on_group line above carries each group's frame count.
 		while let Some(frame) = stream.next().await? {
 			bytes += frame.payload.len() as u64;
-			println!(
-				"sub: fragment {fragments} group {} bytes {} pts {:.3}s",
-				frame.group,
-				frame.payload.len(),
-				frame.timestamp_us as f64 / 1_000_000.0,
-			);
 			collected.push((frame.group, frame.payload.to_vec()));
 			fragments += 1;
 		}

@@ -401,11 +401,11 @@ def one_run(
 
 
 def groups_received(transcript: str) -> list[int]:
-    """The group numbers one subscriber wrote, in arrival order."""
+    """The group numbers one subscriber completed, in arrival order."""
     return [
-        int(line.split()[4])
+        int(line.split()[2])
         for line in transcript.splitlines()
-        if line.startswith("sub: fragment ")
+        if line.startswith("sub: group ") and " complete with " in line
     ]
 
 

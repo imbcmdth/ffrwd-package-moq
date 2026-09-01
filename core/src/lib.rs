@@ -4,8 +4,9 @@
 //! - [`mux`] builds fragmented MP4 from encoded packets: an init
 //!   segment from the stream's out-of-band header - h264's SPS/PPS into
 //!   an `avc1`, AAC's AudioSpecificConfig into an `mp4a` - then one
-//!   `moof`+`mdat` fragment per group, rotated at keyframe packets for
-//!   video and on a target duration for audio, which has none.
+//!   `moof`+`mdat` fragment per sample, each marked where it starts a
+//!   group: at keyframe packets for video and on a target duration for
+//!   audio, which has none.
 //! - [`avc`] is the h264 byte-level knowledge under it: Annex-B NAL
 //!   cutting, AVCC length-prefix framing, and the `avcC` record.
 //! - [`catalog`] is the document a broadcast describes itself with - in

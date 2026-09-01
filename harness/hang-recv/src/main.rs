@@ -12,7 +12,9 @@
 //! Environment: `RELAY_PORT`, `RELAY_CERT_PEM` (path to the relay's
 //! certificate), `BROADCAST` (path), `OUTPUT` (file path). `VIDEO` and
 //! `AUDIO` each name a rendition to take; either may be absent, not
-//! both. Prints `hang:` lines the test asserts.
+//! both. Prints `hang:` lines the test asserts. `RELAY_URL` (a full
+//! relay URL, credentials and all) replaces the localhost pair:
+//! moq-native dials it as written, trusting the OS roots.
 
 use std::io::Write;
 
@@ -22,8 +24,6 @@ fn env(name: &str) -> anyhow::Result<String> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-	let port: u16 = env("RELAY_PORT")?.parse()?;
-	let cert_pem = env("RELAY_CERT_PEM")?;
 	let broadcast_path = env("BROADCAST")?;
 	let output = env("OUTPUT")?;
 	let video = std::env::var("VIDEO").ok();
@@ -32,12 +32,21 @@ async fn main() -> anyhow::Result<()> {
 		anyhow::bail!("name a rendition: VIDEO, AUDIO or both");
 	}
 
-	let url = url::Url::parse(&format!("moqt://127.0.0.1:{port}"))?;
 	let mut config = moq_native::ClientConfig::default();
+	let url = match std::env::var("RELAY_URL") {
+		// A full URL: dialed as written, trusted against the OS roots.
+		Ok(relay_url) => url::Url::parse(&relay_url)?,
+		Err(_) => {
+			let port: u16 = env("RELAY_PORT")?.parse()?;
+			let cert_pem = env("RELAY_CERT_PEM")?;
+			let url = url::Url::parse(&format!("moqt://127.0.0.1:{port}"))?;
+			config.tls.root = vec![cert_pem.into()];
+			// The certificate names localhost; the dial is by IP.
+			config.tls.host_name = Some("localhost".into());
+			url
+		}
+	};
 	config.connect = Some(url.clone());
-	config.tls.root = vec![cert_pem.into()];
-	// The certificate names localhost; the dial is by IP.
-	config.tls.host_name = Some("localhost".into());
 	let client = config.init()?;
 
 	let origin = moq_net::Origin::random().produce();

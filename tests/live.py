@@ -158,7 +158,9 @@ def one_run(publish_wasm: Path, sub_wasm: Path, certgen: Path, keep: bool) -> No
         )
         words = line.split()
         sub_fragments, sub_groups, sub_bytes = int(words[2]), int(words[5]), int(words[7])
-        assert sub_fragments == len(group_rows), "fragment counts diverge"
+        # One fragment per sample: the reader's fragment count is the
+        # packet count, its group count the group rows.
+        assert sub_fragments == summary["packets"], "fragment counts diverge"
         assert sub_groups == len(group_rows), "group counts diverge"
         assert sub_bytes == summary["bytes"] + summary["init_bytes"], "byte counts diverge"
 

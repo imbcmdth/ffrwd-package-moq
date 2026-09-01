@@ -9,8 +9,8 @@
 -- the module takes h264 video and aac audio.
 --
 -- track names the video renditions, by the height each encodes;
--- audio_track names the audio track. relay and cert read as they do
--- for publish().
+-- audio_track names the audio track. relay, cert and token read as
+-- they do for publish().
 --
 -- a is ONE stream, not an array, because a ladder's own cross join
 -- repeats the audio row once per rung: array_agg over it would gather
@@ -23,6 +23,6 @@ CREATE FUNCTION publish_av(v video_stream[], a audio_stream,
                            relay text, broadcast text,
                            track text DEFAULT 'video',
                            audio_track text DEFAULT 'audio',
-                           cert text DEFAULT '')
+                           cert text DEFAULT '', token text DEFAULT '')
 RETURNS sink
   AS 'target/wasm32-wasip2/release/publish.wasm', 'publish' LANGUAGE wasm;

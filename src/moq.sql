@@ -17,9 +17,15 @@
 -- codec, its geometry and its fmp4 init segment, so a hang player can
 -- play the broadcast as published.
 --
+-- token is an auth token a public relay demands (a JWT, typically),
+-- sent as the session's request path; empty sends none. It lands in
+-- the module's params on the command line - scoped, expiring
+-- credentials only, the same caveat the query text carries.
+--
 -- publish_av() is the same module and the same export with an audio
 -- parameter, for a query that has audio to publish beside the video.
 CREATE FUNCTION publish(v video_stream[], relay text, broadcast text,
-                        track text DEFAULT 'video', cert text DEFAULT '')
+                        track text DEFAULT 'video', cert text DEFAULT '',
+                        token text DEFAULT '')
 RETURNS sink
   AS 'target/wasm32-wasip2/release/publish.wasm', 'publish' LANGUAGE wasm;

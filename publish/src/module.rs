@@ -13,7 +13,7 @@ use exports::ffrwd::av::packet_sink::{
 };
 use serde::{Deserialize, Serialize};
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"track":{"type":"string","default":"video","description":"media track name; one stream publishes it as written, several name a rendition apiece under it"},"audio_track":{"type":"string","default":"audio","description":"the audio track's name"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"track":{"type":"string","default":"video","description":"media track name; one stream publishes it as written, several name a rendition apiece under it"},"audio_track":{"type":"string","default":"audio","description":"the audio track's name"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
 
 /// One schema covers both row shapes: a group row carries `group`, the
 /// trailing summary carries `groups`, and each leaves the other's
@@ -37,6 +37,21 @@ const KEEP: Duration = Duration::from_secs(30);
 /// so anything published earlier is simply gone.
 const POLL: Duration = Duration::from_millis(20);
 
+/// How long the first media is held for that first subscriber before it
+/// goes out regardless. The hold keeps a file's start from being lost
+/// to the latest-group rule, and the harness readers arrive within a
+/// second - but an unwatched live publish must still flow: the pipes
+/// feeding the module are bounded, and a stalled stage is killed. First
+/// reader or this, whichever comes first.
+const HOLD_MAX: Duration = Duration::from_secs(10);
+
+/// How often the catalog goes out again, the same snapshot in a fresh
+/// group, while the broadcast lives. A relay that does not retain a
+/// track's last closed group has nothing to hand a late joiner, whose
+/// catalog.json subscription would otherwise wait forever. It is ~1KB;
+/// the cost is nothing.
+const CATALOG_REFRESH: Duration = Duration::from_secs(3);
+
 #[derive(Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Params {
@@ -48,6 +63,11 @@ struct Params {
 	audio_track: String,
 	#[serde(default)]
 	cert: String,
+	// The token rides the params JSON, which is visible on the sidecar
+	// command line - scoped, expiring credentials only, the same caveat
+	// the query text already carries.
+	#[serde(default)]
+	token: String,
 }
 
 fn default_track() -> String {
@@ -117,12 +137,19 @@ struct Rendition {
 	codec: String,
 	media: Media,
 	track: Option<moq_net::track::Producer>,
+	/// The open MoQ group, rotated where the muxer marks a group start.
+	group: Option<moq_net::group::Producer>,
 	muxer: moq_core::mux::Muxer,
 	time_base: (i32, i32),
 	init_bytes: u64,
 	groups: u64,
 	packets: u64,
 	bytes: u64,
+	/// The open group's accumulators, for its row when it closes.
+	group_packets: u64,
+	group_bytes: u64,
+	group_pts_min: i64,
+	group_pts_max: i64,
 }
 
 impl Rendition {
@@ -130,25 +157,64 @@ impl Rendition {
 		ticks as f64 * self.time_base.0 as f64 / self.time_base.1 as f64
 	}
 
-	/// Publishes one fragment as one MoQ frame in a group of its own,
-	/// and returns the group's row.
-	fn publish_fragment(&mut self, fragment: moq_core::mux::Fragment) -> Result<String, String> {
+	/// Publishes one single-sample fragment as one MoQ frame in the
+	/// open group, rotating the group where the muxer marked a start.
+	/// A rotation closes the group before it and returns its row.
+	fn publish_fragment(
+		&mut self,
+		fragment: moq_core::mux::Fragment,
+	) -> Result<Option<String>, String> {
+		let mut row = None;
+		if fragment.starts_group {
+			row = self.close_group()?;
+			let track = self.track.as_mut().expect("track lives until last");
+			self.group = Some(
+				track
+					.append_group()
+					.map_err(|err| format!("moq group: {err}"))?,
+			);
+			self.group_packets = 0;
+			self.group_bytes = 0;
+			self.group_pts_min = fragment.pts;
+			self.group_pts_max = fragment.pts;
+		}
 		let timestamp_us =
-			moq_core::mux::ticks_to_micros(fragment.pts_min, self.time_base.0, self.time_base.1);
+			moq_core::mux::ticks_to_micros(fragment.pts, self.time_base.0, self.time_base.1);
 		let bytes_len = fragment.bytes.len() as u64;
+		let group = self.group.as_mut().expect("a group start opened one");
+		group
+			.write_frame(
+				moq_net::Timestamp::from_micros(timestamp_us)
+					.map_err(|err| format!("moq timestamp: {err}"))?,
+				Bytes::from(fragment.bytes),
+			)
+			.map_err(|err| format!("moq frame: {err}"))?;
+		self.group_packets += 1;
+		self.group_bytes += bytes_len;
+		self.group_pts_min = self.group_pts_min.min(fragment.pts);
+		self.group_pts_max = self.group_pts_max.max(fragment.pts);
+		self.bytes += bytes_len;
+		Ok(row)
+	}
+
+	/// Closes the open group, if any, and returns its row.
+	fn close_group(&mut self) -> Result<Option<String>, String> {
+		let Some(mut group) = self.group.take() else {
+			return Ok(None);
+		};
+		group.finish().map_err(|err| format!("moq group: {err}"))?;
 		let row = GroupRow {
 			track: self.name.clone(),
 			group: self.groups,
-			packets: fragment.samples,
-			bytes: bytes_len,
-			pts_start: self.seconds(fragment.pts_min),
-			pts_end: self.seconds(fragment.pts_max),
+			packets: self.group_packets,
+			bytes: self.group_bytes,
+			pts_start: self.seconds(self.group_pts_min),
+			pts_end: self.seconds(self.group_pts_max),
 		};
-		let track = self.track.as_mut().expect("track lives until last");
-		write_group(track, timestamp_us, fragment.bytes)?;
 		self.groups += 1;
-		self.bytes += bytes_len;
-		Ok(serde_json::to_string(&row).expect("a group row serializes"))
+		Ok(Some(
+			serde_json::to_string(&row).expect("a group row serializes"),
+		))
 	}
 
 	/// The catalog entry naming this track: its decoder configuration
@@ -209,6 +275,8 @@ struct Session {
 	params: Params,
 	/// Set once a subscriber arrived and the init segments went out.
 	started: bool,
+	/// When the catalog last went out; see [`CATALOG_REFRESH`].
+	catalog_sent: Option<std::time::Instant>,
 }
 
 struct State {
@@ -302,7 +370,9 @@ impl Session {
 		);
 		let document = catalog.document()?;
 		let track = self.catalog.as_mut().expect("catalog lives until last");
-		write_group(track, 0, document)
+		write_group(track, 0, document)?;
+		self.catalog_sent = Some(std::time::Instant::now());
+		Ok(())
 	}
 
 	/// One host call's work: hold for the first subscriber, feed each
@@ -316,7 +386,8 @@ impl Session {
 			// The catalog goes out to the first reader of anything: it is
 			// what a subscriber needs before it can name a rendition, so
 			// holding it until a rendition is named would hold it forever.
-			while !self.wanted() {
+			let deadline = tokio::time::Instant::now() + HOLD_MAX;
+			while !self.wanted() && tokio::time::Instant::now() < deadline {
 				tokio::time::sleep(POLL).await;
 			}
 			self.publish_catalog()?;
@@ -327,10 +398,18 @@ impl Session {
 			// subscription begins at the LATEST group, and there is no
 			// rendezvous in the protocol to wait for one that has not
 			// asked yet.
-			while !self.rendition_wanted() {
+			while !self.rendition_wanted() && tokio::time::Instant::now() < deadline {
 				tokio::time::sleep(POLL).await;
 			}
 			self.started = true;
+		}
+		// The same catalog again in a fresh group, for the late joiner
+		// whose relay no longer holds the first one.
+		if self
+			.catalog_sent
+			.is_some_and(|sent| sent.elapsed() >= CATALOG_REFRESH)
+		{
+			self.publish_catalog()?;
 		}
 
 		for (index, pad) in pads.iter().enumerate() {
@@ -338,15 +417,18 @@ impl Session {
 				continue;
 			};
 			for packet in &pad.packets {
-				let closed = rendition.muxer.push(moq_core::mux::Packet {
+				let fragments = rendition.muxer.push(moq_core::mux::Packet {
 					pts: packet.pts,
 					dts: packet.dts,
+					duration: packet.duration,
 					keyframe: packet.keyframe,
 					data: &packet.data,
 				})?;
 				rendition.packets += 1;
-				if let Some(fragment) = closed {
-					rows.push(rendition.publish_fragment(fragment)?);
+				for fragment in fragments {
+					if let Some(row) = rendition.publish_fragment(fragment)? {
+						rows.push(row);
+					}
 				}
 			}
 			// Let the driver move the frames onto the wire now, not
@@ -360,8 +442,13 @@ impl Session {
 			// it is over while its own tail is still queued loses that
 			// tail. The yield is what lets the driver move them.
 			for index in 0..self.renditions.len() {
-				if let Some(fragment) = self.renditions[index].muxer.finish()? {
-					rows.push(self.renditions[index].publish_fragment(fragment)?);
+				for fragment in self.renditions[index].muxer.finish()? {
+					if let Some(row) = self.renditions[index].publish_fragment(fragment)? {
+						rows.push(row);
+					}
+				}
+				if let Some(row) = self.renditions[index].close_group()? {
+					rows.push(row);
 				}
 			}
 			tokio::time::sleep(DRAIN).await;
@@ -439,7 +526,7 @@ impl Guest for Publish {
 		let mut built = Vec::with_capacity(streams.len());
 		for stream in &streams {
 			let coded = &stream.coded;
-			built.push(match coded.format {
+			built.push(match &coded.format {
 				CodedFormat::Video(video) => {
 					if coded.codec != "h264" {
 						return Err(format!(
@@ -454,9 +541,16 @@ impl Guest for Publish {
 						coded.time_base.num,
 						coded.time_base.den,
 					)?;
-					let codec = moq_core::catalog::avc_codec(
-						muxer.avcc().expect("a video muxer builds an avcC"),
-					);
+					// The stream's own profile and level name the codec;
+					// parsing the avcC is the fallback for a wire that
+					// does not say.
+					let avcc = muxer.avcc().expect("a video muxer builds an avcC");
+					let codec = match (coded.profile, coded.level) {
+						(Some(profile), Some(level)) => {
+							moq_core::catalog::avc_codec_from(profile, level, avcc)
+						}
+						_ => moq_core::catalog::avc_codec(avcc),
+					};
 					Built {
 						muxer,
 						codec,
@@ -567,7 +661,12 @@ impl Guest for Publish {
 			}
 			// A looked-up name can carry several addresses; each gets
 			// the full connect timeout before the next is tried.
-			let client = moq_net::Client::new().with_publisher(origin.consume());
+			let mut client = moq_net::Client::new().with_publisher(origin.consume());
+			// A raw-QUIC dial carries no request URI; the token relay
+			// (Cloudflare's, say) wants is the SETUP path itself.
+			if !params.token.is_empty() {
+				client = client.with_path(format!("/{}", params.token));
+			}
 			let mut connected = None;
 			let mut last_err = String::new();
 			for addr in &addrs {
@@ -610,12 +709,17 @@ impl Guest for Publish {
 				codec: built.codec,
 				media: built.media,
 				track: Some(track),
+				group: None,
 				muxer: built.muxer,
 				time_base: built.time_base,
 				init_bytes: 0,
 				groups: 0,
 				packets: 0,
 				bytes: 0,
+				group_packets: 0,
+				group_bytes: 0,
+				group_pts_min: 0,
+				group_pts_max: 0,
 			})
 			.collect();
 
@@ -636,6 +740,7 @@ impl Guest for Publish {
 					renditions,
 					params,
 					started: false,
+					catalog_sent: None,
 				},
 			});
 		});

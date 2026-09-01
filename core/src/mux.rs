@@ -4,22 +4,34 @@
 //! stream into segments, this one builds the segments from the packets
 //! an encoder emits. One [`Muxer`] serves one coded stream: its
 //! [`init_segment`](Muxer::init_segment) is the `ftyp`+`moov` a decoder
-//! needs before any sample, and each [`push`](Muxer::push) collects one
-//! packet into the open group, closing it into a `moof`+`mdat` fragment
-//! when the next group starts.
+//! needs before any sample, and each [`push`](Muxer::push) emits one
+//! `moof`+`mdat` fragment PER SAMPLE - the hang container convention,
+//! where each MoQ frame is a complete fragment - so media leaves as it
+//! is encoded rather than in group-sized bursts. A sample's duration is
+//! the packet's own where the wire carried one, and such a packet leaves
+//! on its own push; a duration-less packet falls back to the decode-time
+//! step to the next one, so its push emits the packet BEFORE it, and
+//! [`finish`](Muxer::finish) flushes such a tail at the last known
+//! duration.
+//!
+//! The group discipline is unchanged, only marked instead of buffered:
+//! each fragment says whether its sample [starts a
+//! group](Fragment::starts_group), and the transport rotates its groups
+//! there.
 //!
 //! [`Muxer::video`] packages h264: an `avc1` sample entry whose `avcC`
 //! is built from the stream's out-of-band SPS/PPS, samples stored
 //! AVCC-framed (4-byte NAL lengths) after reframing the Annex-B bytes
-//! the packets carry, and a group that closes at every keyframe.
+//! the packets carry, and a group that starts at every keyframe.
 //!
 //! [`Muxer::audio`] packages AAC: an `mp4a` sample entry whose `esds`
 //! carries the stream's AudioSpecificConfig, samples stored exactly as
 //! the packets carry them. Every AAC frame is a sync sample, so there
-//! is no keyframe to rotate on and the group closes on a target
-//! duration instead - see [`AUDIO_GROUP_SECONDS`]. A group therefore
-//! always begins on a whole AAC frame, which is what a decoder needs;
-//! it does not align with any video group, which is a later concern.
+//! is no keyframe to rotate on and a group starts once a target
+//! duration has elapsed instead - see [`AUDIO_GROUP_SECONDS`]. A group
+//! therefore always begins on a whole AAC frame, which is what a
+//! decoder needs; it does not align with any video group, which is a
+//! later concern.
 //!
 //! Timestamps: the media timescale is the stream time base's
 //! denominator, so a tick value crosses unchanged when the numerator is
@@ -28,8 +40,9 @@
 //! shifted up once so the first fragment starts at zero, and
 //! presentation offsets carry the reordering per sample. The first
 //! packets of such a stream may arrive with no decode time at all -
-//! the wire does not settle it - and get one synthesized backwards from
-//! the first settled one at the fragment's own step.
+//! the wire does not settle it - and are held until one settles, when
+//! the prefix gets decode times synthesized backwards at the settled
+//! step and flushes.
 
 use crate::avc;
 
@@ -40,34 +53,40 @@ pub struct Packet<'a> {
 	/// Decode timestamp; absent for the first packets of a reordering
 	/// stream.
 	pub dts: Option<i64>,
+	/// How long the packet is presented, in stream ticks, as the wire
+	/// carried it; None where it carried none. A packet with one needs no
+	/// lookahead: its fragment can leave before the next packet arrives.
+	pub duration: Option<i64>,
 	/// Whether decoding can start at this packet.
 	pub keyframe: bool,
 	/// The encoded bytes, Annex-B.
 	pub data: &'a [u8],
 }
 
-/// One closed group of pictures: a `moof`+`mdat` fragment.
+/// One sample as a complete `moof`+`mdat` fragment.
 #[derive(Debug)]
 pub struct Fragment {
 	/// The fragment bytes, ready for the wire.
 	pub bytes: Vec<u8>,
 	/// The `mfhd` sequence number, from 1.
 	pub sequence: u32,
-	/// Whether the first sample is a sync sample.
+	/// Whether the sample is a sync sample.
 	pub keyframe: bool,
-	/// Samples in the fragment.
-	pub samples: u64,
-	/// Smallest presentation timestamp, in stream ticks as fed.
-	pub pts_min: i64,
-	/// Largest presentation timestamp, in stream ticks as fed.
-	pub pts_max: i64,
+	/// Whether the sample starts a group: a video keyframe, an audio
+	/// frame past the group target, and always the stream's first.
+	pub starts_group: bool,
+	/// The sample's presentation timestamp, in stream ticks as fed.
+	pub pts: i64,
 }
 
 struct Sample {
 	data: Vec<u8>,
 	pts: i64,
 	dts: Option<i64>,
+	/// The wire's own duration, where the packet carried one.
+	duration: Option<i64>,
 	keyframe: bool,
+	starts_group: bool,
 }
 
 /// How long an audio group runs before it closes. One second, so a
@@ -101,7 +120,11 @@ pub struct Muxer {
 	tick_scale: i64,
 	kind: Kind,
 	sequence: u32,
+	/// Samples whose duration the next decode time has yet to settle.
 	pending: Vec<Sample>,
+	/// The open group's first presentation timestamp; None before the
+	/// first push.
+	group_start_pts: Option<i64>,
 	/// Added to every decode time; set when the first fragment closes.
 	dts_shift: Option<i64>,
 	/// The last computed sample duration, for the stream's final sample.
@@ -176,6 +199,7 @@ impl Muxer {
 			kind,
 			sequence: 1,
 			pending: Vec::new(),
+			group_start_pts: None,
 			dts_shift: None,
 			last_duration: None,
 		})
@@ -206,9 +230,12 @@ impl Muxer {
 		out
 	}
 
-	/// Collects one packet; a packet that starts a new group closes the
-	/// open one first, and the closed fragment comes back.
-	pub fn push(&mut self, packet: Packet<'_>) -> Result<Option<Fragment>, String> {
+	/// Collects one packet and returns every fragment it settles: this
+	/// one, when it carries its own duration - else the packet BEFORE
+	/// it, whose duration its decode time is - or several, where its
+	/// decode time settles a held prefix - or none, while the stream's
+	/// reorder delay keeps decode times unsettled.
+	pub fn push(&mut self, packet: Packet<'_>) -> Result<Vec<Fragment>, String> {
 		let (data, sync) = match &self.kind {
 			Kind::Video { .. } => {
 				let data = avc::annexb_to_avcc(packet.data);
@@ -229,166 +256,183 @@ impl Muxer {
 				(packet.data.to_vec(), true)
 			}
 		};
-		let mut closed = None;
-		if self.starts_a_group(&packet) {
-			closed = Some(self.close(packet.dts)?);
+		let starts_group = self.starts_a_group(&packet);
+		if starts_group {
+			self.group_start_pts = Some(packet.pts);
 		}
 		self.pending.push(Sample {
 			data,
 			pts: packet.pts,
 			dts: packet.dts,
+			duration: packet.duration.filter(|d| *d > 0),
 			keyframe: sync,
+			starts_group,
 		});
-		Ok(closed)
+		self.drain(false)
 	}
 
-	/// Whether `packet` opens a new group, so the pending one closes
-	/// before it. Video rotates where the encoder put its keyframes;
-	/// audio has none to rotate on and rotates on elapsed ticks.
+	/// Whether `packet` opens a new group. Video rotates where the
+	/// encoder put its keyframes; audio has none to rotate on and
+	/// rotates on elapsed ticks. The stream's first packet opens the
+	/// first group.
 	fn starts_a_group(&self, packet: &Packet<'_>) -> bool {
-		let Some(first) = self.pending.first() else {
-			return false;
+		let Some(start) = self.group_start_pts else {
+			return true;
 		};
 		match self.kind {
+			// A keyframe opens a group, but not more often than once a
+			// second: an all-intra stream (every frame an IDR, the shape
+			// that survives a mid-group join on a relay that replays
+			// nothing) would otherwise make every frame its own group.
+			// Every keyframe opens a group. An all-intra stream makes every
+			// frame its own group, which is the point: a subscriber can only
+			// ever join at a group start, so no join lands mid-group.
 			Kind::Video { .. } => packet.keyframe,
-			Kind::Audio { group_ticks, .. } => packet.pts - first.pts >= group_ticks,
+			Kind::Audio { group_ticks, .. } => packet.pts - start >= group_ticks,
 		}
 	}
 
-	/// Closes whatever group is open. The stream's last fragment, at
-	/// end of input.
-	pub fn finish(&mut self) -> Result<Option<Fragment>, String> {
-		if self.pending.is_empty() {
-			return Ok(None);
-		}
-		Ok(Some(self.close(None)?))
+	/// Flushes the samples still held: a duration-less last one, whose
+	/// duration no following decode time will settle - its own wire
+	/// duration or the last known one stands in - and any prefix a
+	/// reorder delay kept unsettled to the end.
+	pub fn finish(&mut self) -> Result<Vec<Fragment>, String> {
+		self.drain(true)
 	}
 
-	/// Closes the pending samples into one fragment. `next_dts` is the
-	/// decode time of the packet after the fragment, which settles the
-	/// last sample's duration; absent at end of input, where the last
-	/// known duration stands in.
-	fn close(&mut self, next_dts: Option<i64>) -> Result<Fragment, String> {
-		let samples = std::mem::take(&mut self.pending);
-		let count = samples.len();
-
-		let dts = self.resolve_dts(&samples, next_dts)?;
-		let mut durations = Vec::with_capacity(count);
-		for i in 0..count {
-			let next = match (dts.get(i + 1), next_dts) {
-				(Some(following), _) => Some(*following),
-				(None, Some(after)) => Some(after),
-				(None, None) => None,
-			};
-			let duration = match next {
-				Some(next) => {
+	/// Emits every pending sample whose decode time AND duration are
+	/// settled. A sample's duration is the wire's own where its packet
+	/// carried one; only a duration-less tail waits for the next decode
+	/// time to settle it as a step. A flush emits everything, such a tail
+	/// at the last known duration.
+	fn drain(&mut self, flush: bool) -> Result<Vec<Fragment>, String> {
+		let dts = self.resolved_dts(flush)?;
+		// `dts` covers no pending sample or every one of them, so only
+		// the final sample can lack a settled duration.
+		let holds_tail =
+			!flush && !dts.is_empty() && self.pending[dts.len() - 1].duration.is_none();
+		let emit = dts.len() - usize::from(holds_tail);
+		let mut out = Vec::with_capacity(emit);
+		if emit == 0 {
+			return Ok(out);
+		}
+		let samples: Vec<Sample> = self.pending.drain(..emit).collect();
+		for (i, sample) in samples.into_iter().enumerate() {
+			let duration = match (sample.duration, dts.get(i + 1)) {
+				(Some(own), _) => own,
+				(None, Some(next)) => {
 					let step = next - dts[i];
 					if step < 0 {
 						return Err(format!(
 							"decode time steps backwards at pts {}",
-							samples[i].pts
+							sample.pts
 						));
 					}
 					step
 				}
-				None => self.last_duration.unwrap_or(0),
+				(None, None) => self.last_duration.unwrap_or(0),
 			};
-			durations.push(duration);
+			if duration > 0 {
+				self.last_duration = Some(duration);
+			}
+			out.push(self.emit(sample, dts[i], duration)?);
 		}
-		if let Some(last) = durations.iter().rev().find(|d| **d > 0) {
-			self.last_duration = Some(*last);
-		}
+		Ok(out)
+	}
 
+	/// One decode time per pending sample, for as many as are settled
+	/// or synthesizable now: settled ones as they came, an unsettled
+	/// prefix synthesized backwards from the first settled pair at its
+	/// step. Empty while nothing has settled, or while a prefix waits
+	/// for the pair; a flush resolves everything, presentation order
+	/// standing in for a stream that never settled a decode time.
+	fn resolved_dts(&self, flush: bool) -> Result<Vec<i64>, String> {
+		let samples = &self.pending;
+		if samples.is_empty() {
+			return Ok(Vec::new());
+		}
+		let Some(k) = samples.iter().position(|s| s.dts.is_some()) else {
+			// No decode time settled anywhere: at end of input this is
+			// a stream that does not reorder, where presentation order
+			// is decode order.
+			return if flush {
+				Ok(samples.iter().map(|s| s.pts).collect())
+			} else {
+				Ok(Vec::new())
+			};
+		};
+		let known = samples[k].dts.expect("position found it");
+		let step = samples.get(k + 1).and_then(|s| s.dts).map(|f| f - known);
+		let step = match step {
+			Some(step) => step,
+			// No prefix to synthesize, so no step is needed.
+			None if k == 0 => 0,
+			None if flush => 0,
+			// Hold the prefix until a second decode time sets the step.
+			None => return Ok(Vec::new()),
+		};
+		let mut out = Vec::with_capacity(samples.len());
+		for (i, sample) in samples.iter().enumerate() {
+			match sample.dts {
+				Some(dts) => out.push(dts),
+				None if i < k => out.push(known - step * (k - i) as i64),
+				None => {
+					return Err(format!(
+						"the packet at pts {} has no decode time after one settled",
+						sample.pts
+					))
+				}
+			}
+		}
+		Ok(out)
+	}
+
+	/// One sample into one `moof`+`mdat` fragment.
+	fn emit(&mut self, sample: Sample, dts: i64, duration: i64) -> Result<Fragment, String> {
 		let shift = *self
 			.dts_shift
-			.get_or_insert_with(|| if dts[0] < 0 { -dts[0] } else { 0 });
-		let base_decode_time = dts[0] + shift;
+			.get_or_insert(if dts < 0 { -dts } else { 0 });
+		let base_decode_time = dts + shift;
 		if base_decode_time < 0 {
 			return Err(format!(
 				"decode time {base_decode_time} below the stream's start",
 			));
 		}
 
-		let mut entries = Vec::with_capacity(count);
-		let mut mdat_len = 0usize;
-		for (i, sample) in samples.iter().enumerate() {
-			let cts = (sample.pts - dts[i]) * self.tick_scale;
-			let cts: i32 = cts.try_into().map_err(|_| {
-				format!("presentation offset {cts} at pts {} overflows", sample.pts)
-			})?;
-			let duration = durations[i] * self.tick_scale;
-			let duration: u32 = duration
-				.try_into()
-				.map_err(|_| format!("duration {duration} at pts {} overflows", sample.pts))?;
-			let flags: u32 = if sample.keyframe { 0x0200_0000 } else { 0x0101_0000 };
-			entries.push(TrunEntry {
-				duration,
-				size: sample.data.len() as u32,
-				flags,
-				cts,
-			});
-			mdat_len += sample.data.len();
-		}
+		let cts = (sample.pts - dts) * self.tick_scale;
+		let cts: i32 = cts.try_into().map_err(|_| {
+			format!("presentation offset {cts} at pts {} overflows", sample.pts)
+		})?;
+		let duration = duration * self.tick_scale;
+		let duration: u32 = duration
+			.try_into()
+			.map_err(|_| format!("duration {duration} at pts {} overflows", sample.pts))?;
+		let flags: u32 = if sample.keyframe { 0x0200_0000 } else { 0x0101_0000 };
+		let entry = TrunEntry {
+			duration,
+			size: sample.data.len() as u32,
+			flags,
+			cts,
+		};
 
-		let moof = moof(
+		let mut bytes = moof(
 			self.sequence,
 			(base_decode_time * self.tick_scale) as u64,
-			&entries,
+			&entry,
 		);
-		let mut bytes = moof;
-		bytes.extend_from_slice(&((mdat_len + 8) as u32).to_be_bytes());
+		bytes.extend_from_slice(&((sample.data.len() + 8) as u32).to_be_bytes());
 		bytes.extend_from_slice(b"mdat");
-		for sample in &samples {
-			bytes.extend_from_slice(&sample.data);
-		}
+		bytes.extend_from_slice(&sample.data);
 
 		let fragment = Fragment {
 			bytes,
 			sequence: self.sequence,
-			keyframe: samples[0].keyframe,
-			samples: count as u64,
-			pts_min: samples.iter().map(|s| s.pts).min().expect("samples"),
-			pts_max: samples.iter().map(|s| s.pts).max().expect("samples"),
+			keyframe: sample.keyframe,
+			starts_group: sample.starts_group,
+			pts: sample.pts,
 		};
 		self.sequence += 1;
 		Ok(fragment)
-	}
-
-	/// One decode time per sample: the settled ones as they came, an
-	/// unsettled prefix synthesized backwards from the first settled
-	/// one at the nearest known step.
-	fn resolve_dts(&self, samples: &[Sample], next_dts: Option<i64>) -> Result<Vec<i64>, String> {
-		let first_known = samples.iter().position(|s| s.dts.is_some());
-		match first_known {
-			None => {
-				// No decode time settled anywhere: a stream that does
-				// not reorder, where presentation order is decode order.
-				Ok(samples.iter().map(|s| s.pts).collect())
-			}
-			Some(k) => {
-				let known = samples[k].dts.expect("position found it");
-				let step = samples
-					.get(k + 1)
-					.and_then(|s| s.dts)
-					.map(|following| following - known)
-					.or_else(|| next_dts.map(|after| after - known))
-					.unwrap_or(0);
-				let mut out = Vec::with_capacity(samples.len());
-				for (i, sample) in samples.iter().enumerate() {
-					match sample.dts {
-						Some(dts) => out.push(dts),
-						None if i < k => out.push(known - step * (k - i) as i64),
-						None => {
-							return Err(format!(
-								"the packet at pts {} has no decode time after one settled",
-								sample.pts
-							))
-						}
-					}
-				}
-				Ok(out)
-			}
-		}
 	}
 
 	fn moov(&self) -> Vec<u8> {
@@ -536,10 +580,10 @@ fn ftyp() -> Vec<u8> {
 	boxed(b"ftyp", p)
 }
 
-fn moof(sequence: u32, base_decode_time: u64, entries: &[TrunEntry]) -> Vec<u8> {
+fn moof(sequence: u32, base_decode_time: u64, entry: &TrunEntry) -> Vec<u8> {
 	// Sizes first, so the trun's data offset can point past the moof
 	// into the mdat payload before either is assembled.
-	let trun_size = 20 + entries.len() * 16;
+	let trun_size = 20 + 16;
 	let traf_size = 8 + 16 + 20 + trun_size;
 	let moof_size = 8 + 16 + traf_size;
 	let data_offset = (moof_size + 8) as i32;
@@ -548,14 +592,12 @@ fn moof(sequence: u32, base_decode_time: u64, entries: &[TrunEntry]) -> Vec<u8> 
 	let tfhd = full_boxed(b"tfhd", 0, 0x020000, 1u32.to_be_bytes().to_vec());
 	let tfdt = full_boxed(b"tfdt", 1, 0, base_decode_time.to_be_bytes().to_vec());
 	let trun = full_boxed(b"trun", 1, 0xf01, {
-		let mut p = (entries.len() as u32).to_be_bytes().to_vec();
+		let mut p = 1u32.to_be_bytes().to_vec();
 		p.extend_from_slice(&data_offset.to_be_bytes());
-		for entry in entries {
-			p.extend_from_slice(&entry.duration.to_be_bytes());
-			p.extend_from_slice(&entry.size.to_be_bytes());
-			p.extend_from_slice(&entry.flags.to_be_bytes());
-			p.extend_from_slice(&entry.cts.to_be_bytes());
-		}
+		p.extend_from_slice(&entry.duration.to_be_bytes());
+		p.extend_from_slice(&entry.size.to_be_bytes());
+		p.extend_from_slice(&entry.flags.to_be_bytes());
+		p.extend_from_slice(&entry.cts.to_be_bytes());
 		p
 	});
 	let traf = boxed(b"traf", [tfhd, tfdt, trun].concat());
@@ -700,64 +742,195 @@ mod tests {
 	}
 
 	#[test]
-	fn a_keyframe_closes_the_group_before_it() {
+	fn each_push_settles_the_sample_before_it() {
 		let mut mux = muxer();
-		for pts in 0..3 {
-			let data = packet(pts, pts == 0);
-			let closed = mux
+		let mut fragments = Vec::new();
+		for pts in 0..4i64 {
+			let keyframe = pts % 3 == 0;
+			let data = packet(pts, keyframe);
+			let emitted = mux
 				.push(Packet {
 					pts,
 					dts: Some(pts),
+					duration: None,
+					keyframe,
+					data: &data,
+				})
+				.expect("push");
+			// The first push has nothing settled; each later one
+			// settles exactly the packet before it.
+			assert_eq!(emitted.len(), usize::from(pts > 0));
+			fragments.extend(emitted);
+		}
+		fragments.extend(mux.finish().expect("finish"));
+		assert!(mux.finish().expect("finish").is_empty());
+
+		assert_eq!(fragments.len(), 4, "one fragment per sample");
+		for (i, fragment) in fragments.iter().enumerate() {
+			assert_eq!(fragment.sequence, i as u32 + 1);
+			assert_eq!(fragment.pts, i as i64);
+			assert_eq!(trun_sample_count(&fragment.bytes), 1);
+		}
+		// Groups start at the stream's first sample and at each
+		// keyframe; the sync flag marks exactly the keyframes, in the
+		// fragment and in its trun entry.
+		let starts: Vec<bool> = fragments.iter().map(|f| f.starts_group).collect();
+		assert_eq!(starts, [true, false, false, true]);
+		let syncs: Vec<bool> = fragments.iter().map(|f| f.keyframe).collect();
+		assert_eq!(syncs, [true, false, false, true]);
+		for fragment in &fragments {
+			let non_sync = trun_first_flags(&fragment.bytes) & 0x0001_0000 != 0;
+			assert_eq!(non_sync, !fragment.keyframe, "trun sync flag");
+		}
+	}
+
+	#[test]
+	fn a_packet_with_its_own_duration_leaves_on_its_own_push() {
+		let mut mux = muxer();
+		for pts in 0..3i64 {
+			let data = packet(pts, pts == 0);
+			let emitted = mux
+				.push(Packet {
+					pts,
+					dts: Some(pts),
+					duration: Some(1),
 					keyframe: pts == 0,
 					data: &data,
 				})
 				.expect("push");
-			assert!(closed.is_none());
+			// No lookahead: the wire settled the duration, so nothing
+			// waits for the next packet.
+			assert_eq!(emitted.len(), 1, "pts {pts}");
+			assert_eq!(emitted[0].pts, pts);
+			assert_eq!(trun_entry(&emitted[0].bytes).0, 1, "the wire's duration");
 		}
-		let data = packet(3, true);
-		let closed = mux
-			.push(Packet {
-				pts: 3,
-				dts: Some(3),
-				keyframe: true,
-				data: &data,
-			})
-			.expect("push")
-			.expect("the keyframe closed a fragment");
-		assert_eq!(closed.sequence, 1);
-		assert_eq!(closed.samples, 3);
-		assert!(closed.keyframe);
-		assert_eq!((closed.pts_min, closed.pts_max), (0, 2));
-
-		let last = mux.finish().expect("finish").expect("the tail fragment");
-		assert_eq!(last.sequence, 2);
-		assert_eq!(last.samples, 1);
-		assert!(mux.finish().expect("finish").is_none());
+		assert!(mux.finish().expect("finish").is_empty(), "nothing held");
 	}
 
 	#[test]
-	fn an_unsettled_decode_prefix_is_synthesized_backwards() {
+	fn the_final_sample_keeps_its_real_duration() {
+		let mut mux = muxer();
+		// Duration-less packets two ticks apart, then a final one whose
+		// wire duration (5) disagrees with the last known step (2): its
+		// fragment must keep the real one rather than the stand-in, and
+		// carrying its own duration it leaves without waiting.
+		let mut fragments = Vec::new();
+		for pts in [0i64, 2] {
+			let data = packet(pts, pts == 0);
+			fragments.extend(
+				mux.push(Packet {
+					pts,
+					dts: Some(pts),
+					duration: None,
+					keyframe: pts == 0,
+					data: &data,
+				})
+				.expect("push"),
+			);
+		}
+		let data = packet(4, false);
+		fragments.extend(
+			mux.push(Packet {
+				pts: 4,
+				dts: Some(4),
+				duration: Some(5),
+				keyframe: false,
+				data: &data,
+			})
+			.expect("push"),
+		);
+		assert_eq!(
+			fragments.iter().map(|f| f.pts).collect::<Vec<_>>(),
+			[0, 2, 4],
+			"the wire-settled packet needed no flush"
+		);
+		let durations: Vec<u32> = fragments.iter().map(|f| trun_entry(&f.bytes).0).collect();
+		assert_eq!(durations, [2, 2, 5]);
+		assert!(mux.finish().expect("finish").is_empty());
+	}
+
+	#[test]
+	fn a_duration_less_packet_still_waits_for_its_successor() {
+		let mut mux = muxer();
+		let with = packet(0, true);
+		let emitted = mux
+			.push(Packet {
+				pts: 0,
+				dts: Some(0),
+				duration: Some(1),
+				keyframe: true,
+				data: &with,
+			})
+			.expect("push");
+		assert_eq!(emitted.len(), 1, "the wire-settled packet leaves");
+		let without = packet(1, false);
+		let held = mux
+			.push(Packet {
+				pts: 1,
+				dts: Some(1),
+				duration: None,
+				keyframe: false,
+				data: &without,
+			})
+			.expect("push");
+		assert!(held.is_empty(), "the lookahead is still the fallback");
+		let tail = mux.finish().expect("finish");
+		assert_eq!(tail.len(), 1);
+		assert_eq!(
+			trun_entry(&tail[0].bytes).0,
+			1,
+			"the tail stands in at the last known duration"
+		);
+	}
+
+	#[test]
+	fn an_unsettled_decode_prefix_is_held_then_synthesized_backwards() {
 		let mut mux = muxer();
 		// Decode times settle at the third packet, as a reordering
-		// stream's do; the synthesized prefix must keep the step.
-		let inputs = [(2i64, None), (0, None), (1, Some(0i64)), (3, Some(1))];
-		for (pts, dts) in inputs {
+		// stream's do; nothing may leave before the settled PAIR sets
+		// the step, and the synthesized prefix must keep it.
+		for (pts, dts) in [(2i64, None), (0, None), (1, Some(0i64))] {
 			let data = packet(pts, pts == 2);
-			mux.push(Packet {
-				pts,
-				dts,
-				keyframe: pts == 2,
+			let held = mux
+				.push(Packet {
+					pts,
+					dts,
+					duration: None,
+					keyframe: pts == 2,
+					data: &data,
+				})
+				.expect("push");
+			assert!(held.is_empty(), "nothing may leave before the step is known");
+		}
+		let data = packet(3, false);
+		let emitted = mux
+			.push(Packet {
+				pts: 3,
+				dts: Some(1),
+				duration: None,
+				keyframe: false,
 				data: &data,
 			})
 			.expect("push");
-		}
-		let fragment = mux.finish().expect("finish").expect("a fragment");
-		assert_eq!(fragment.samples, 4);
-		// Synthesized: dts -2, -1 behind the settled 0, 1 - so the
-		// shift lifts the base decode time to zero exactly.
+		// The settled pair 0,1 sets the step; the prefix resolves to
+		// -2, -1 and three samples flush, the fourth still waiting on
+		// its own duration.
+		assert_eq!(emitted.iter().map(|f| f.pts).collect::<Vec<_>>(), [2, 0, 1]);
+		// Synthesized: dts -2 behind the settled 0 - so the shift
+		// lifts the first fragment's base decode time to zero exactly,
+		// and the next decodes one tick later.
 		// Past the tag: version(1) + flags(3), then the 64-bit time.
-		let tfdt = &fragment.bytes[past_tag(&fragment.bytes, b"tfdt")..];
-		assert_eq!(&tfdt[..12], &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+		let tfdt = past_tag(&emitted[0].bytes, b"tfdt");
+		assert_eq!(&emitted[0].bytes[tfdt..tfdt + 12], &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+		let tfdt = past_tag(&emitted[1].bytes, b"tfdt");
+		assert_eq!(&emitted[1].bytes[tfdt..tfdt + 12], &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+		// The reorder still crosses as presentation offsets: the first
+		// sample shows 4 ticks ahead of its decode time.
+		let entry = trun_entry(&emitted[0].bytes);
+		assert_eq!(entry.3, 4, "cts offset of the reordered sample");
+
+		let tail = mux.finish().expect("finish");
+		assert_eq!(tail.iter().map(|f| f.pts).collect::<Vec<_>>(), [3]);
 	}
 
 	#[test]
@@ -767,6 +940,7 @@ mod tests {
 			.push(Packet {
 				pts: 0,
 				dts: Some(0),
+				duration: None,
 				keyframe: true,
 				data: &[1, 2, 3],
 			})
@@ -775,32 +949,38 @@ mod tests {
 	}
 
 	#[test]
-	fn an_audio_group_closes_on_the_target_duration() {
+	fn an_audio_group_starts_past_the_target_duration() {
 		let mut mux = audio_muxer();
-		// 1024 samples a frame at 48 kHz: the 47th frame is the first
-		// whose timestamp stands a whole second past the group's first,
-		// so it is the one that closes it.
-		let mut closed_at = None;
-		for index in 0..60i64 {
+		let mut fragments = Vec::new();
+		for index in 0..49i64 {
 			let data = aac_frame(index);
-			let closed = mux
-				.push(Packet {
+			fragments.extend(
+				mux.push(Packet {
 					pts: index * 1024,
 					dts: Some(index * 1024),
+					duration: None,
 					keyframe: true,
 					data: &data,
 				})
-				.expect("push");
-			if let Some(fragment) = closed {
-				closed_at = Some((index, fragment));
-				break;
-			}
+				.expect("push"),
+			);
 		}
-		let (index, fragment) = closed_at.expect("a group closed within 60 frames");
-		assert_eq!(index, 47);
-		assert_eq!(fragment.samples, 47);
-		assert!(fragment.keyframe, "every AAC frame is a sync sample");
-		assert_eq!((fragment.pts_min, fragment.pts_max), (0, 46 * 1024));
+		fragments.extend(mux.finish().expect("finish"));
+		assert_eq!(fragments.len(), 49, "one fragment per AAC frame");
+		// 1024 samples a frame at 48 kHz: the 47th frame is the first
+		// whose timestamp stands a whole second past the group's
+		// first, so it is the one that starts the next group.
+		let starts: Vec<usize> = fragments
+			.iter()
+			.enumerate()
+			.filter(|(_, f)| f.starts_group)
+			.map(|(i, _)| i)
+			.collect();
+		assert_eq!(starts, [0, 47]);
+		assert!(
+			fragments.iter().all(|f| f.keyframe),
+			"every AAC frame is a sync sample"
+		);
 	}
 
 	#[test]
@@ -812,11 +992,13 @@ mod tests {
 		mux.push(Packet {
 			pts: 0,
 			dts: Some(0),
+			duration: None,
 			keyframe: true,
 			data: &data,
 		})
 		.expect("push");
-		let fragment = mux.finish().expect("finish").expect("a fragment");
+		let fragments = mux.finish().expect("finish");
+		let fragment = fragments.first().expect("a fragment");
 		let mdat = past_tag(&fragment.bytes, b"mdat");
 		assert_eq!(&fragment.bytes[mdat..], &data[..]);
 	}
@@ -828,6 +1010,7 @@ mod tests {
 			.push(Packet {
 				pts: 0,
 				dts: Some(0),
+				duration: None,
 				keyframe: true,
 				data: &[],
 			})
@@ -887,6 +1070,28 @@ mod tests {
 		assert_eq!(ticks_to_micros(30, 1, 30), 1_000_000);
 		assert_eq!(ticks_to_micros(2048, 1, 61440), 33_333);
 		assert_eq!(ticks_to_micros(-5, 1, 30), 0);
+	}
+
+	/// The trun's sample count.
+	fn trun_sample_count(bytes: &[u8]) -> u32 {
+		let payload = past_tag(bytes, b"trun") + 4; // version + flags
+		u32::from_be_bytes(bytes[payload..payload + 4].try_into().expect("count"))
+	}
+
+	/// The trun's first entry flags.
+	fn trun_first_flags(bytes: &[u8]) -> u32 {
+		let (_, _, flags, _) = trun_entry(bytes);
+		flags
+	}
+
+	/// The trun's first entry: duration, size, flags, cts.
+	fn trun_entry(bytes: &[u8]) -> (u32, u32, u32, i32) {
+		// Past the tag: version + flags, count, data offset.
+		let entry = past_tag(bytes, b"trun") + 12;
+		let field = |i: usize| {
+			u32::from_be_bytes(bytes[entry + 4 * i..entry + 4 * i + 4].try_into().expect("field"))
+		};
+		(field(0), field(1), field(2), field(3) as i32)
 	}
 
 	/// Byte offset just past the first `kind` tag found.
