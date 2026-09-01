@@ -7,6 +7,8 @@
 //!   packets.
 //! - [`avc`] is the h264 byte-level knowledge under it: Annex-B NAL
 //!   cutting, AVCC length-prefix framing, and the `avcC` record.
+//! - [`catalog`] is the document a broadcast describes itself with, and
+//!   the names its renditions publish under.
 //! - [`subscribe::FrameStream`] pulls groups and frames off a track
 //!   subscription in arrival order (the test harness's receiving side).
 //! - [`fmp4`] cuts a fragmented-MP4 byte stream back into segments -
@@ -18,6 +20,7 @@
 //!   relay lookup: encode a question, read the answer's addresses.
 
 pub mod avc;
+pub mod catalog;
 pub mod dns;
 pub mod fmp4;
 pub mod mux;

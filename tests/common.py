@@ -6,7 +6,8 @@ because a killed direct child (uv, say) leaves its ffmpeg and sidecar holding
 the output pipes, and a harness that then waits for pipe EOF waits forever.
 
 Toolchain overrides: WASMTIME, MOQ_RELAY, WASI_SDK_PATH (or CC_wasm32_wasip2
-directly), FFRWD_WASM for the sidecar binary.
+directly), FFRWD_WASM for the sidecar binary, FFRWD_REPO for the checkout
+holding the compiler and the sidecar.
 """
 
 from __future__ import annotations
@@ -19,11 +20,32 @@ import time
 from pathlib import Path
 
 PACKAGE = Path(__file__).resolve().parent.parent
-REPO = PACKAGE.parent.parent.parent
+
+
+def _compiler_repo() -> Path:
+    """The checkout holding the compiler and the sidecar.
+
+    FFRWD_REPO names it outright. Otherwise: the repo this package sits
+    inside, for a checkout that vendors it under packages/, and the sibling
+    `ffrwd-cli` clone for one that does not.
+    """
+    named = os.environ.get("FFRWD_REPO")
+    if named is not None:
+        return Path(named)
+    vendored = PACKAGE.parent.parent.parent
+    if (vendored / "cli").is_dir():
+        return vendored
+    return PACKAGE.parent / "ffrwd-cli"
+
+
+REPO = _compiler_repo()
 CLI = REPO / "cli"
-SIDECAR = (
-    REPO / "sidecar" / "target" / "release"
-    / ("ffrwd-wasm.exe" if os.name == "nt" else "ffrwd-wasm")
+SIDECAR = Path(
+    os.environ.get(
+        "FFRWD_WASM",
+        REPO / "sidecar" / "target" / "release"
+        / ("ffrwd-wasm.exe" if os.name == "nt" else "ffrwd-wasm"),
+    )
 )
 
 EXE = ".exe" if os.name == "nt" else ""
@@ -115,19 +137,34 @@ def start_relay(port: int, cert: Path, key: Path, log: Path) -> subprocess.Popen
 
 
 def start_subscriber(
-    wasm: Path, port: int, cert_hex: str, out_dir: Path, broadcast: str, track: str
+    wasm: Path,
+    port: int,
+    cert_hex: str,
+    out_dir: Path,
+    broadcast: str,
+    track: str | None = None,
+    *,
+    rendition: int = 0,
+    output: str = "recv.mp4",
 ) -> subprocess.Popen:
+    """One sub-recv guest against `broadcast`.
+
+    `track` names the media track outright; left None the subscriber reads
+    the catalog and takes its `rendition`-th track, which is what a player
+    choosing off a ladder does.
+    """
     wasmtime = tool("WASMTIME", "wasmtime")
+    argv = [wasmtime, "run", "-S", "inherit-network",
+            "--dir", f"{out_dir}::/out",
+            "--env", f"RELAY_PORT={port}",
+            "--env", f"RELAY_CERT_HEX={cert_hex}",
+            "--env", f"BROADCAST={broadcast}",
+            "--env", f"RENDITION={rendition}",
+            "--env", f"OUTPUT=/out/{output}"]
+    if track is not None:
+        argv += ["--env", f"TRACK={track}", "--env", f"INIT_TRACK={track}.init"]
     return spawn(
-        [wasmtime, "run", "-S", "inherit-network",
-         "--dir", f"{out_dir}::/out",
-         "--env", f"RELAY_PORT={port}",
-         "--env", f"RELAY_CERT_HEX={cert_hex}",
-         "--env", f"BROADCAST={broadcast}",
-         "--env", f"TRACK={track}",
-         "--env", f"INIT_TRACK={track}.init",
-         "--env", "OUTPUT=/out/recv.mp4",
-         str(wasm)],
+        [*argv, str(wasm)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
 

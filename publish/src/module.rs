@@ -9,16 +9,16 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use exports::ffrwd::av::packet_sink::{
-	CodedStream, Guest, Meta, Packet, PacketSinkMeta, Processed, StreamInfo,
+	Arity, CodedFormat, Guest, InputStream, Meta, PacketSinkMeta, PadPackets, Processed,
 };
 use serde::{Deserialize, Serialize};
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"track":{"type":"string","default":"video","description":"media track name; the init segment rides <track>.init"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"track":{"type":"string","default":"video","description":"media track name; one stream publishes it as written, several name a rendition apiece under it"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
 
 /// One schema covers both row shapes: a group row carries `group`, the
 /// trailing summary carries `groups`, and each leaves the other's
 /// fields out. `pts_start`/`pts_end` are seconds of media time.
-const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"group":{"type":"integer"},"packets":{"type":"integer"},"bytes":{"type":"integer"},"pts_start":{"type":"number"},"pts_end":{"type":"number"},"groups":{"type":"integer"},"init_bytes":{"type":"integer"}},"additionalProperties":false}"#;
+const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"track":{"type":"string"},"group":{"type":"integer"},"packets":{"type":"integer"},"bytes":{"type":"integer"},"pts_start":{"type":"number"},"pts_end":{"type":"number"},"tracks":{"type":"integer"},"groups":{"type":"integer"},"init_bytes":{"type":"integer"}},"additionalProperties":false}"#;
 
 /// How long the session stays open after the last fragment, for the
 /// wire to drain: there is no delivered signal for a subscription.
@@ -26,6 +26,16 @@ const DRAIN: Duration = Duration::from_secs(2);
 
 /// How long a relay gets to answer the dial before init gives up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a non-latest group is kept for a backlogged subscriber. The
+/// default evicts after 5s, which is not enough for one that arrives
+/// mid-broadcast and asks for the init segment or the catalog.
+const KEEP: Duration = Duration::from_secs(30);
+
+/// How often the publisher re-checks for its first subscriber. Nothing is
+/// published before one arrives: a subscription starts at the LATEST group,
+/// so anything published earlier is simply gone.
+const POLL: Duration = Duration::from_millis(20);
 
 #[derive(Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -45,6 +55,7 @@ fn default_track() -> String {
 /// One published group's row.
 #[derive(Serialize)]
 struct GroupRow {
+	track: String,
 	group: u64,
 	packets: u64,
 	bytes: u64,
@@ -52,9 +63,10 @@ struct GroupRow {
 	pts_end: f64,
 }
 
-/// The trailing summary, once per stream.
+/// The trailing summary, once per run over every track.
 #[derive(Serialize)]
 struct SummaryRow {
+	tracks: u64,
 	groups: u64,
 	packets: u64,
 	bytes: u64,
@@ -76,22 +88,99 @@ impl Executor {
 	}
 }
 
+/// One rendition: one encoded stream, its own fmp4 muxer, and the pair of
+/// MoQ tracks carrying its init segment and its fragments.
+struct Rendition {
+	name: String,
+	init_name: String,
+	codec: String,
+	width: u32,
+	height: u32,
+	track: Option<moq_net::track::Producer>,
+	init_track: Option<moq_net::track::Producer>,
+	muxer: moq_core::mux::Muxer,
+	time_base: (i32, i32),
+	init_bytes: u64,
+	groups: u64,
+	packets: u64,
+	bytes: u64,
+}
+
+impl Rendition {
+	fn seconds(&self, ticks: i64) -> f64 {
+		ticks as f64 * self.time_base.0 as f64 / self.time_base.1 as f64
+	}
+
+	/// Publishes one fragment as one MoQ frame in a group of its own,
+	/// and returns the group's row.
+	fn publish_fragment(&mut self, fragment: moq_core::mux::Fragment) -> Result<String, String> {
+		let timestamp_us =
+			moq_core::mux::ticks_to_micros(fragment.pts_min, self.time_base.0, self.time_base.1);
+		let bytes_len = fragment.bytes.len() as u64;
+		let row = GroupRow {
+			track: self.name.clone(),
+			group: self.groups,
+			packets: fragment.samples,
+			bytes: bytes_len,
+			pts_start: self.seconds(fragment.pts_min),
+			pts_end: self.seconds(fragment.pts_max),
+		};
+		let track = self.track.as_mut().expect("track lives until last");
+		write_group(track, timestamp_us, fragment.bytes)?;
+		self.groups += 1;
+		self.bytes += bytes_len;
+		Ok(serde_json::to_string(&row).expect("a group row serializes"))
+	}
+
+	/// The init segment onto its own track, once.
+	fn publish_init(&mut self) -> Result<(), String> {
+		let init = self.muxer.init_segment();
+		self.init_bytes = init.len() as u64;
+		let track = self.init_track.as_mut().expect("init track lives until last");
+		write_group(track, 0, init)
+	}
+
+	fn catalog_entry(&self) -> moq_core::catalog::Track {
+		moq_core::catalog::Track {
+			name: self.name.clone(),
+			init: self.init_name.clone(),
+			kind: "video",
+			codec: self.codec.clone(),
+			width: self.width,
+			height: self.height,
+		}
+	}
+}
+
+/// One whole payload as one frame in a group of its own.
+fn write_group(
+	track: &mut moq_net::track::Producer,
+	timestamp_us: u64,
+	payload: Vec<u8>,
+) -> Result<(), String> {
+	let mut group = track
+		.append_group()
+		.map_err(|err| format!("moq group: {err}"))?;
+	group
+		.write_frame(
+			moq_net::Timestamp::from_micros(timestamp_us)
+				.map_err(|err| format!("moq timestamp: {err}"))?,
+			Bytes::from(payload),
+		)
+		.map_err(|err| format!("moq frame: {err}"))?;
+	group.finish().map_err(|err| format!("moq group: {err}"))
+}
+
 struct Session {
 	endpoint: quinn::Endpoint,
 	session: Option<moq_net::Session>,
 	driver: Option<tokio::task::JoinHandle<()>>,
 	broadcast: Option<moq_net::broadcast::Producer>,
-	init_track: Option<moq_net::track::Producer>,
-	track: Option<moq_net::track::Producer>,
-	muxer: moq_core::mux::Muxer,
-	time_base: (i32, i32),
+	catalog: Option<moq_net::track::Producer>,
+	renditions: Vec<Rendition>,
 	params: Params,
-	/// Set once a subscriber arrived and the init segment went out.
-	init_published: bool,
-	init_bytes: u64,
-	groups: u64,
-	packets: u64,
-	bytes: u64,
+	/// Set once a subscriber arrived and the init segments went out.
+	started: bool,
 }
 
 struct State {
@@ -146,109 +235,126 @@ fn unhex(hex: &str) -> Result<Vec<u8>, String> {
 }
 
 impl Session {
-	/// Publishes one fragment as one MoQ frame in a group of its own,
-	/// and returns the group's row.
-	fn publish_fragment(&mut self, fragment: moq_core::mux::Fragment) -> Result<String, String> {
-		let timestamp_us =
-			moq_core::mux::ticks_to_micros(fragment.pts_min, self.time_base.0, self.time_base.1);
-		let bytes_len = fragment.bytes.len() as u64;
-		let track = self.track.as_mut().expect("track lives until last");
-		let mut group = track
-			.append_group()
-			.map_err(|err| format!("moq group: {err}"))?;
-		group
-			.write_frame(
-				moq_net::Timestamp::from_micros(timestamp_us)
-					.map_err(|err| format!("moq timestamp: {err}"))?,
-				Bytes::from(fragment.bytes),
-			)
-			.map_err(|err| format!("moq frame: {err}"))?;
-		group.finish().map_err(|err| format!("moq group: {err}"))?;
-
-		let row = GroupRow {
-			group: self.groups,
-			packets: fragment.samples,
-			bytes: bytes_len,
-			pts_start: self.seconds(fragment.pts_min),
-			pts_end: self.seconds(fragment.pts_max),
-		};
-		self.groups += 1;
-		self.bytes += row.bytes;
-		Ok(serde_json::to_string(&row).expect("a group row serializes"))
+	/// Whether anything here has a subscriber at all, the catalog
+	/// included. A subscription starts at the LATEST group, so nothing may
+	/// be published before one exists: the relay subscribes upstream the
+	/// moment a downstream subscriber wants a track, which is what
+	/// surfaces here.
+	fn wanted(&self) -> bool {
+		let tracks = self
+			.renditions
+			.iter()
+			.flat_map(|rendition| [rendition.track.as_ref(), rendition.init_track.as_ref()])
+			.chain(std::iter::once(self.catalog.as_ref()));
+		tracks
+			.flatten()
+			.any(|track| track.subscription().is_some())
 	}
 
-	fn seconds(&self, ticks: i64) -> f64 {
-		ticks as f64 * self.time_base.0 as f64 / self.time_base.1 as f64
+	/// Whether any RENDITION has been asked for, which is what says a
+	/// reader has got past the catalog and named the rung it wants.
+	fn rendition_wanted(&self) -> bool {
+		self.renditions.iter().any(|rendition| {
+			[rendition.track.as_ref(), rendition.init_track.as_ref()]
+				.into_iter()
+				.flatten()
+				.any(|track| track.subscription().is_some())
+		})
 	}
 
-	/// One host call's work: hold for the first subscriber, feed the
-	/// muxer, publish what closed, and on the final call drain and
+	/// The catalog onto its own track, once, before any fragment.
+	fn publish_catalog(&mut self) -> Result<(), String> {
+		let catalog = moq_core::catalog::Catalog::new(
+			self.renditions
+				.iter()
+				.map(Rendition::catalog_entry)
+				.collect(),
+		);
+		let document = catalog.document()?;
+		let track = self.catalog.as_mut().expect("catalog lives until last");
+		write_group(track, 0, document)
+	}
+
+	/// One host call's work: hold for the first subscriber, feed each
+	/// pad's muxer, publish what closed, and on the final call drain and
 	/// close the session.
-	async fn drive(&mut self, packets: &[Packet], last: bool) -> Result<Processed, String> {
+	async fn drive(&mut self, pads: &[PadPackets], last: bool) -> Result<Processed, String> {
 		let mut rows = Vec::new();
 		let mut trailing = Vec::new();
 
-		if !self.init_published {
-			// A moq subscription starts at the LATEST group: anything
-			// published before a subscriber asks is simply gone, and a
-			// from-the-start playback needs group 0. The relay
-			// subscribes upstream the moment a downstream subscriber
-			// wants the track, which surfaces here - so hold the first
-			// publish until then.
-			self.track
-				.as_mut()
-				.expect("track lives until last")
-				.used()
-				.await
-				.map_err(|err| format!("waiting for a subscriber: {err}"))?;
-			let init = self.muxer.init_segment();
-			self.init_bytes = init.len() as u64;
-			let init_track = self.init_track.as_mut().expect("init track lives until last");
-			let mut group = init_track
-				.append_group()
-				.map_err(|err| format!("moq group: {err}"))?;
-			group
-				.write_frame(
-					moq_net::Timestamp::from_micros(0)
-						.map_err(|err| format!("moq timestamp: {err}"))?,
-					Bytes::from(init),
-				)
-				.map_err(|err| format!("moq frame: {err}"))?;
-			group.finish().map_err(|err| format!("moq group: {err}"))?;
-			self.init_published = true;
+		if !self.started {
+			// The catalog goes out to the first reader of anything: it is
+			// what a subscriber needs before it can name a rendition, so
+			// holding it until a rendition is named would hold it forever.
+			while !self.wanted() {
+				tokio::time::sleep(POLL).await;
+			}
+			self.publish_catalog()?;
+			// Then the media, once a rung has actually been asked for.
+			// Every init goes out together, so a subscriber that switches
+			// renditions mid-broadcast finds the one it moves to already
+			// described.
+			//
+			// A reader still choosing when this fires starts at the group
+			// it arrives in, as a reader of any live broadcast does: a
+			// subscription begins at the LATEST group, and there is no
+			// rendezvous in the protocol to wait for one that has not
+			// asked yet.
+			while !self.rendition_wanted() {
+				tokio::time::sleep(POLL).await;
+			}
+			for index in 0..self.renditions.len() {
+				self.renditions[index].publish_init()?;
+			}
+			self.started = true;
 		}
 
-		for packet in packets {
-			let closed = self.muxer.push(moq_core::mux::Packet {
-				pts: packet.pts,
-				dts: packet.dts,
-				keyframe: packet.keyframe,
-				data: &packet.data,
-			})?;
-			self.packets += 1;
-			if let Some(fragment) = closed {
-				rows.push(self.publish_fragment(fragment)?);
+		for (index, pad) in pads.iter().enumerate() {
+			let Some(rendition) = self.renditions.get_mut(index) else {
+				continue;
+			};
+			for packet in &pad.packets {
+				let closed = rendition.muxer.push(moq_core::mux::Packet {
+					pts: packet.pts,
+					dts: packet.dts,
+					keyframe: packet.keyframe,
+					data: &packet.data,
+				})?;
+				rendition.packets += 1;
+				if let Some(fragment) = closed {
+					rows.push(rendition.publish_fragment(fragment)?);
+				}
 			}
-			// Let the driver move the frame onto the wire now, not
+			// Let the driver move the frames onto the wire now, not
 			// after the next call.
 			tokio::task::yield_now().await;
 		}
 
 		if last {
-			if let Some(fragment) = self.muxer.finish()? {
-				rows.push(self.publish_fragment(fragment)?);
+			// Every track's last fragment goes out BEFORE any track is
+			// finished: a subscriber stops at the finish, so a track told
+			// it is over while its own tail is still queued loses that
+			// tail. The yield is what lets the driver move them.
+			for index in 0..self.renditions.len() {
+				if let Some(fragment) = self.renditions[index].muxer.finish()? {
+					rows.push(self.renditions[index].publish_fragment(fragment)?);
+				}
 			}
-			if let Some(mut track) = self.track.take() {
-				track.finish().map_err(|err| format!("moq track: {err}"))?;
+			tokio::time::sleep(DRAIN).await;
+			for rendition in &mut self.renditions {
+				let closing = [rendition.track.take(), rendition.init_track.take()];
+				for track in closing.into_iter().flatten() {
+					let mut track = track;
+					track.finish().map_err(|err| format!("moq track: {err}"))?;
+				}
 			}
-			if let Some(mut init_track) = self.init_track.take() {
-				init_track
+			if let Some(mut catalog) = self.catalog.take() {
+				catalog
 					.finish()
 					.map_err(|err| format!("moq track: {err}"))?;
 			}
-			// The finish and the last fragments still have to cross
-			// the wire; the session offers no delivered signal, so
-			// hold it open briefly.
+			// The finish still has to cross the wire; the session offers
+			// no delivered signal, so hold it open briefly.
 			tokio::time::sleep(DRAIN).await;
 			drop(self.broadcast.take());
 			drop(self.session.take());
@@ -258,10 +364,11 @@ impl Session {
 			self.endpoint.wait_idle().await;
 			trailing.push(
 				serde_json::to_string(&SummaryRow {
-					groups: self.groups,
-					packets: self.packets,
-					bytes: self.bytes,
-					init_bytes: self.init_bytes,
+					tracks: self.renditions.len() as u64,
+					groups: self.renditions.iter().map(|r| r.groups).sum(),
+					packets: self.renditions.iter().map(|r| r.packets).sum(),
+					bytes: self.renditions.iter().map(|r| r.bytes).sum(),
+					init_bytes: self.renditions.iter().map(|r| r.init_bytes).sum(),
 				})
 				.expect("a summary row serializes"),
 			);
@@ -278,7 +385,7 @@ impl Guest for Publish {
 		PacketSinkMeta {
 			meta: Meta {
 				name: "publish".to_string(),
-				version: "0.2.0".to_string(),
+				version: "0.3.0".to_string(),
 				params_schema: PARAMS_SCHEMA.to_string(),
 				rows_schema: ROWS_SCHEMA.to_string(),
 				// No decoded payload ever arrives, so no format list fills in.
@@ -290,28 +397,44 @@ impl Guest for Publish {
 			},
 			// The fmp4 packaging is h264-shaped: avcC from SPS/PPS.
 			codecs: vec!["h264".to_string()],
+			audio_codecs: vec![],
+			// One broadcast carries as many renditions as the query names.
+			video: Arity::Many,
+			audio: Arity::Zero,
 		}
 	}
 
-	fn init(
-		coded_stream: CodedStream,
-		_stream_info: StreamInfo,
-		params: String,
-	) -> Result<(), String> {
+	fn init(streams: Vec<InputStream>, params: String) -> Result<(), String> {
 		let params = parse_params(&params)?;
-		if coded_stream.codec != "h264" {
-			return Err(format!(
-				"publish packages h264, and this stream is {}",
-				coded_stream.codec
-			));
+		if streams.is_empty() {
+			return Err("publish reads at least one video stream".into());
 		}
-		let muxer = moq_core::mux::Muxer::new(
-			&coded_stream.extradata,
-			coded_stream.width,
-			coded_stream.height,
-			coded_stream.time_base.num,
-			coded_stream.time_base.den,
-		)?;
+		// Every muxer is built before the session, so a stream this
+		// module cannot package is refused before anything is dialed.
+		let mut built = Vec::with_capacity(streams.len());
+		for stream in &streams {
+			let coded = &stream.coded;
+			if coded.codec != "h264" {
+				return Err(format!(
+					"publish packages h264, and this stream is {}",
+					coded.codec
+				));
+			}
+			let CodedFormat::Video(video) = coded.format else {
+				return Err("publish packages video, and this stream is audio".into());
+			};
+			let muxer = moq_core::mux::Muxer::new(
+				&coded.extradata,
+				video.width,
+				video.height,
+				coded.time_base.num,
+				coded.time_base.den,
+			)?;
+			built.push((muxer, video.width, video.height, coded.time_base));
+		}
+		let heights: Vec<u32> = built.iter().map(|(_, _, height, _)| *height).collect();
+		let names = moq_core::catalog::track_names(&params.track, &heights);
+
 		let (host, port) = parse_relay(&params.relay)?;
 		let literal: Option<IpAddr> = host.parse().ok();
 		let addrs = match literal {
@@ -335,7 +458,7 @@ impl Guest for Publish {
 		// included. The broadcast and its tracks exist before the
 		// session: the session's driver announces whatever the origin
 		// already carries.
-		let (broadcast, init_track, track, connected) = executor.enter(async {
+		let (broadcast, catalog, tracks, connected) = executor.enter(async {
 			let origin = moq_net::Origin::random().produce();
 			let mut broadcast = origin
 				.create_broadcast(
@@ -343,17 +466,24 @@ impl Guest for Publish {
 					moq_net::broadcast::Route::announced(),
 				)
 				.map_err(|err| format!("broadcast '{}': {err}", params.broadcast))?;
-			let init_track_name = format!("{}.init", params.track);
-			let init_track = broadcast
-				.create_track(init_track_name.as_str(), None)
-				.map_err(|err| format!("track '{init_track_name}': {err}"))?;
 			// The default keep window evicts a non-latest group after
 			// 5s; give a backlogged subscriber more rope.
-			let media_info =
-				moq_net::track::Info::default().with_latency_max(Duration::from_secs(30));
-			let track = broadcast
-				.create_track(params.track.as_str(), media_info)
-				.map_err(|err| format!("track '{}': {err}", params.track))?;
+			let info = moq_net::track::Info::default().with_latency_max(KEEP);
+			let catalog_name = moq_core::catalog::TRACK;
+			let catalog = broadcast
+				.create_track(catalog_name, info.clone())
+				.map_err(|err| format!("track '{catalog_name}': {err}"))?;
+			let mut tracks = Vec::with_capacity(names.len());
+			for name in &names {
+				let init_name = moq_core::catalog::init_name(name);
+				let init_track = broadcast
+					.create_track(init_name.as_str(), info.clone())
+					.map_err(|err| format!("track '{init_name}': {err}"))?;
+				let track = broadcast
+					.create_track(name.as_str(), info.clone())
+					.map_err(|err| format!("track '{name}': {err}"))?;
+				tracks.push((init_name, init_track, track));
+			}
 			// A looked-up name can carry several addresses; each gets
 			// the full connect timeout before the next is tried.
 			let client = moq_net::Client::new().with_publisher(origin.consume());
@@ -387,8 +517,33 @@ impl Guest for Publish {
 					addrs.len()
 				),
 			})?;
-			Ok::<_, String>((broadcast, init_track, track, connected))
+			Ok::<_, String>((broadcast, catalog, tracks, connected))
 		})?;
+
+		let renditions = built
+			.into_iter()
+			.zip(names)
+			.zip(tracks)
+			.map(
+				|(((muxer, width, height, time_base), name), (init_name, init_track, track))| {
+					Rendition {
+						codec: moq_core::catalog::avc_codec(muxer.avcc()),
+						name,
+						init_name,
+						width,
+						height,
+						track: Some(track),
+						init_track: Some(init_track),
+						muxer,
+						time_base: (time_base.num, time_base.den),
+						init_bytes: 0,
+						groups: 0,
+						packets: 0,
+						bytes: 0,
+					}
+				},
+			)
+			.collect();
 
 		let driver = connected.driver;
 		let driver = executor.local.spawn_local(async move {
@@ -403,16 +558,10 @@ impl Guest for Publish {
 					session: Some(connected.session),
 					driver: Some(driver),
 					broadcast: Some(broadcast),
-					init_track: Some(init_track),
-					track: Some(track),
-					muxer,
-					time_base: (coded_stream.time_base.num, coded_stream.time_base.den),
+					catalog: Some(catalog),
+					renditions,
 					params,
-					init_published: false,
-					init_bytes: 0,
-					groups: 0,
-					packets: 0,
-					bytes: 0,
+					started: false,
 				},
 			});
 		});
@@ -433,13 +582,13 @@ impl Guest for Publish {
 		})
 	}
 
-	fn process(packets: Vec<Packet>, last: bool) -> Processed {
+	fn process(pads: Vec<PadPackets>, last: bool) -> Processed {
 		STATE.with(|s| {
 			let mut holder = s.borrow_mut();
 			let state = holder.as_mut().expect("process called before init");
 
 			// Nothing to publish and no close asked: stay off the network.
-			if packets.is_empty() && !last {
+			if pads.iter().all(|pad| pad.packets.is_empty()) && !last {
 				return Processed {
 					rows: vec![],
 					trailing: vec![],
@@ -447,7 +596,7 @@ impl Guest for Publish {
 			}
 
 			let State { executor, session } = state;
-			match executor.enter(session.drive(&packets, last)) {
+			match executor.enter(session.drive(&pads, last)) {
 				Ok(processed) => {
 					if last {
 						*holder = None;

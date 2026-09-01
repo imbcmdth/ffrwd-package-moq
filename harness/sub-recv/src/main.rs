@@ -2,15 +2,17 @@
 //! fmp4 broadcast into a file a decoder must then accept whole.
 //!
 //! Connects to the relay, waits for the broadcast to be announced,
-//! reads the init segment off its own track, then every fragment off
-//! the media track - subscribed from group 0, ordered, tolerating
-//! backlog - and writes the bytes in arrival order. Prints `sub:`
-//! lines the test asserts.
+//! reads `catalog.json` to find out what the broadcast carries, then
+//! the init segment off its own track and every fragment off the media
+//! track - subscribed from group 0, ordered, tolerating backlog -
+//! writing the bytes in arrival order. Prints `sub:` lines the test
+//! asserts, the catalog's tracks among them.
 //!
 //! Environment: `RELAY_PORT`, `RELAY_CERT_HEX` (the relay certificate,
-//! DER as hex), `BROADCAST` (path), `TRACK` (media track name),
-//! `INIT_TRACK` (init track name), `OUTPUT` (file path inside a
-//! preopened directory).
+//! DER as hex), `BROADCAST` (path), `OUTPUT` (file path inside a
+//! preopened directory). `TRACK` and `INIT_TRACK` name the tracks to
+//! read; left unset, they come from the catalog - `RENDITION` picks
+//! which of its tracks by index, and defaults to the first.
 
 #[cfg(target_os = "wasi")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -37,8 +39,6 @@ mod live {
 		let port: u16 = env("RELAY_PORT")?.parse()?;
 		let cert_der = unhex(&env("RELAY_CERT_HEX")?)?;
 		let broadcast_path = env("BROADCAST")?;
-		let track_name = env("TRACK")?;
-		let init_track_name = env("INIT_TRACK")?;
 		let output = env("OUTPUT")?;
 
 		let relay = moq_core::wasi::Relay {
@@ -63,7 +63,26 @@ mod live {
 			.announced_broadcast(broadcast_path.as_str())
 			.await
 			.ok_or("broadcast never announced")?;
-		println!("sub: {broadcast_path} announced, subscribing to {track_name}");
+		println!("sub: {broadcast_path} announced, reading {CATALOG_TRACK}");
+
+		let catalog = read_catalog(&broadcast).await?;
+		println!("sub: catalog {}", catalog.trim());
+		let tracks = catalog_tracks(&catalog)?;
+		println!("sub: catalog names {} track(s)", tracks.len());
+		for (name, init, codec, size) in &tracks {
+			println!("sub: catalog track {name} init {init} codec {codec} {size}");
+		}
+		let rendition: usize = std::env::var("RENDITION")
+			.ok()
+			.map(|written| written.parse())
+			.transpose()?
+			.unwrap_or(0);
+		let chosen = tracks
+			.get(rendition)
+			.ok_or("the catalog has no track at RENDITION")?;
+        let track_name = std::env::var("TRACK").unwrap_or_else(|_| chosen.0.clone());
+        let init_track_name = std::env::var("INIT_TRACK").unwrap_or_else(|_| chosen.1.clone());
+		println!("sub: subscribing to {track_name}");
 
 		// Both subscriptions exist before any frame is read, so no
 		// media group can slip past while the init segment is fetched.
@@ -126,6 +145,77 @@ mod live {
 		println!("sub: clean close");
 		println!("sub: PASS");
 		Ok(())
+	}
+
+	/// The track a broadcast describes itself on, moq-rs's own name for it.
+	const CATALOG_TRACK: &str = "catalog.json";
+
+	/// The catalog document, read from group 0 of its own track.
+	async fn read_catalog(
+		broadcast: &moq_net::broadcast::Consumer,
+	) -> Result<String, Box<dyn Error>> {
+		let track = broadcast.track(CATALOG_TRACK)?;
+		let subscription = moq_net::track::Subscription::default()
+			.with_ordered(true)
+			.with_latency_max(std::time::Duration::from_secs(30))
+			.with_group_start(0);
+		let mut stream =
+			moq_core::subscribe::FrameStream::new(track.subscribe(subscription).await?);
+		let frame = stream
+			.next()
+			.await?
+			.ok_or("catalog track finished without a document")?;
+		Ok(String::from_utf8(frame.payload.to_vec())?)
+	}
+
+	/// Each catalog track as `(name, init, codec, WxH)`.
+	///
+	/// Read with a small scan rather than a JSON crate: the harness has no
+	/// serde dependency, and the document is this package's own.
+	fn catalog_tracks(
+		document: &str,
+	) -> Result<Vec<(String, String, String, String)>, Box<dyn Error>> {
+		let mut found = Vec::new();
+		for entry in document.split("{\"name\"").skip(1) {
+			let name = field(entry, "")?;
+			let init = field(entry, "\"init\"")?;
+			let codec = field(entry, "\"codec\"")?;
+			let width = number(entry, "\"width\"")?;
+			let height = number(entry, "\"height\"")?;
+			found.push((name, init, codec, format!("{width}x{height}")));
+		}
+		if found.is_empty() {
+			return Err(format!("no tracks in catalog {document}").into());
+		}
+		Ok(found)
+	}
+
+	/// One string field's value, after `key` (empty for the entry's first).
+	fn field(entry: &str, key: &str) -> Result<String, Box<dyn Error>> {
+		let rest = match entry.split_once(key) {
+			Some((_, rest)) => rest,
+			None => return Err(format!("catalog entry has no {key}").into()),
+		};
+		let (_, rest) = rest
+			.split_once('"')
+			.ok_or_else(|| format!("catalog {key} has no value"))?;
+		let (value, _) = rest
+			.split_once('"')
+			.ok_or_else(|| format!("catalog {key} is unterminated"))?;
+		Ok(value.to_string())
+	}
+
+	/// One numeric field's value, after `key`.
+	fn number(entry: &str, key: &str) -> Result<u32, Box<dyn Error>> {
+		let (_, rest) = entry
+			.split_once(key)
+			.ok_or_else(|| format!("catalog entry has no {key}"))?;
+		let digits: String = rest
+			.chars()
+			.skip_while(|c| !c.is_ascii_digit())
+			.take_while(|c| c.is_ascii_digit())
+			.collect();
+		Ok(digits.parse()?)
 	}
 
 	fn env(name: &str) -> Result<String, Box<dyn Error>> {

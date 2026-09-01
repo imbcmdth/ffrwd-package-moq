@@ -624,6 +624,8 @@ dependencies = [
  "quinn",
  "quinn-wasi",
  "rustls",
+ "serde",
+ "serde_json",
  "tokio",
  "web-transport-quinn",
  "webpki-roots",
