@@ -11,12 +11,13 @@ COPY (
 ) TO ffrwd.moq.publish('moqt://203.0.113.7:4443', 'live/demo')
 ```
 
-One stream is one track. Gather several and they are one broadcast -
-a rendition ladder is `array_agg` over the rungs:
+<!-- draft: rewritten for the row-shaped sink; please review. -->
+The relation IS the broadcast: one row is one rendition, and a
+rendition ladder is one row per rung, not an array gathered into one:
 
 ```pgsql
 COPY (
-  SELECT array_agg(scale(f.video[1], :widths[i.i], -2))
+  SELECT scale(f.video[1], :widths[i.i], -2) AS v
   FROM input(:'source') f, generate_series(1, :rungs) i
 ) TO ffrwd.moq.publish(:'relay', :'broadcast')
   WITH (video_bitrate :'bitrates'[i.i], gop 30)
@@ -60,20 +61,20 @@ carried for wasm32-wasip2 fixes upstream does not ship yet).
 
 ## Exports
 
-- `publish(v, relay, broadcast, track DEFAULT 'video', cert DEFAULT '')`
-  returns `sink`: a COPY destination, nothing comes back. `v` is
-  `video_stream[]` - every video stream the SELECT carries.
-- `publish_av(v, a, relay, broadcast, track DEFAULT 'video',
-  audio_track DEFAULT 'audio', cert DEFAULT '')` - the same, plus one
-  audio stream.
+- `publish(relay, broadcast, cert DEFAULT '', token DEFAULT '')`
+  returns `sink`: a COPY destination, nothing comes back. It reads the
+  whole relation - a video cell, an audio cell, either NULL - one
+  rendition per row.
 
 ## Recipes
 
 - `publish` - a file's first video track to a relay.
 - `publish-live` - the same shape from a live source URL; the run ends
   when the source does.
-- `publish-ladder` - a rendition ladder, one broadcast.
-- `publish-ladder-audio` - the ladder with the file's audio beside it.
+- `publish-ladder` - a rendition ladder plus the file's audio, one
+  broadcast.
+- `republish-ladder` - an HLS or DASH ladder read back and republished
+  as one MoQ broadcast, rendition for rendition.
 
 ```
 ffrwd ffrwd.moq.publish-ladder -v source=film.mp4 -v relay=moqt://203.0.113.7:4443 -v broadcast=live/demo -v rungs=3 -v widths=1920,1280,854 -v bitrates=6000k,3000k,1000k

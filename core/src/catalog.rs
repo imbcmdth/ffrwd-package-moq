@@ -231,6 +231,84 @@ pub fn track_names(base: &str, heights: &[u32]) -> Vec<String> {
 		.collect()
 }
 
+/// What one sink pad carries, past its row and its rendition's name -
+/// enough to name its MoQ track without depending on the wit types
+/// `init` reads them off. A video pad also carries the frame height
+/// the fallback naming reads.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RowKind {
+	Video { height: u32 },
+	Audio,
+}
+
+/// One pad, in the order a packet sink's `init` receives it: which
+/// relation row it belongs to, and what the row's rendition-meta said
+/// its name was, if anything did.
+#[derive(Debug, Clone)]
+pub struct RowPad {
+	pub row: u32,
+	pub kind: RowKind,
+	pub name: Option<String>,
+}
+
+/// Names a sink's tracks from the relation rows it was handed, in pad
+/// order. A row is one rendition: a video pad and an audio pad
+/// sharing a row are one muxed rendition, and either alone is its
+/// own - so three pads on rows `[0, 0, 1]` are two renditions, one
+/// muxed and one on its own.
+///
+/// A pad's own name - what its row's rendition-meta said, read off a
+/// manifest or another broadcast's catalog - is used as written.
+/// Without one, a video pad falls back to [`track_names`], computed
+/// over only the unnamed video pads so a lone one still keeps the
+/// plain `video_base`; an audio pad falls back to `audio_base`,
+/// numbered past the first. MoQ track names are one flat namespace
+/// per broadcast, so a muxed row's audio pad cannot repeat its video
+/// pad's explicit name - it qualifies it with ".audio" instead.
+pub fn track_names_for_rows(pads: &[RowPad], video_base: &str, audio_base: &str) -> Vec<String> {
+	let mut row_has_video: std::collections::HashMap<u32, bool> = std::collections::HashMap::new();
+	for pad in pads {
+		if let RowKind::Video { .. } = pad.kind {
+			row_has_video.insert(pad.row, true);
+		}
+	}
+
+	let unnamed_heights: Vec<u32> = pads
+		.iter()
+		.filter_map(|pad| match (pad.kind, &pad.name) {
+			(RowKind::Video { height }, None) => Some(height),
+			_ => None,
+		})
+		.collect();
+	let mut fallback_video_names = track_names(video_base, &unnamed_heights).into_iter();
+
+	let mut unnamed_audio_ordinal = 0u32;
+	pads
+		.iter()
+		.map(|pad| match pad.kind {
+			RowKind::Video { .. } => match &pad.name {
+				Some(name) => name.clone(),
+				None => fallback_video_names
+					.next()
+					.expect("one fallback name per unnamed video pad"),
+			},
+			RowKind::Audio => match &pad.name {
+				Some(name) if row_has_video.get(&pad.row).copied().unwrap_or(false) => {
+					format!("{name}.audio")
+				}
+				Some(name) => name.clone(),
+				None => {
+					unnamed_audio_ordinal += 1;
+					match unnamed_audio_ordinal {
+						1 => audio_base.to_string(),
+						nth => format!("{audio_base}.{}", nth - 1),
+					}
+				}
+			},
+		})
+		.collect()
+}
+
 /// The RFC 6381 codec string an `avcC` record spells: the profile, the
 /// constraint flags and the level, which are its bytes 1 through 3. The
 /// fallback for a stream that names no profile or level of its own.
@@ -297,6 +375,98 @@ mod tests {
 		assert_eq!(
 			track_names("video", &[720, 720, 360]),
 			vec!["video.720p.0", "video.720p.1", "video.360p"]
+		);
+	}
+
+	#[test]
+	fn rows_zero_zero_one_are_a_muxed_rendition_and_an_audio_only_one() {
+		// Three pads: a video and an audio on row 0 (one muxed
+		// rendition, unnamed - the old plain "video"/"audio" defaults),
+		// and an audio alone on row 1 (its own rendition, numbered past
+		// the first).
+		let pads = vec![
+			RowPad {
+				row: 0,
+				kind: RowKind::Video { height: 720 },
+				name: None,
+			},
+			RowPad {
+				row: 0,
+				kind: RowKind::Audio,
+				name: None,
+			},
+			RowPad {
+				row: 1,
+				kind: RowKind::Audio,
+				name: None,
+			},
+		];
+		assert_eq!(
+			track_names_for_rows(&pads, "video", "audio"),
+			vec!["video", "audio", "audio.1"]
+		);
+	}
+
+	#[test]
+	fn an_explicit_rendition_name_is_used_as_written() {
+		// An audio-only row with a rendition name reads it straight off,
+		// no numbering.
+		let pads = vec![RowPad {
+			row: 0,
+			kind: RowKind::Audio,
+			name: Some("commentary".to_string()),
+		}];
+		assert_eq!(track_names_for_rows(&pads, "video", "audio"), vec!["commentary"]);
+	}
+
+	#[test]
+	fn a_muxed_rows_named_audio_pad_is_qualified_against_its_video_pad() {
+		// Row 0 pairs a video and an audio pad under the same explicit
+		// name: the video pad keeps it, the audio pad cannot repeat it
+		// (MoQ track names are one flat namespace), so it is qualified.
+		let pads = vec![
+			RowPad {
+				row: 0,
+				kind: RowKind::Video { height: 1080 },
+				name: Some("1080p".to_string()),
+			},
+			RowPad {
+				row: 0,
+				kind: RowKind::Audio,
+				name: Some("1080p".to_string()),
+			},
+		];
+		assert_eq!(
+			track_names_for_rows(&pads, "video", "audio"),
+			vec!["1080p", "1080p.audio"]
+		);
+	}
+
+	#[test]
+	fn unnamed_video_rows_still_fall_back_to_height_derived_names() {
+		// Two unnamed video-only rows behave exactly as `track_names`
+		// over their heights, undisturbed by an explicit-name row mixed
+		// among them.
+		let pads = vec![
+			RowPad {
+				row: 0,
+				kind: RowKind::Video { height: 480 },
+				name: None,
+			},
+			RowPad {
+				row: 1,
+				kind: RowKind::Video { height: 720 },
+				name: Some("hd".to_string()),
+			},
+			RowPad {
+				row: 2,
+				kind: RowKind::Video { height: 240 },
+				name: None,
+			},
+		];
+		assert_eq!(
+			track_names_for_rows(&pads, "video", "audio"),
+			vec!["video.480p", "hd", "video.240p"]
 		);
 	}
 

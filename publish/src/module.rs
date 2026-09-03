@@ -9,11 +9,19 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use exports::ffrwd::av::packet_sink::{
-	Arity, CodedFormat, Guest, InputStream, Meta, PacketSinkMeta, PadPackets, Processed,
+	Arity, Guest, InputStream, Meta, PacketSinkMeta, PadPackets, Processed,
 };
+use ffrwd::av::types::CodedFormat;
 use serde::{Deserialize, Serialize};
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"track":{"type":"string","default":"video","description":"media track name; one stream publishes it as written, several name a rendition apiece under it"},"audio_track":{"type":"string","default":"audio","description":"the audio track's name"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
+
+/// The base name a video track falls back to when its row's rendition
+/// carries none, and the ladder holds only the one stream.
+const DEFAULT_VIDEO_TRACK: &str = "video";
+
+/// The base name an audio track falls back to under the same rule.
+const DEFAULT_AUDIO_TRACK: &str = "audio";
 
 /// One schema covers both row shapes: a group row carries `group`, the
 /// trailing summary carries `groups`, and each leaves the other's
@@ -57,10 +65,6 @@ const CATALOG_REFRESH: Duration = Duration::from_secs(3);
 struct Params {
 	relay: String,
 	broadcast: String,
-	#[serde(default = "default_track")]
-	track: String,
-	#[serde(default = "default_audio_track")]
-	audio_track: String,
 	#[serde(default)]
 	cert: String,
 	// The token rides the params JSON, which is visible on the sidecar
@@ -68,14 +72,6 @@ struct Params {
 	// the query text already carries.
 	#[serde(default)]
 	token: String,
-}
-
-fn default_track() -> String {
-	"video".into()
-}
-
-fn default_audio_track() -> String {
-	"audio".into()
 }
 
 /// One published group's row.
@@ -317,11 +313,13 @@ fn parse_relay(url: &str) -> Result<(String, u16), String> {
 
 fn unhex(hex: &str) -> Result<Vec<u8>, String> {
 	let digits: Vec<u8> = hex.trim().bytes().collect();
-	if digits.len() % 2 != 0 {
+	if !digits.len().is_multiple_of(2) {
 		return Err("cert: odd hex length".into());
 	}
 	digits
-		.chunks_exact(2)
+		.as_chunks::<2>()
+		.0
+		.iter()
 		.map(|pair| {
 			let hi = (pair[0] as char).to_digit(16).ok_or("cert: bad hex digit")?;
 			let lo = (pair[1] as char).to_digit(16).ok_or("cert: bad hex digit")?;
@@ -494,7 +492,7 @@ impl Guest for Publish {
 		PacketSinkMeta {
 			meta: Meta {
 				name: "publish".to_string(),
-				version: "0.3.0".to_string(),
+				version: "0.4.0".to_string(),
 				params_schema: PARAMS_SCHEMA.to_string(),
 				rows_schema: ROWS_SCHEMA.to_string(),
 				// No decoded payload ever arrives, so no format list fills in.
@@ -589,30 +587,30 @@ impl Guest for Publish {
 				}
 			});
 		}
-		// The video streams name a rendition apiece by height; the audio
-		// stream takes the track name it was given.
-		let heights: Vec<u32> = built
+		// Renditions come from the rows, not from argument names: every
+		// stream carries the relation row it belongs to, and the row's
+		// rendition-meta is what the source (a manifest, another moq
+		// broadcast) said about it. A row with a video and an audio pad
+		// is one muxed rendition; a video alone or an audio alone is its
+		// own. The naming rule itself is a pure function in moq-core, so
+		// it is unit-tested without a session or the wit types.
+		let pads: Vec<moq_core::catalog::RowPad> = streams
 			.iter()
-			.filter_map(|b| match b.media {
-				Media::Video { height, .. } => Some(height),
-				Media::Audio { .. } => None,
+			.zip(&built)
+			.map(|(stream, b)| moq_core::catalog::RowPad {
+				row: stream.row,
+				kind: match b.media {
+					Media::Video { height, .. } => moq_core::catalog::RowKind::Video { height },
+					Media::Audio { .. } => moq_core::catalog::RowKind::Audio,
+				},
+				name: stream.rendition.name.clone(),
 			})
 			.collect();
-		let mut video_names = moq_core::catalog::track_names(&params.track, &heights).into_iter();
-		let mut audio_names = 0u32;
-		let names: Vec<String> = built
-			.iter()
-			.map(|b| match b.media {
-				Media::Video { .. } => video_names.next().expect("one name per video stream"),
-				Media::Audio { .. } => {
-					audio_names += 1;
-					match audio_names {
-						1 => params.audio_track.clone(),
-						nth => format!("{}.{}", params.audio_track, nth - 1),
-					}
-				}
-			})
-			.collect();
+		let names = moq_core::catalog::track_names_for_rows(
+			&pads,
+			DEFAULT_VIDEO_TRACK,
+			DEFAULT_AUDIO_TRACK,
+		);
 
 		let (host, port) = parse_relay(&params.relay)?;
 		let literal: Option<IpAddr> = host.parse().ok();

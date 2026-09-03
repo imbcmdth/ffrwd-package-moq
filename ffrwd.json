@@ -1,6 +1,6 @@
 {
  "name": "ffrwd/moq",
- "version": "0.3.0",
+ "version": "0.4.0",
  "description": "Live publishing over Media over QUIC, hosted in wasm: COPY a query's streams TO a relay broadcast. The module packages each encoded stream as fragmented MP4 - one fragment per group of pictures, a hang catalog naming the renditions with their init segments - and publishes them over raw QUIC as one broadcast, so a hang player picks a rendition and plays it.",
  "license": "Apache-2.0",
  "homepage": "https://github.com/imbcmdth/ffrwd-package-moq",
@@ -9,7 +9,7 @@
   "http"
  ],
  "dependencies": {
-  "ffrwd/wasm": "0.12.0"
+  "ffrwd/wasm": "0.13.0"
  },
  "keywords": [
   "moq",
@@ -21,13 +21,12 @@
   "fmp4"
  ],
  "lib": {
-  "publish": "src/moq.sql",
-  "publish_av": "src/moq-av.sql"
+  "publish": "src/moq.sql"
  },
  "bin": {
   "publish": "recipes/publish.sql",
   "publish-live": "recipes/publish-live.sql",
   "publish-ladder": "recipes/publish-ladder.sql",
-  "publish-ladder-audio": "recipes/publish-ladder-audio.sql"
+  "republish-ladder": "recipes/republish-ladder.sql"
  }
 }
