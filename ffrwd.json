@@ -9,7 +9,7 @@
   "http"
  ],
  "dependencies": {
-  "ffrwd/wasm": "0.13.0"
+  "ffrwd/wasm": "0.15.0"
  },
  "keywords": [
   "fmp4",

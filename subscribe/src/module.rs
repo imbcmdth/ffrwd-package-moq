@@ -287,14 +287,40 @@ fn source_track(
 	))
 }
 
-/// Every rendition as a catalog the host reads, and the demuxers under
-/// it, in the catalog's own order.
+/// The renditions `order` names, as catalog indices: what `open` was told
+/// to pull. An index the broadcast's catalog does not carry is refused by
+/// name, before anything is subscribed to.
+fn chosen(
+	renditions: &[moq_core::catalog::Rendition],
+	tracks: &[u32],
+) -> Result<Vec<usize>, String> {
+	tracks
+		.iter()
+		.map(|index| {
+			let index = *index as usize;
+			if index >= renditions.len() {
+				return Err(format!(
+					"this broadcast's catalog names {} rendition(s), so track {index} is not one of them",
+					renditions.len()
+				));
+			}
+			Ok(index)
+		})
+		.collect()
+}
+
+/// The renditions `order` names as a catalog the host reads, and the demuxers
+/// under it, in that order. `probe` passes every index and `open` the ones it
+/// was told to pull; a track's `index` and `row` stay the catalog's own, so
+/// the same rendition is the same track in both.
 fn catalog_of(
 	renditions: &[moq_core::catalog::Rendition],
+	order: &[usize],
 ) -> Result<(Catalog, Vec<Rendition>), String> {
-	let mut tracks = Vec::with_capacity(renditions.len());
-	let mut readers = Vec::with_capacity(renditions.len());
-	for (index, rendition) in renditions.iter().enumerate() {
+	let mut tracks = Vec::with_capacity(order.len());
+	let mut readers = Vec::with_capacity(order.len());
+	for &index in order {
+		let rendition = &renditions[index];
 		let (track, demux) = source_track(index, rendition)?;
 		let video = matches!(rendition.kind, moq_core::catalog::Kind::Video { .. });
 		tracks.push(track);
@@ -490,10 +516,12 @@ impl Guest for Subscribe {
 		let executor = Executor::new()?;
 		executor.enter(async {
 			let opened = open_broadcast(&params, PROBE_TIMEOUT).await?;
-			// The catalog is built before the session closes, so a
+			// The whole catalog, which is what makes the rows known at
+			// compile time. It is built before the session closes, so a
 			// rendition this module cannot read is named here rather
 			// than at run time.
-			let (catalog, _) = catalog_of(&opened.renditions)?;
+			let every = (0..opened.renditions.len()).collect::<Vec<_>>();
+			let (catalog, _) = catalog_of(&opened.renditions, &every)?;
 			drop(opened.broadcast);
 			drop(opened.session);
 			opened.endpoint.wait_idle().await;
@@ -501,21 +529,35 @@ impl Guest for Subscribe {
 		})
 	}
 
-	fn open(params: String) -> Result<Catalog, String> {
+	fn open(params: String, tracks: Vec<u32>) -> Result<Catalog, String> {
 		let params = parse_params(&params)?;
 		let executor = Executor::new()?;
 		let (catalog, reader) = executor.enter(async {
 			let opened = open_broadcast(&params, OPEN_TIMEOUT).await?;
-			let (catalog, renditions) = catalog_of(&opened.renditions)?;
-			// EVERY catalog track is read: the host writes one output
-			// per track, and a track nothing subscribes to never ends.
+			let order = chosen(&opened.renditions, &tracks)?;
+			// One line per run naming what this source pulls, so a run can
+			// be read back against the catalog it narrowed.
+			eprintln!(
+				"subscribe: pulling {} of {} rendition(s): {}",
+				order.len(),
+				opened.renditions.len(),
+				order
+					.iter()
+					.map(|&index| format!("{index}={}", opened.renditions[index].name))
+					.collect::<Vec<_>>()
+					.join(", ")
+			);
+			let (catalog, renditions) = catalog_of(&opened.renditions, &order)?;
+			// Only the tracks this run was told to pull are subscribed
+			// to, and each becomes the pad at its place in `order`.
 			let (sender, frames) = mpsc::unbounded_channel();
-			for (index, rendition) in opened.renditions.iter().enumerate() {
+			for (pad, &index) in order.iter().enumerate() {
+				let rendition = &opened.renditions[index];
 				// Subscribed once here, so a name the broadcast does not
 				// carry is refused by `open` rather than mid-run.
 				let subscriber = subscribe_track(&opened.broadcast, &rendition.name, true).await?;
 				tokio::task::spawn_local(read_track(
-					index,
+					pad,
 					opened.broadcast.clone(),
 					rendition.name.clone(),
 					subscriber,
