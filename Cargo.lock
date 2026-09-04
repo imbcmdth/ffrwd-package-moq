@@ -627,6 +627,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "wasi 0.14.7+wasi-0.2.4",
  "web-transport-quinn",
  "webpki-roots",
 ]
@@ -787,7 +788,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "wasi 0.14.7+wasi-0.2.4",
  "wit-bindgen",
 ]
 
@@ -1238,8 +1238,21 @@ version = "0.1.0"
 dependencies = [
  "moq-core",
  "moq-net",
+ "tokio",
+]
+
+[[package]]
+name = "subscribe"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "moq-core",
+ "moq-net",
+ "quinn",
+ "serde",
  "serde_json",
  "tokio",
+ "wit-bindgen",
 ]
 
 [[package]]

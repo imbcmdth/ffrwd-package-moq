@@ -1,14 +1,16 @@
 [workspace]
-# The wasm this package ships and the code under it. `publish` builds
-# into target/wasm32-wasip2/release/, which is where the package's lib
-# SQL names it; `core` is the shared Rust it compiles in, testable on
-# the native target; `harness/sub-recv` is the receiving side of the
-# package's own live test, never shipped. The vendored crates under
-# vendor/ and the live test's native helper are dependencies, not
-# members, so a workspace-wide wasm build does not sweep them in.
+# The wasm this package ships and the code under it. `publish` and
+# `subscribe` build into target/wasm32-wasip2/release/, which is where
+# the package's lib SQL names them; `core` is the shared Rust they
+# compile in, testable on the native target; `harness/sub-recv` is the
+# receiving side of the package's own live test, never shipped. The
+# vendored crates under vendor/ and the live test's native helper are
+# dependencies, not members, so a workspace-wide wasm build does not
+# sweep them in.
 members = [
     "core",
     "publish",
+    "subscribe",
     "harness/sub-recv",
 ]
 exclude = [

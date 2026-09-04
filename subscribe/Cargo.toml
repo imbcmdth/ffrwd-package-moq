@@ -1,10 +1,10 @@
 [package]
-name = "publish"
+name = "subscribe"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "publish"
+name = "subscribe"
 crate-type = ["cdylib"]
 
 [dependencies]

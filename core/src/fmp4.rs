@@ -283,15 +283,15 @@ impl Default for Scanner {
 }
 
 /// A box header peeked off the head of a buffer.
-struct BoxHeader {
+pub(crate) struct BoxHeader {
 	/// Total box size including the header.
-	size: u64,
-	kind: [u8; 4],
+	pub(crate) size: u64,
+	pub(crate) kind: [u8; 4],
 }
 
 /// Reads the header at the head of `buf`, or `None` if more bytes are
 /// needed to know. `offset` is `buf[0]`'s absolute position, for errors.
-fn peek_box(buf: &[u8], offset: u64) -> Result<Option<BoxHeader>, Error> {
+pub(crate) fn peek_box(buf: &[u8], offset: u64) -> Result<Option<BoxHeader>, Error> {
 	if buf.len() < 8 {
 		return Ok(None);
 	}
@@ -477,7 +477,7 @@ fn trun_first_sample_flags(trun: &[u8]) -> Option<u32> {
 }
 
 /// Strips a complete box's header, returning its payload.
-fn box_payload(data: &[u8], offset: u64) -> Result<&[u8], Error> {
+pub(crate) fn box_payload(data: &[u8], offset: u64) -> Result<&[u8], Error> {
 	let header = peek_box(data, offset)?.ok_or_else(|| Error::Truncated {
 		offset,
 		what: "box shorter than its header".into(),
@@ -505,11 +505,11 @@ struct BoxIter<'a> {
 	offset: u64,
 }
 
-struct ChildBox<'a> {
-	kind: [u8; 4],
-	payload: &'a [u8],
+pub(crate) struct ChildBox<'a> {
+	pub(crate) kind: [u8; 4],
+	pub(crate) payload: &'a [u8],
 	/// Absolute offset of the payload's first byte.
-	offset: u64,
+	pub(crate) offset: u64,
 }
 
 impl<'a> BoxIter<'a> {
@@ -546,4 +546,15 @@ impl<'a> BoxIter<'a> {
 		self.pos += size;
 		Ok(Some(child))
 	}
+}
+
+/// Every child box of a parent payload, in order. `offset` is the
+/// absolute position of `data[0]`, for errors.
+pub(crate) fn child_boxes(data: &[u8], offset: u64) -> Result<Vec<ChildBox<'_>>, Error> {
+	let mut children = Vec::new();
+	let mut iter = BoxIter::new(data, offset);
+	while let Some(child) = iter.next()? {
+		children.push(child);
+	}
+	Ok(children)
 }

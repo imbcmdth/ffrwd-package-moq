@@ -49,7 +49,6 @@ SECONDS = 8
 RATE = 30
 GOP = 30
 BROADCAST = "live/demo"
-TRACK = "video"
 
 # Hard deadlines, seconds. Generous: an expiry means something is stuck,
 # not slow.
@@ -132,7 +131,9 @@ def one_run(publish_wasm: Path, sub_wasm: Path, certgen: Path, keep: bool) -> No
 
         port = free_udp_port()
         relay = start_relay(port, dir / "cert.pem", dir / "key.pem", dir / "relay.log")
-        sub = start_subscriber(sub_wasm, port, cert_hex, out_dir, BROADCAST, TRACK)
+        # The broadcast's one track, taken off the catalog: what it is
+        # called follows from the row it was published from.
+        sub = start_subscriber(sub_wasm, port, cert_hex, out_dir, BROADCAST)
         rows, _ = run_publisher(source, port, cert_hex)
         transcript = wait_subscriber(sub, SUBSCRIBER_DEADLINE)
 

@@ -27,3 +27,24 @@ CREATE FUNCTION publish(relay text, broadcast text,
                         cert text DEFAULT '', token text DEFAULT '')
 RETURNS sink
   AS 'target/wasm32-wasip2/release/publish.wasm', 'publish' LANGUAGE wasm;
+
+-- Subscribing as a source: a MoQ relay broadcast IS a relation in
+-- FROM, one row per rendition of its catalog.json, a video cell and
+-- an audio cell (NULL where the rendition lacks the kind). WHERE,
+-- ORDER BY and LIMIT over the rows pick rungs at compile time the
+-- same way a manifest input's do: s.height, s.width, s.bandwidth,
+-- s.codecs, s.name. A broadcast never ends of itself, so the relation
+-- is unbounded - a live input, and the run lasts as long as the
+-- publisher does.
+--
+-- The catalog is read at compile time, so the broadcast must be on
+-- the relay before the query compiles. Each rendition's init segment
+-- carries the decoder configuration - h264's SPS/PPS, aac's
+-- AudioSpecificConfig - and its fragments are demuxed back to the
+-- packets they were built from, so a rung crosses the graph encoded.
+--
+-- relay, cert and token read exactly as publish's do.
+CREATE FUNCTION subscribe(relay text, broadcast text,
+                          cert text DEFAULT '', token text DEFAULT '')
+RETURNS source
+  AS 'target/wasm32-wasip2/release/subscribe.wasm', 'subscribe' LANGUAGE wasm;

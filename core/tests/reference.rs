@@ -21,6 +21,7 @@
 //! exactly. When ffprobe is on the PATH the muxer's own output must
 //! also decode whole.
 
+use moq_core::demux::{Media, Track};
 use moq_core::fmp4::{Scanner, Segment};
 use moq_core::mux::{Muxer, Packet};
 
@@ -151,6 +152,51 @@ fn the_reference_round_trips_through_the_scanner() {
 			"fragment {} does not open on a sync sample",
 			fragment.sequence
 		);
+	}
+}
+
+#[test]
+fn the_demux_reads_the_reference_the_hand_parser_does() {
+	// ffmpeg puts a whole GOP in one moof, which the muxer never does:
+	// the demux must cut a many-sample trun exactly where this file's
+	// own reader cuts it, and read the same timescale, geometry and
+	// avcC off the init segment.
+	let reference = Reference::read();
+	let bytes = std::fs::read(REFERENCE).expect("the committed reference");
+	let mut scanner = Scanner::new();
+	scanner.push(&bytes).expect("scan the reference");
+
+	let mut track: Option<Track> = None;
+	let mut read = Vec::new();
+	while let Some(segment) = scanner.poll() {
+		match segment {
+			Segment::Init(seg) => {
+				track = Some(Track::read(&seg.bytes).expect("the init segment reads"))
+			}
+			Segment::Fragment(frag) => {
+				let track = track.as_ref().expect("the init segment comes first");
+				read.extend(track.samples(&frag.bytes).expect("a fragment reads"));
+			}
+		}
+	}
+	let track = track.expect("the reference has an init segment");
+	assert_eq!(track.timescale, reference.timescale);
+	assert_eq!(
+		track.media,
+		Media::Video {
+			width: reference.width,
+			height: reference.height,
+			avcc: reference.avcc.clone(),
+		}
+	);
+	assert_eq!(read.len(), reference.samples.len(), "sample count");
+	for (index, (sample, want)) in read.iter().zip(&reference.samples).enumerate() {
+		assert_eq!(
+			(sample.dts, sample.pts, sample.duration, sample.keyframe),
+			(want.dts, want.pts, want.duration as i64, want.keyframe),
+			"sample {index}"
+		);
+		assert_eq!(sample.data, want.data, "sample {index} bytes");
 	}
 }
 

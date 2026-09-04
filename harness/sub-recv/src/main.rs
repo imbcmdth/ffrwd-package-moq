@@ -38,7 +38,7 @@ mod live {
 
 	pub async fn run() -> Result<(), Box<dyn Error>> {
 		let port: u16 = env("RELAY_PORT")?.parse()?;
-		let cert_der = unhex(&env("RELAY_CERT_HEX")?)?;
+		let cert_der = moq_core::catalog::unhex(&env("RELAY_CERT_HEX")?)?;
 		let broadcast_path = env("BROADCAST")?;
 		let output = env("OUTPUT")?;
 
@@ -64,9 +64,12 @@ mod live {
 			.announced_broadcast(broadcast_path.as_str())
 			.await
 			.ok_or("broadcast never announced")?;
-		println!("sub: {broadcast_path} announced, reading {CATALOG_TRACK}");
+		println!(
+			"sub: {broadcast_path} announced, reading {}",
+			moq_core::catalog::TRACK
+		);
 
-		let catalog = read_catalog(&broadcast).await?;
+		let catalog = moq_core::subscribe::read_catalog(&broadcast).await?;
 		println!("sub: catalog {}", catalog.trim());
 		let tracks = catalog_tracks(&catalog)?;
 		println!("sub: catalog names {} track(s)", tracks.len());
@@ -95,15 +98,9 @@ mod live {
 		println!("sub: subscribing to {track_name}");
 
 		let track = broadcast.track(track_name.as_str())?;
-		// A default subscription is live-edge: start at the latest
-		// group and skip any older one the moment a newer exists.
-		// Reassembly wants the opposite - every group from 0, in
-		// order, tolerating backlog.
-		let subscription = moq_net::track::Subscription::default()
-			.with_ordered(true)
-			.with_latency_max(std::time::Duration::from_secs(30))
-			.with_group_start(0);
-		let subscriber = track.subscribe(subscription).await?;
+		// Reassembly reads every group from 0, in order, tolerating
+		// backlog - the opposite of the live edge a player takes.
+		let subscriber = track.subscribe(moq_core::subscribe::from_start()).await?;
 
 		// The init segment came with the catalog, not off a track.
 		println!("sub: init segment {} bytes", chosen.init.len());
@@ -154,27 +151,6 @@ mod live {
 		Ok(())
 	}
 
-	/// The track a broadcast describes itself on, moq-rs's own name for it.
-	const CATALOG_TRACK: &str = "catalog.json";
-
-	/// The catalog document, read from group 0 of its own track.
-	async fn read_catalog(
-		broadcast: &moq_net::broadcast::Consumer,
-	) -> Result<String, Box<dyn Error>> {
-		let track = broadcast.track(CATALOG_TRACK)?;
-		let subscription = moq_net::track::Subscription::default()
-			.with_ordered(true)
-			.with_latency_max(std::time::Duration::from_secs(30))
-			.with_group_start(0);
-		let mut stream =
-			moq_core::subscribe::FrameStream::new(track.subscribe(subscription).await?);
-		let frame = stream
-			.next()
-			.await?
-			.ok_or("catalog track finished without a document")?;
-		Ok(String::from_utf8(frame.payload.to_vec())?)
-	}
-
 	/// One track the catalog names: its name, codec, a shape line for
 	/// the transcript, and the decoded init segment.
 	struct CatalogTrack {
@@ -184,109 +160,30 @@ mod live {
 		init: Vec<u8>,
 	}
 
-	/// The catalog's tracks: the video renditions then the audio ones,
-	/// each set in the document's own (alphabetical) order.
+	/// The catalog's tracks, in the document's own order: the video
+	/// renditions then the audio ones, each alphabetical.
 	fn catalog_tracks(document: &str) -> Result<Vec<CatalogTrack>, Box<dyn Error>> {
-		let parsed: serde_json::Value = serde_json::from_str(document)?;
-		let mut found = Vec::new();
-		for kind in ["video", "audio"] {
-			let Some(renditions) = parsed
-				.get(kind)
-				.and_then(|section| section.get("renditions"))
-				.and_then(|map| map.as_object())
-			else {
-				continue;
-			};
-			for (name, entry) in renditions {
-				let codec = string(entry, "codec")?;
-				let shape = if kind == "audio" {
-					format!("{}Hz {}ch", number(entry, "sampleRate")?, number(entry, "numberOfChannels")?)
-				} else {
-					format!("{}x{}", number(entry, "codedWidth")?, number(entry, "codedHeight")?)
-				};
-				let container = entry.get("container").ok_or("catalog entry has no container")?;
-				if string(container, "kind")? != "cmaf" {
-					return Err(format!("track {name} is not cmaf").into());
-				}
-				let init = unbase64(&string(container, "init")?)?;
-				found.push(CatalogTrack {
-					name: name.clone(),
-					codec,
-					shape,
-					init,
-				});
-			}
-		}
-		if found.is_empty() {
-			return Err(format!("no tracks in catalog {document}").into());
-		}
-		Ok(found)
-	}
-
-	fn string(entry: &serde_json::Value, key: &str) -> Result<String, Box<dyn Error>> {
-		entry
-			.get(key)
-			.and_then(|value| value.as_str())
-			.map(str::to_string)
-			.ok_or_else(|| format!("catalog entry has no {key}").into())
-	}
-
-	fn number(entry: &serde_json::Value, key: &str) -> Result<u64, Box<dyn Error>> {
-		entry
-			.get(key)
-			.and_then(|value| value.as_u64())
-			.ok_or_else(|| format!("catalog entry has no {key}").into())
-	}
-
-	/// Standard base64 with padding, the coding the catalog's init uses.
-	fn unbase64(text: &str) -> Result<Vec<u8>, Box<dyn Error>> {
-		fn value(c: u8) -> Result<u32, Box<dyn Error>> {
-			match c {
-				b'A'..=b'Z' => Ok(u32::from(c - b'A')),
-				b'a'..=b'z' => Ok(u32::from(c - b'a') + 26),
-				b'0'..=b'9' => Ok(u32::from(c - b'0') + 52),
-				b'+' => Ok(62),
-				b'/' => Ok(63),
-				_ => Err("bad base64 digit".into()),
-			}
-		}
-		let digits: Vec<u8> = text.trim().trim_end_matches('=').bytes().collect();
-		let mut out = Vec::with_capacity(digits.len() * 3 / 4);
-		for chunk in digits.chunks(4) {
-			if chunk.len() == 1 {
-				return Err("truncated base64".into());
-			}
-			let mut word = 0u32;
-			for (i, c) in chunk.iter().enumerate() {
-				word |= value(*c)? << (18 - 6 * i);
-			}
-			out.push((word >> 16) as u8);
-			if chunk.len() > 2 {
-				out.push((word >> 8) as u8);
-			}
-			if chunk.len() > 3 {
-				out.push(word as u8);
-			}
-		}
-		Ok(out)
+		Ok(moq_core::catalog::parse(document)?
+			.into_iter()
+			.map(|rendition| CatalogTrack {
+				name: rendition.name,
+				codec: rendition.codec,
+				shape: match rendition.kind {
+					moq_core::catalog::Kind::Video { width, height } => {
+						format!("{width}x{height}")
+					}
+					moq_core::catalog::Kind::Audio {
+						sample_rate,
+						channels,
+					} => format!("{sample_rate}Hz {channels}ch"),
+				},
+				init: rendition.init,
+			})
+			.collect())
 	}
 
 	fn env(name: &str) -> Result<String, Box<dyn Error>> {
 		std::env::var(name).map_err(|_| format!("missing env {name}").into())
 	}
 
-	fn unhex(hex: &str) -> Result<Vec<u8>, Box<dyn Error>> {
-		let digits: Vec<u8> = hex.trim().bytes().collect();
-		if digits.len() % 2 != 0 {
-			return Err("odd hex length".into());
-		}
-		digits
-			.chunks_exact(2)
-			.map(|pair| {
-				let hi = (pair[0] as char).to_digit(16).ok_or("bad hex digit")?;
-				let lo = (pair[1] as char).to_digit(16).ok_or("bad hex digit")?;
-				Ok((hi * 16 + lo) as u8)
-			})
-			.collect()
-	}
 }

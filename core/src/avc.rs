@@ -111,6 +111,82 @@ pub fn build_avcc(sps: &[Vec<u8>], pps: &[Vec<u8>]) -> Result<Vec<u8>, String> {
 	Ok(avcc)
 }
 
+/// The NAL length prefix an `avcC` declares, in bytes: its
+/// `lengthSizeMinusOne` plus one. Four for everything ffmpeg writes;
+/// a record too short to say is read as four.
+pub fn avcc_length_size(avcc: &[u8]) -> usize {
+	match avcc.get(4) {
+		Some(byte) => usize::from(byte & 0x3) + 1,
+		None => 4,
+	}
+}
+
+/// The SPS and PPS an `avcC` record carries, back as the Annex-B
+/// extradata a coded stream declares: each NAL behind a 4-byte start
+/// code, the sets in the order the record listed them.
+///
+/// The inverse of [`build_avcc`]; what a source reading an mp4 init
+/// segment hands an encoded edge that expects Annex-B.
+pub fn avcc_to_annexb_extradata(avcc: &[u8]) -> Result<Vec<u8>, String> {
+	if avcc.len() < 6 {
+		return Err(format!("an avcC of {} bytes names no parameter sets", avcc.len()));
+	}
+	let mut out = Vec::with_capacity(avcc.len());
+	let mut pos = 5usize;
+	let mut counts = [usize::from(avcc[5] & 0x1f), 0];
+	pos += 1;
+	for set in 0..2 {
+		if set == 1 {
+			let count = *avcc.get(pos).ok_or("the avcC ends before its PPS count")?;
+			counts[1] = usize::from(count);
+			pos += 1;
+		}
+		for _ in 0..counts[set] {
+			let length = avcc
+				.get(pos..pos + 2)
+				.map(|pair| usize::from(u16::from_be_bytes([pair[0], pair[1]])))
+				.ok_or("the avcC ends inside a parameter set length")?;
+			pos += 2;
+			let nal = avcc
+				.get(pos..pos + length)
+				.ok_or("the avcC ends inside a parameter set")?;
+			pos += length;
+			out.extend_from_slice(&[0, 0, 0, 1]);
+			out.extend_from_slice(nal);
+		}
+	}
+	if out.is_empty() {
+		return Err("the avcC carries no parameter sets".into());
+	}
+	Ok(out)
+}
+
+/// One AVCC-framed sample back as Annex-B: each length-prefixed NAL
+/// behind a 4-byte start code. The inverse of [`annexb_to_avcc`].
+pub fn avcc_to_annexb(sample: &[u8], length_size: usize) -> Result<Vec<u8>, String> {
+	if !(1..=4).contains(&length_size) {
+		return Err(format!("a NAL length of {length_size} bytes is not 1 to 4"));
+	}
+	let mut out = Vec::with_capacity(sample.len() + 8);
+	let mut pos = 0usize;
+	while pos < sample.len() {
+		let header = sample
+			.get(pos..pos + length_size)
+			.ok_or_else(|| format!("the sample ends inside a NAL length at byte {pos}"))?;
+		let length = header
+			.iter()
+			.fold(0usize, |value, byte| (value << 8) | usize::from(*byte));
+		pos += length_size;
+		let nal = sample
+			.get(pos..pos + length)
+			.ok_or_else(|| format!("a NAL of {length} bytes overruns the sample"))?;
+		pos += length;
+		out.extend_from_slice(&[0, 0, 0, 1]);
+		out.extend_from_slice(nal);
+	}
+	Ok(out)
+}
+
 /// The formats an avcC extension carries, read out of an SPS.
 struct SpsFormats {
 	chroma_format_idc: u8,
@@ -229,5 +305,53 @@ mod tests {
 		assert_eq!(bits.ue(), Some(1));
 		assert_eq!(bits.ue(), Some(2));
 		assert_eq!(bits.ue(), Some(3));
+	}
+
+	#[test]
+	fn extradata_round_trips_through_the_avcc() {
+		// The parameter sets go in Annex-B, come back out Annex-B, and
+		// the record between them declares 4-byte NAL lengths.
+		let annexb: &[u8] = &[
+			0, 0, 0, 1, 0x67, 66, 0xc0, 30, 0xab, 0xcd, // SPS
+			0, 0, 0, 1, 0x68, 0xee, 0x06, 0xf2, // PPS
+		];
+		let (sps, pps) = parse_parameter_sets(annexb);
+		let avcc = build_avcc(&sps, &pps).expect("an avcC");
+		assert_eq!(avcc_length_size(&avcc), 4);
+		assert_eq!(avcc_to_annexb_extradata(&avcc).expect("extradata"), annexb);
+	}
+
+	#[test]
+	fn a_high_profile_record_keeps_its_sets_past_the_extension_bytes() {
+		// A High-profile avcC carries three extension bytes after the
+		// PPS; the sets read back from before them either way.
+		let annexb: &[u8] = &[
+			0, 0, 0, 1, 0x67, 0x64, 0x00, 0x1f, 0xac, 0xd9, 0x40, 0x50, 0x05, 0xbb,
+			0, 0, 0, 1, 0x68, 0xeb, 0xec, 0xb2, 0x2c,
+		];
+		let (sps, pps) = parse_parameter_sets(annexb);
+		let avcc = build_avcc(&sps, &pps).expect("an avcC");
+		assert_eq!(avcc_to_annexb_extradata(&avcc).expect("extradata"), annexb);
+	}
+
+	#[test]
+	fn a_sample_round_trips_through_the_avcc_framing() {
+		// Two NALs behind start codes, length-prefixed and back.
+		let annexb: &[u8] = &[0, 0, 0, 1, 0x65, 1, 2, 3, 0, 0, 0, 1, 0x41, 9];
+		let framed = annexb_to_avcc(annexb);
+		assert_eq!(framed, vec![0, 0, 0, 4, 0x65, 1, 2, 3, 0, 0, 0, 2, 0x41, 9]);
+		assert_eq!(avcc_to_annexb(&framed, 4).expect("annex-b"), annexb);
+	}
+
+	#[test]
+	fn a_nal_running_past_the_sample_is_refused() {
+		let err = avcc_to_annexb(&[0, 0, 0, 9, 1, 2], 4).expect_err("a refusal");
+		assert!(err.contains("overruns"), "{err}");
+	}
+
+	#[test]
+	fn an_avcc_too_short_to_name_a_set_is_refused() {
+		let err = avcc_to_annexb_extradata(&[1, 0x64, 0, 0x1f]).expect_err("a refusal");
+		assert!(err.contains("names no parameter sets"), "{err}");
 	}
 }

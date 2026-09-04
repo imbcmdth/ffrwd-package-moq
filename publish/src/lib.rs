@@ -26,6 +26,4 @@
 // A native build of the workspace compiles this crate to nothing, so
 // `cargo test` on the host never chases the wasi-only dependencies.
 #[cfg(target_os = "wasi")]
-mod doh;
-#[cfg(target_os = "wasi")]
 mod module;

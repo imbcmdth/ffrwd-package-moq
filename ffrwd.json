@@ -12,21 +12,26 @@
   "ffrwd/wasm": "0.13.0"
  },
  "keywords": [
-  "moq",
-  "quic",
+  "fmp4",
   "live",
-  "streaming",
-  "relay",
+  "moq",
   "publish",
-  "fmp4"
+  "quic",
+  "relay",
+  "streaming",
+  "subscribe"
  ],
  "lib": {
-  "publish": "src/moq.sql"
+  "publish": "src/moq.sql",
+  "subscribe": "src/moq.sql"
  },
  "bin": {
   "publish": "recipes/publish.sql",
   "publish-live": "recipes/publish-live.sql",
   "publish-ladder": "recipes/publish-ladder.sql",
-  "republish-ladder": "recipes/republish-ladder.sql"
+  "republish-ladder": "recipes/republish-ladder.sql",
+  "subscribe": "recipes/subscribe.sql",
+  "subscribe-widest": "recipes/subscribe-widest.sql",
+  "relay": "recipes/relay.sql"
  }
 }

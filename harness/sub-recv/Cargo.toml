@@ -8,4 +8,3 @@ description = "The live test's receiving side: subscribes from the start, reasse
 moq-core = { path = "../../core" }
 moq-net = "0.2.15"
 tokio = { version = "1", default-features = false, features = ["rt", "sync", "time", "macros"] }
-serde_json = "1"

@@ -1,13 +1,77 @@
 //! The subscribe core: MoQ groups in, frames out.
 //!
-//! Wraps a track subscriber and yields one `(timestamp, payload)` frame
-//! at a time — the exact shape a future sidecar sink binding will drain.
-//! Groups are taken in arrival order and read to completion; the stream
-//! ends when the publisher finishes the track.
+//! [`FrameStream`] wraps a track subscriber and yields one
+//! `(timestamp, payload)` frame at a time. Groups are taken in arrival
+//! order and read to completion; the stream ends when the publisher
+//! finishes the track.
+//!
+//! Beside it, what any subscriber does before the media: the
+//! subscription a reader asks for ([`from_start`]) and the one
+//! document off [`crate::catalog::TRACK`] that says what a broadcast
+//! carries ([`read_catalog`]).
+
+use std::time::Duration;
 
 use bytes::Bytes;
 
 use crate::Error;
+
+/// How long a backlogged group is waited for rather than skipped. The
+/// default drops a non-latest group the moment a newer one exists,
+/// which is the opposite of what a reader feeding a pipeline wants.
+pub const BACKLOG: Duration = Duration::from_secs(30);
+
+/// Every group the publisher still holds, in order, tolerating
+/// backlog: a reader joins at the oldest group still cached, which on
+/// a broadcast that has been running is the live edge less its
+/// retention window.
+///
+/// The alternative - the latest group alone, which is what a default
+/// subscription asks for - is what a player wanting the smallest delay
+/// takes, and it is not what a reader feeding a pipeline wants: the
+/// default skips a group the moment a newer one exists, so a publisher
+/// running ahead of real time loses most of what it sent.
+pub fn from_start() -> moq_net::track::Subscription {
+	live_edge().with_group_start(0)
+}
+
+/// The same, from the latest group instead: what a relay that will not
+/// serve a backlog leaves, and all a broadcast running for hours has
+/// near its edge anyway.
+pub fn live_edge() -> moq_net::track::Subscription {
+	moq_net::track::Subscription::default()
+		.with_ordered(true)
+		.with_latency_max(BACKLOG)
+}
+
+/// How long to wait before asking a broadcast for its catalog again,
+/// and how many times. A publisher republishes the same document in a
+/// fresh group every few seconds, so a group that aged out from under
+/// the read is followed by another carrying the same thing.
+const CATALOG_RETRY: Duration = Duration::from_millis(250);
+const CATALOG_TRIES: u32 = 40;
+
+/// The catalog document a broadcast describes itself with, read off
+/// its own track: the LATEST group, since the newest document wins.
+pub async fn read_catalog(
+	broadcast: &moq_net::broadcast::Consumer,
+) -> Result<String, Box<dyn std::error::Error>> {
+	let mut last = String::new();
+	for _ in 0..CATALOG_TRIES {
+		let track = broadcast.track(crate::catalog::TRACK)?;
+		let subscription = moq_net::track::Subscription::default()
+			.with_ordered(true)
+			.with_latency_max(BACKLOG);
+		let mut stream = FrameStream::new(track.subscribe(subscription).await?);
+		match stream.next().await {
+			Ok(Some(frame)) => return Ok(String::from_utf8(frame.payload.to_vec())?),
+			Ok(None) => return Err("the catalog track finished without a document".into()),
+			Err(err) => last = err.to_string(),
+		}
+		tokio::time::sleep(CATALOG_RETRY).await;
+	}
+	Err(format!("the catalog track kept dropping its groups (last: {last})").into())
+}
 
 /// One frame as received, with its position in the group hierarchy.
 #[derive(Clone, Debug)]

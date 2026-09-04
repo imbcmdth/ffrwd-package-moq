@@ -5,7 +5,7 @@
 
 use std::net::IpAddr;
 
-use moq_core::dns;
+use crate::dns;
 use wasi::http::outgoing_handler;
 use wasi::http::types::{Fields, Method, OutgoingBody, OutgoingRequest, RequestOptions, Scheme};
 

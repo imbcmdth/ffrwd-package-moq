@@ -4,7 +4,6 @@ wit_bindgen::generate!({
 });
 
 use std::cell::RefCell;
-use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -31,9 +30,6 @@ const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"track":{"type":"str
 /// How long the session stays open after the last fragment, for the
 /// wire to drain: there is no delivered signal for a subscription.
 const DRAIN: Duration = Duration::from_secs(2);
-
-/// How long a relay gets to answer the dial before init gives up.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a non-latest group is kept for a backlogged subscriber. The
 /// default evicts after 5s, which is not enough for one that arrives
@@ -286,46 +282,6 @@ thread_local! {
 
 fn parse_params(params: &str) -> Result<Params, String> {
 	serde_json::from_str(params).map_err(|err| format!("params: {err}"))
-}
-
-/// The relay URL taken apart: host and port. The scheme is
-/// decorative. An IP-literal host is dialed as written; a name goes
-/// through the DNS-over-HTTPS lookup in [`crate::doh`], since the
-/// runner grants UDP and outgoing HTTP but no name lookup.
-fn parse_relay(url: &str) -> Result<(String, u16), String> {
-	let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
-	let rest = rest.split(['/', '?']).next().unwrap_or(rest);
-	let (host, port) = match rest.rsplit_once(':') {
-		Some((host, port)) if !host.is_empty() && !port.contains(']') => {
-			let port: u16 = port
-				.parse()
-				.map_err(|_| format!("relay '{url}': '{port}' is not a port"))?;
-			(host, port)
-		}
-		_ => (rest, 443),
-	};
-	let host = host.trim_start_matches('[').trim_end_matches(']');
-	if host.is_empty() {
-		return Err(format!("relay '{url}' names no host"));
-	}
-	Ok((host.to_string(), port))
-}
-
-fn unhex(hex: &str) -> Result<Vec<u8>, String> {
-	let digits: Vec<u8> = hex.trim().bytes().collect();
-	if !digits.len().is_multiple_of(2) {
-		return Err("cert: odd hex length".into());
-	}
-	digits
-		.as_chunks::<2>()
-		.0
-		.iter()
-		.map(|pair| {
-			let hi = (pair[0] as char).to_digit(16).ok_or("cert: bad hex digit")?;
-			let lo = (pair[1] as char).to_digit(16).ok_or("cert: bad hex digit")?;
-			Ok((hi * 16 + lo) as u8)
-		})
-		.collect()
 }
 
 impl Session {
@@ -612,18 +568,6 @@ impl Guest for Publish {
 			DEFAULT_AUDIO_TRACK,
 		);
 
-		let (host, port) = parse_relay(&params.relay)?;
-		let literal: Option<IpAddr> = host.parse().ok();
-		let addrs = match literal {
-			Some(ip) => vec![ip],
-			None => crate::doh::resolve(&host)
-				.map_err(|err| format!("relay '{}': {err}", params.relay))?,
-		};
-		let cert_der = match params.cert.trim() {
-			"" => None,
-			hex => Some(unhex(hex)?),
-		};
-
 		let runtime = tokio::runtime::Builder::new_current_thread()
 			.enable_time()
 			.build()
@@ -657,44 +601,13 @@ impl Guest for Publish {
 					.map_err(|err| format!("track '{name}': {err}"))?;
 				tracks.push(track);
 			}
-			// A looked-up name can carry several addresses; each gets
-			// the full connect timeout before the next is tried.
-			let mut client = moq_net::Client::new().with_publisher(origin.consume());
-			// A raw-QUIC dial carries no request URI; the token relay
-			// (Cloudflare's, say) wants is the SETUP path itself.
-			if !params.token.is_empty() {
-				client = client.with_path(format!("/{}", params.token));
-			}
-			let mut connected = None;
-			let mut last_err = String::new();
-			for addr in &addrs {
-				let relay = moq_core::wasi::Relay {
-					addr: SocketAddr::new(*addr, port),
-					server_name: host.clone(),
-					cert_der: cert_der.clone(),
-				};
-				match tokio::time::timeout(
-					CONNECT_TIMEOUT,
-					moq_core::wasi::connect(&relay, client.clone()),
-				)
-				.await
-				{
-					Ok(Ok(session)) => {
-						connected = Some(session);
-						break;
-					}
-					Ok(Err(err)) => last_err = err.to_string(),
-					Err(_) => last_err = "no answer within 10s".to_string(),
-				}
-			}
-			let connected = connected.ok_or_else(|| match literal {
-				Some(_) => format!("relay '{}': {last_err}", params.relay),
-				None => format!(
-					"relay '{}': no address of '{host}' answered ({} tried; last: {last_err})",
-					params.relay,
-					addrs.len()
-				),
-			})?;
+			let connected = moq_core::relay::dial(
+				&params.relay,
+				&params.cert,
+				&params.token,
+				moq_net::Client::new().with_publisher(origin.consume()),
+			)
+			.await?;
 			Ok::<_, String>((broadcast, catalog, tracks, connected))
 		})?;
 

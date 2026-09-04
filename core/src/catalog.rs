@@ -207,6 +207,196 @@ fn base64(bytes: &[u8]) -> String {
 	out
 }
 
+/// One rendition as a catalog names it: the read side of [`Track`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Rendition {
+	/// The MoQ track its fragments arrive on.
+	pub name: String,
+	/// The RFC 6381 string the catalog spelled.
+	pub codec: String,
+	/// The decoder configuration, hex-decoded: the `avcC` record for
+	/// video, the AudioSpecificConfig for audio.
+	pub config: Vec<u8>,
+	/// The `ftyp`+`moov` out of the `cmaf` container, base64-decoded.
+	pub init: Vec<u8>,
+	pub kind: Kind,
+	/// Which relation row it belongs to; see [`rows`].
+	pub row: u32,
+}
+
+/// What a rendition carries, and the geometry its kind states.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Kind {
+	Video { width: u32, height: u32 },
+	Audio { sample_rate: u32, channels: u32 },
+}
+
+/// The suffix a muxed row's audio track is qualified with, since MoQ
+/// track names are one flat namespace per broadcast. See
+/// [`track_names_for_rows`], which writes it.
+const AUDIO_SUFFIX: &str = ".audio";
+
+/// Reads a catalog document into its renditions, in the document's own
+/// order: the video section then the audio one, each alphabetical -
+/// the order [`Catalog`] writes and the order a reader counts them in.
+///
+/// Rows are assigned by [`rows`] on the way out, so a broadcast this
+/// package published reads back as the relation it was published from.
+pub fn parse(document: &str) -> Result<Vec<Rendition>, String> {
+	let parsed: serde_json::Value =
+		serde_json::from_str(document).map_err(|err| format!("catalog: {err}"))?;
+	let mut found = Vec::new();
+	for section in ["video", "audio"] {
+		let Some(renditions) = parsed
+			.get(section)
+			.and_then(|found| found.get("renditions"))
+			.and_then(|map| map.as_object())
+		else {
+			continue;
+		};
+		for (name, entry) in renditions {
+			let kind = if section == "video" {
+				Kind::Video {
+					width: number(entry, "codedWidth", name)? as u32,
+					height: number(entry, "codedHeight", name)? as u32,
+				}
+			} else {
+				Kind::Audio {
+					sample_rate: number(entry, "sampleRate", name)? as u32,
+					channels: number(entry, "numberOfChannels", name)? as u32,
+				}
+			};
+			let container = entry
+				.get("container")
+				.ok_or_else(|| format!("rendition '{name}' names no container"))?;
+			let spelled = text(container, "kind", name)?;
+			if spelled != "cmaf" {
+				return Err(format!(
+					"rendition '{name}' travels in '{spelled}', and this reads cmaf"
+				));
+			}
+			found.push(Rendition {
+				name: name.clone(),
+				codec: text(entry, "codec", name)?,
+				config: unhex(&text(entry, "description", name)?)
+					.map_err(|err| format!("rendition '{name}': {err}"))?,
+				init: unbase64(&text(container, "init", name)?)
+					.map_err(|err| format!("rendition '{name}': {err}"))?,
+				kind,
+				row: 0,
+			});
+		}
+	}
+	if found.is_empty() {
+		return Err("the catalog names no renditions".into());
+	}
+	let rows = rows(&found);
+	for (rendition, row) in found.iter_mut().zip(rows) {
+		rendition.row = row;
+	}
+	Ok(found)
+}
+
+/// The relation row each rendition belongs to, in the order they were
+/// read.
+///
+/// A video rendition and the audio rendition named for it - its own
+/// name and `.audio`, which is how [`track_names_for_rows`] writes a
+/// muxed row's audio track - are ONE row. Every other rendition is a
+/// row of its own. Rows are numbered in reading order, so the first
+/// video rendition is row 0.
+pub fn rows(renditions: &[Rendition]) -> Vec<u32> {
+	let mut row_of: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+	let mut next = 0u32;
+	let mut out = Vec::with_capacity(renditions.len());
+	for rendition in renditions {
+		if let Kind::Video { .. } = rendition.kind {
+			row_of.insert(rendition.name.as_str(), next);
+			out.push(next);
+			next += 1;
+			continue;
+		}
+		let paired = rendition
+			.name
+			.strip_suffix(AUDIO_SUFFIX)
+			.and_then(|video| row_of.get(video).copied());
+		match paired {
+			Some(row) => out.push(row),
+			None => {
+				out.push(next);
+				next += 1;
+			}
+		}
+	}
+	out
+}
+
+fn text(entry: &serde_json::Value, key: &str, name: &str) -> Result<String, String> {
+	entry
+		.get(key)
+		.and_then(|value| value.as_str())
+		.map(str::to_string)
+		.ok_or_else(|| format!("rendition '{name}' names no {key}"))
+}
+
+fn number(entry: &serde_json::Value, key: &str, name: &str) -> Result<u64, String> {
+	entry
+		.get(key)
+		.and_then(|value| value.as_u64())
+		.ok_or_else(|| format!("rendition '{name}' names no {key}"))
+}
+
+/// Bytes from the lowercase hex [`hex`] writes.
+pub fn unhex(text: &str) -> Result<Vec<u8>, String> {
+	let digits: Vec<u8> = text.trim().bytes().collect();
+	if !digits.len().is_multiple_of(2) {
+		return Err("odd hex length".into());
+	}
+	digits
+		.as_chunks::<2>()
+		.0
+		.iter()
+		.map(|pair| {
+			let hi = (pair[0] as char).to_digit(16).ok_or("bad hex digit")?;
+			let lo = (pair[1] as char).to_digit(16).ok_or("bad hex digit")?;
+			Ok((hi * 16 + lo) as u8)
+		})
+		.collect()
+}
+
+/// Bytes from the standard base64 [`base64`] writes, padding optional.
+pub fn unbase64(text: &str) -> Result<Vec<u8>, String> {
+	fn value(digit: u8) -> Result<u32, String> {
+		match digit {
+			b'A'..=b'Z' => Ok(u32::from(digit - b'A')),
+			b'a'..=b'z' => Ok(u32::from(digit - b'a') + 26),
+			b'0'..=b'9' => Ok(u32::from(digit - b'0') + 52),
+			b'+' => Ok(62),
+			b'/' => Ok(63),
+			other => Err(format!("'{}' is not a base64 digit", other as char)),
+		}
+	}
+	let digits: Vec<u8> = text.trim().trim_end_matches('=').bytes().collect();
+	let mut out = Vec::with_capacity(digits.len() * 3 / 4);
+	for chunk in digits.chunks(4) {
+		if chunk.len() == 1 {
+			return Err("truncated base64".into());
+		}
+		let mut word = 0u32;
+		for (index, digit) in chunk.iter().enumerate() {
+			word |= value(*digit)? << (18 - 6 * index);
+		}
+		out.push((word >> 16) as u8);
+		if chunk.len() > 2 {
+			out.push((word >> 8) as u8);
+		}
+		if chunk.len() > 3 {
+			out.push(word as u8);
+		}
+	}
+	Ok(out)
+}
+
 /// The track names a broadcast's renditions publish under.
 ///
 /// ONE stream keeps the base name as written, so a broadcast that
@@ -579,5 +769,155 @@ mod tests {
 			document,
 			r#"{"video":{"renditions":{}},"audio":{"renditions":{"audio":{"codec":"mp4a.40.2","description":"1190","sampleRate":48000,"numberOfChannels":2,"jitter":600,"container":{"kind":"cmaf","init":"AAEC"}}}}}"#
 		);
+	}
+
+	/// The document a two-rung ladder with a muxed audio track writes:
+	/// video "1080p" and "720p", the 1080p rung's audio qualified under
+	/// it, and a commentary track of its own.
+	fn ladder() -> Catalog {
+		Catalog::new(vec![
+			Track::video(
+				"1080p".into(),
+				"avc1.64002a".into(),
+				&[1, 0x64, 0x00, 0x2a],
+				1920,
+				1080,
+				vec![9, 8, 7],
+			),
+			Track::audio(
+				"1080p.audio".into(),
+				"mp4a.40.2".into(),
+				&[0x11, 0x90],
+				48000,
+				2,
+				vec![6, 5],
+			),
+			Track::video(
+				"720p".into(),
+				"avc1.64001f".into(),
+				&[1, 0x64, 0x00, 0x1f],
+				1280,
+				720,
+				vec![4, 3],
+			),
+			Track::audio(
+				"commentary".into(),
+				"mp4a.40.2".into(),
+				&[0x12, 0x10],
+				44100,
+				1,
+				vec![2, 1],
+			),
+		])
+	}
+
+	#[test]
+	fn every_field_the_writer_wrote_reads_back() {
+		let document = String::from_utf8(ladder().document().expect("serializes")).unwrap();
+		let read = parse(&document).expect("the document parses");
+		// The document's own order: the video section then the audio one,
+		// each alphabetical.
+		assert_eq!(
+			read.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+			vec!["1080p", "720p", "1080p.audio", "commentary"]
+		);
+		let top = &read[0];
+		assert_eq!(top.codec, "avc1.64002a");
+		assert_eq!(top.config, vec![1, 0x64, 0x00, 0x2a]);
+		assert_eq!(top.init, vec![9, 8, 7]);
+		assert_eq!(
+			top.kind,
+			Kind::Video {
+				width: 1920,
+				height: 1080
+			}
+		);
+		let commentary = &read[3];
+		assert_eq!(commentary.config, vec![0x12, 0x10]);
+		assert_eq!(commentary.init, vec![2, 1]);
+		assert_eq!(
+			commentary.kind,
+			Kind::Audio {
+				sample_rate: 44100,
+				channels: 1
+			}
+		);
+	}
+
+	#[test]
+	fn a_muxed_rows_audio_track_reads_back_onto_its_video_rows() {
+		// "1080p.audio" is the 1080p rung's own audio, so it shares that
+		// rung's row; "commentary" names no video and takes a row of its
+		// own past the two rungs.
+		let document = String::from_utf8(ladder().document().expect("serializes")).unwrap();
+		let read = parse(&document).expect("the document parses");
+		assert_eq!(
+			read.iter().map(|r| (r.name.as_str(), r.row)).collect::<Vec<_>>(),
+			vec![("1080p", 0), ("720p", 1), ("1080p.audio", 0), ("commentary", 2)]
+		);
+	}
+
+	#[test]
+	fn the_rows_a_sink_published_are_the_rows_a_source_reads_back() {
+		// The naming rule and the pairing rule are inverses: the pads of
+		// two muxed renditions publish under names that read back onto
+		// the same two rows.
+		let pads = vec![
+			RowPad {
+				row: 0,
+				kind: RowKind::Video { height: 1080 },
+				name: Some("1080p".to_string()),
+			},
+			RowPad {
+				row: 0,
+				kind: RowKind::Audio,
+				name: Some("1080p".to_string()),
+			},
+			RowPad {
+				row: 1,
+				kind: RowKind::Video { height: 720 },
+				name: Some("720p".to_string()),
+			},
+		];
+		let names = track_names_for_rows(&pads, "video", "audio");
+		let catalog = Catalog::new(vec![
+			Track::video(names[0].clone(), "avc1".into(), &[], 1920, 1080, vec![1]),
+			Track::audio(names[1].clone(), "mp4a.40.2".into(), &[], 48000, 2, vec![2]),
+			Track::video(names[2].clone(), "avc1".into(), &[], 1280, 720, vec![3]),
+		]);
+		let document = String::from_utf8(catalog.document().expect("serializes")).unwrap();
+		let read = parse(&document).expect("the document parses");
+		let mut by_name: Vec<(String, u32)> =
+			read.iter().map(|r| (r.name.clone(), r.row)).collect();
+		by_name.sort();
+		// Two rows, and the pads that shared one still share one.
+		assert_eq!(by_name[0].1, by_name[1].1, "{by_name:?}");
+		assert_ne!(by_name[0].1, by_name[2].1, "{by_name:?}");
+	}
+
+	#[test]
+	fn a_rendition_in_another_container_is_refused_by_name() {
+		let err = parse(
+			r#"{"video":{"renditions":{"v":{"codec":"avc1","description":"01","codedWidth":8,"codedHeight":8,"container":{"kind":"loc","init":"AA=="}}}}}"#,
+		)
+		.expect_err("a refusal");
+		assert!(err.contains("'loc'"), "{err}");
+	}
+
+	#[test]
+	fn a_catalog_naming_nothing_is_refused() {
+		let err = parse(r#"{"video":{"renditions":{}},"audio":{"renditions":{}}}"#)
+			.expect_err("a refusal");
+		assert!(err.contains("names no renditions"), "{err}");
+	}
+
+	#[test]
+	fn base64_and_hex_read_back_what_they_wrote() {
+		for case in [&b""[..], b"f", b"fo", b"foo", b"foob", b"fooba", b"foobar"] {
+			assert_eq!(unbase64(&base64(case)).expect("decodes"), case);
+			assert_eq!(unhex(&hex(case)).expect("decodes"), case);
+		}
+		assert!(unhex("abc").is_err(), "an odd hex length is refused");
+		assert!(unbase64("A").is_err(), "a truncated group is refused");
 	}
 }

@@ -207,6 +207,11 @@ def build_guests(deadline: int) -> tuple[Path, Path, Path]:
     return release / "publish.wasm", release / "sub-recv.wasm", certgen
 
 
+def guest(name: str) -> Path:
+    """One wasm guest by name, where `build_guests` leaves it."""
+    return PACKAGE / "target" / "wasm32-wasip2" / "release" / f"{name}.wasm"
+
+
 def build_hang_recv(deadline: int) -> Path:
     """The third-party subscriber, built from the pinned hang stack."""
     done = run(
