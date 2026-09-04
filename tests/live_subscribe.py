@@ -14,12 +14,12 @@ a NEW broadcast name, and subscribed to a second time. A rendition that
 survives publish -> subscribe -> publish -> subscribe is one nothing in
 either direction invented.
 
-The subscribe module is driven by the sidecar directly rather than by
-`ffrwd run`, because `ffrwd compile` cannot probe it: the compiler's
-probe of a packet source passes the sidecar no `-net`, so a source that
-reads a network refuses at compile time. `recipes/subscribe.sql` and
-its two neighbours are red for exactly that reason, and go green with
-no change here when the probe is granted what a run already grants.
+The subscribe module is driven by the sidecar directly here, which is
+the narrower check: it reads the catalog and demuxes without a query
+around it. `recipes/subscribe.sql` and its two neighbours run the same
+module through `ffrwd run`, and are proven against a relay by hand -
+publish a ladder, subscribe a rung back, copy the broadcast under a new
+name and subscribe to that.
 
 Never collected by any suite: it needs moq-relay, wasmtime, ffmpeg,
 ffprobe, cargo with the wasm32-wasip2 target and a wasi-sdk clang -
