@@ -1,7 +1,7 @@
 {
  "name": "ffrwd/moq",
- "version": "0.5.0",
- "description": "Media over QUIC in both directions, hosted in wasm: publish a query's streams TO a relay broadcast, and subscribe to one as a FROM relation. Publishing packages each encoded stream as fragmented MP4 - one fragment per group of pictures, a hang catalog naming the renditions with their init segments - so a hang player picks a rendition and plays it. Subscribing reads that catalog back as rows, one per rendition, and demuxes each fragment to the packets it was built from, so a rung crosses the graph encoded. Both in one query is a relay.",
+ "version": "0.5.1",
+ "description": "Media over QUIC - publish a query's streams TO a relay broadcast, and subscribe to one as a FROM relation. Publishing packages each encoded stream as fragmented MP4 and a hang catalog naming the renditions with their init segments.",
  "license": "Apache-2.0",
  "homepage": "https://github.com/imbcmdth/ffrwd-package-moq",
  "capabilities": [
