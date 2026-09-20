@@ -87,6 +87,50 @@ the answer carries is tried in turn.
 
 A relay that demands authentication takes a `token`.
 
+## What the shared crates changed
+
+The fmp4 and h264 layers under this package are
+[ffrwd-bmff](https://github.com/imbcmdth/ffrwd-bmff) and
+[ffrwd-nal](https://github.com/imbcmdth/ffrwd-nal), which several ffrwd
+packages share. What stays here is what MoQ decides rather than what a
+container says: the group discipline, the hang catalog, the relay. Most
+of the move is invisible from the outside. These parts are not.
+
+**The `avcC` is one byte shorter, and it is now ffmpeg's own record.**
+ffmpeg's H.264 demuxer pads the SPS in its Annex-B extradata with a
+`trailing_zero_8bits`, and the scanner this package used to carry gave
+that byte to the SPS. So every record published before this carried a
+27-byte SPS where ffmpeg's own MP4 muxer writes 26. The byte is padding
+and no decoder reads it, but the record was not ffmpeg's. It is now,
+which moves one byte in every published init segment and two hex digits
+in every catalog entry's `description`. `core/tests/reference.rs` pins
+the new record against the one ffmpeg wrote into the test fixture.
+
+**What a reader accepts has widened.** A box of declared size zero,
+which a muxer writing into a pipe uses because it does not yet know the
+length, runs to the end of the stream instead of being refused. A `moof`
+carrying several `traf` boxes is read, and the track fragments that are
+not this track's are skipped: a fragment with nothing for the track
+yields no packets and does not end the subscription. A fragment with no
+`tfdt` is timed from zero rather than refused. The `1 << 28` per-box
+refusal is gone; where this package scans a byte stream it takes
+ffrwd-bmff's own bound of 64 MiB for a box that must be held whole,
+which is far past the single-sample fragments it publishes.
+
+**A record that cannot be spelled is refused rather than truncated.**
+More than 31 SPS, more than 255 PPS, or a parameter set past 65535
+bytes used to be written as a wrapped count or length. None of them
+comes off a real encoder, and all of them are now named.
+
+**A wire timestamp can move by one microsecond.** Ticks round to
+nearest on the way to microseconds where they used to truncate.
+
+**A failure says less and points better.** The shared crates carry no
+formatted strings on the error path, so a message no longer quotes the
+presentation time or the size that caused it, and carries the byte
+offset instead. This package puts back what it alone knows, at its own
+call sites: which track, and which packet.
+
 ## License
 
 This package is **MIT OR Apache-2.0**, and so is everything vendored
