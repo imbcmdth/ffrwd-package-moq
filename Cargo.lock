@@ -140,13 +140,13 @@ dependencies = [
 
 [[package]]
 name = "ffrwd-bmff"
-version = "0.1.0"
-source = "git+https://github.com/imbcmdth/ffrwd-bmff?tag=v0.1.0#23b93ab305baed9adc2d92fa13047f14a45ec7c7"
+version = "0.1.1"
+source = "git+https://github.com/imbcmdth/ffrwd-bmff?tag=v0.1.1#44a169c5335dc99b3e8b922a6ac8440ac98073b4"
 
 [[package]]
 name = "ffrwd-nal"
-version = "0.1.0"
-source = "git+https://github.com/imbcmdth/ffrwd-nal?tag=v0.1.0#bd2ffcf559065b8364369bbc0b24df7220b96eb8"
+version = "0.1.1"
+source = "git+https://github.com/imbcmdth/ffrwd-nal?tag=v0.1.1#525a55aa83014a32d32e26ac9d8dad25e73b8a41"
 
 [[package]]
 name = "find-msvc-tools"

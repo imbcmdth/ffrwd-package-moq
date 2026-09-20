@@ -12,8 +12,8 @@ wit-bindgen = "0.57.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 bytes = "1"
-ffrwd-bmff = { git = "https://github.com/imbcmdth/ffrwd-bmff", tag = "v0.1.0" }
-ffrwd-nal = { git = "https://github.com/imbcmdth/ffrwd-nal", tag = "v0.1.0" }
+ffrwd-bmff = { git = "https://github.com/imbcmdth/ffrwd-bmff", tag = "v0.1.1" }
+ffrwd-nal = { git = "https://github.com/imbcmdth/ffrwd-nal", tag = "v0.1.1" }
 moq-core = { path = "../core" }
 moq-net = "0.2.15"
 quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "log"] }
