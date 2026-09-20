@@ -6,8 +6,8 @@ because a killed direct child (uv, say) leaves its ffmpeg and sidecar holding
 the output pipes, and a harness that then waits for pipe EOF waits forever.
 
 Toolchain overrides: WASMTIME, MOQ_RELAY, WASI_SDK_PATH (or CC_wasm32_wasip2
-directly), FFRWD_WASM for the sidecar binary, FFRWD_REPO for the checkout
-holding the compiler and the sidecar.
+directly), FFRWD_WASM for the sidecar binary, FFRWD_CLI for an installed
+ffrwd, FFRWD_REPO for the checkout holding the compiler and the sidecar.
 """
 
 from __future__ import annotations
@@ -53,6 +53,20 @@ EXE = ".exe" if os.name == "nt" else ""
 
 def tool(env_name: str, default: str) -> str:
     return os.environ.get(env_name, default)
+
+
+def ffrwd_argv(*args: object) -> list[str]:
+    """The argv that runs the compiler.
+
+    FFRWD_CLI names an installed ffrwd outright, which is what a release
+    is proven against: the same CLI a user of this package has. Left
+    unset, the checkout's own runs in place under uv.
+    """
+    named = os.environ.get("FFRWD_CLI")
+    spelled = [str(arg) for arg in args]
+    if named is not None:
+        return [named, *spelled]
+    return ["uv", "run", "--project", str(CLI), "ffrwd", *spelled]
 
 
 def wasi_cc_env() -> dict[str, str]:

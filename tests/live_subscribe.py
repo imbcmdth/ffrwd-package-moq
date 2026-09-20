@@ -40,10 +40,10 @@ import time
 from pathlib import Path
 
 from common import (
-    CLI,
     PACKAGE,
     SIDECAR,
     build_guests,
+    ffrwd_argv,
     free_udp_port,
     guest,
     kill_tree,
@@ -89,7 +89,10 @@ def start_source(
     """subscribe.wasm under the sidecar: one nut output per catalog track.
 
     The grants are the ones the compiler's own run path writes; only its
-    probe leaves them off.
+    probe leaves them off. So is `-track`: an output of a packet source
+    says which track of the module's catalog it carries, 0-based and in
+    catalog order, and what the outputs name is what the source
+    subscribes to.
     """
     params = json.dumps({
         "relay": f"moqt://127.0.0.1:{port}",
@@ -99,8 +102,8 @@ def start_source(
     })
     argv = [str(SIDECAR), "-udp", str(module), "-http", str(module),
             "-m", str(module), "-params", params]
-    for path in outputs:
-        argv += ["-f", "nut", str(path)]
+    for track, path in enumerate(outputs):
+        argv += ["-track", str(track), "-f", "nut", str(path)]
     print("+", " ".join(argv[:6]), "...", flush=True)
     return spawn(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
@@ -129,11 +132,11 @@ def start_publish(recipe: str, port: int, cert_hex: str, broadcast: str,
     """
     env = dict(os.environ)
     env["FFRWD_WASM"] = str(SIDECAR)
-    argv = ["uv", "run", "--project", str(CLI), "ffrwd", "run",
-            "-f", str(PACKAGE / "recipes" / recipe),
-            "-v", f"relay=moqt://127.0.0.1:{port}",
-            "-v", f"broadcast={broadcast}",
-            "-v", f"cert={cert_hex}", *extra, "-q"]
+    argv = ffrwd_argv("run",
+                      "-f", str(PACKAGE / "recipes" / recipe),
+                      "-v", f"relay=moqt://127.0.0.1:{port}",
+                      "-v", f"broadcast={broadcast}",
+                      "-v", f"cert={cert_hex}", *extra, "-q")
     print("+", " ".join(argv[:8]), "...", flush=True)
     return spawn(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
 

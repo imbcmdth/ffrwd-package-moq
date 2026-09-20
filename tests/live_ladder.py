@@ -51,12 +51,12 @@ import time
 from pathlib import Path
 
 from common import (
-    CLI,
     PACKAGE,
     SIDECAR,
     build_guests,
     build_hang_recv,
     ffprobe_frames,
+    ffrwd_argv,
     free_udp_port,
     kill_tree,
     run,
@@ -136,7 +136,7 @@ def run_publisher(
     env["FFRWD_WASM"] = str(SIDECAR)
     args = recipe_args(source, port, cert_hex, rungs, audio)
     shown = run(
-        ["uv", "run", "--project", CLI, "ffrwd", "compile", *args],
+        ffrwd_argv("compile", *args),
         COMPILE_DEADLINE, capture_output=True, text=True, env=env,
     )
     if shown.returncode != 0:
@@ -158,7 +158,7 @@ def run_publisher(
 
     started = time.monotonic()
     done = run(
-        ["uv", "run", "--project", CLI, "ffrwd", "run", *args, "-q"],
+        ffrwd_argv("run", *args, "-q"),
         RUN_DEADLINE, capture_output=True, text=True, env=env,
     )
     wall = time.monotonic() - started

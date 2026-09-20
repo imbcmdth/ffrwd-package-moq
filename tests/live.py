@@ -32,10 +32,10 @@ import time
 from pathlib import Path
 
 from common import (
-    CLI,
     PACKAGE,
     SIDECAR,
     build_guests,
+    ffrwd_argv,
     ffprobe_frames,
     free_udp_port,
     kill_tree,
@@ -76,11 +76,11 @@ def run_publisher(source: Path, port: int, cert_hex: str) -> tuple[list[dict], s
     env = dict(os.environ)
     env["FFRWD_WASM"] = str(SIDECAR)
     shown = run(
-        ["uv", "run", "--project", CLI, "ffrwd", "compile", "-f", recipe,
-         "-v", f"source={source}",
-         "-v", f"relay=moqt://127.0.0.1:{port}",
-         "-v", f"broadcast={BROADCAST}",
-         "-v", f"cert={cert_hex}"],
+        ffrwd_argv("compile", "-f", recipe,
+              "-v", f"source={source}",
+              "-v", f"relay=moqt://127.0.0.1:{port}",
+              "-v", f"broadcast={BROADCAST}",
+              "-v", f"cert={cert_hex}"),
         COMPILE_DEADLINE, capture_output=True, text=True, env=env,
     )
     if shown.returncode != 0:
@@ -90,12 +90,12 @@ def run_publisher(source: Path, port: int, cert_hex: str) -> tuple[list[dict], s
 
     started = time.monotonic()
     done = run(
-        ["uv", "run", "--project", CLI, "ffrwd", "run", "-f", recipe,
-         "-v", f"source={source}",
-         "-v", f"relay=moqt://127.0.0.1:{port}",
-         "-v", f"broadcast={BROADCAST}",
-         "-v", f"cert={cert_hex}",
-         "-q"],
+        ffrwd_argv("run", "-f", recipe,
+              "-v", f"source={source}",
+              "-v", f"relay=moqt://127.0.0.1:{port}",
+              "-v", f"broadcast={BROADCAST}",
+              "-v", f"cert={cert_hex}",
+              "-q"),
         RUN_DEADLINE, capture_output=True, text=True, env=env,
     )
     wall = time.monotonic() - started

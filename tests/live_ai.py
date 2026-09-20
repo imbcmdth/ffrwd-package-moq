@@ -54,10 +54,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from common import (
-    CLI,
     SIDECAR,
     build_guests,
     ffprobe_frames,
+    ffrwd_argv,
     free_udp_port,
     kill_tree,
     run,
@@ -180,7 +180,7 @@ def ffrwd(argv: list[str], deadline: int, project: Path) -> subprocess.Completed
     env = dict(os.environ)
     env["FFRWD_WASM"] = str(SIDECAR)
     return run(
-        ["uv", "run", "--project", CLI, "ffrwd", *argv],
+        ffrwd_argv(*argv),
         deadline, capture_output=True, text=True, env=env, cwd=project,
     )
 
