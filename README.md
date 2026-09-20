@@ -104,7 +104,16 @@ that byte to the SPS. So every record published before this carried a
 and no decoder reads it, but the record was not ffmpeg's. It is now,
 which moves one byte in every published init segment and two hex digits
 in every catalog entry's `description`. `core/tests/reference.rs` pins
-the new record against the one ffmpeg wrote into the test fixture.
+the new record against the one ffmpeg wrote into the test fixture. For
+that fixture the video init segment goes from 669 bytes to 668, and
+every byte outside the record and the box sizes around it is where it
+was.
+
+**An audio init segment names its own brand.** The `ftyp` compatible
+brands are `iso5 isom <sample entry> mp41`, so an AAC track's now read
+`iso5 isom mp4a mp41` where they used to say `avc1`, which was the
+video entry's name on an audio-only track. Four bytes, and nothing
+else in the audio init segment moves.
 
 **What a reader accepts has widened.** A box of declared size zero,
 which a muxer writing into a pipe uses because it does not yet know the
