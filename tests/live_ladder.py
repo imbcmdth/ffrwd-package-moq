@@ -77,8 +77,8 @@ BITRATES = ("2000k", "1000k", "400k")
 
 # The tone --audio adds, and what an AAC-LC encode of it comes to: a
 # frame is 1024 samples whatever the rate, and a group runs for
-# `audio_group_ms` of them - a tenth of a second by default, which is
-# five frames at 48 kHz and about ten groups a second. That rate is
+# `audio_group_ms` of them - a fifth of a second by default, which is
+# ten frames at 48 kHz and about 4.7 groups a second. That rate is
 # what the check below pins, since it is the thing a player feels.
 SAMPLE_RATE = 48000
 CHANNELS = 2
@@ -92,7 +92,7 @@ AUDIO_FRAME_RATE = SAMPLE_RATE / AAC_FRAME
 AUDIO_TRACK = "a0"
 # MOQ_AUDIO_GROUP_MS runs the loop against a duration instead of the
 # default group per frame, which is what the publish param takes.
-AUDIO_GROUP_MS = int(os.environ.get("MOQ_AUDIO_GROUP_MS", "100"))
+AUDIO_GROUP_MS = int(os.environ.get("MOQ_AUDIO_GROUP_MS", "200"))
 # A group closes at the first frame a whole `audio_group_ms` past its
 # start, so the frames to a group is that duration rounded UP in frames.
 AUDIO_GROUP_FRAMES_ASKED = max(

@@ -34,8 +34,10 @@
 -- and a '#' fragment is refused rather than dropped.
 -- audio_group_ms is how long one audio group runs, in milliseconds. A
 -- relay forwards a group once it is whole and a player waits for the
--- group it is reading, so the duration is the delay: 100, the default,
--- is five AAC frames at 48 kHz. 0 gives every frame a group of its
+-- group it is reading, so the duration is the delay: 200, the default,
+-- is ten AAC frames at 48 kHz. Shorter groups mean more group streams
+-- a second, and through a public relay under load 100 lost whole
+-- groups where 200 lost none; see the README. 0 gives every frame a group of its
 -- own, which is what upstream hang publishes and is EXPERIMENTAL here
 -- - a player skips about one such group in four on a real relay - and
 -- a larger value trades delay for fewer streams. Video groups follow
@@ -48,7 +50,7 @@
 -- the final total alone.
 CREATE FUNCTION publish(relay text, broadcast text,
                         cert text DEFAULT '', token text DEFAULT '',
-                        audio_group_ms number DEFAULT 100,
+                        audio_group_ms number DEFAULT 200,
                         rows text DEFAULT 'summary')
 RETURNS sink
   AS 'target/wasm32-wasip2/release/publish.wasm', 'publish' LANGUAGE wasm;

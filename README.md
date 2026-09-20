@@ -49,6 +49,15 @@ broadcast (`tracks`, `groups`, `packets`, `bytes`, `init_bytes`).
 audio alone, so it is for piping somewhere rather than for watching.
 `'none'` leaves the trailing row alone.
 
+A track row also carries what the session looked like over the window:
+`appended` and `closed` (groups opened on the track and finished -
+they differ only by the one still open), `sub_latency_ms`,
+`sub_priority` and `sub_ordered` (what the relay is actually asking
+for on that track, `-1` when nobody is subscribed), and `gap_max_ms`
+and `call_max_ms` (the longest the QUIC session lay undriven, and the
+longest one call held it: the session runs only while a host call is
+on the executor, so the first is what a loaded machine costs).
+
 ### Groups
 
 A group is what a relay forwards and what a subscriber joins at. Video
@@ -60,15 +69,37 @@ what it has until the group it is reading ends. A group that spans a
 second is a second of sound arriving at once, with the picture beside
 it running ahead.
 
-`audio_group_ms` is that duration. The default is `100`, five AAC
-frames at 48 kHz: short enough that nothing waits on it, long enough
-that a run of groups still arrives one at a time. Before 0.6.2 the
-rule was a fixed second, which is what the stutter was.
+`audio_group_ms` is that duration. The default is `200`, ten AAC
+frames at 48 kHz. Before 0.6.2 the rule was a fixed second, which is
+what the stutter was; 0.6.2 cut it to `100` and 0.6.3 doubled it
+again, for a reason worth writing down.
 
-`0` gives every frame a group of its own. That is what upstream hang's
-own publisher writes, and against a real relay it is **not yet sound**
-here: a player reading such a broadcast skips about one audio group in
-four. The shape is several groups appended and finished inside one
+Through a public relay, on a loaded machine, 100 ms groups lost WHOLE
+audio groups: between 0.7% and 6% of them over several captures, one
+group at a time, never a run. A player skipped them and a patient
+stream-copy subscriber reading the backlog missed the same ones, so
+they never came out of the relay to anybody. The publisher's own rows
+showed every packet written, every group closed, no starvation of its
+session, and nothing in moq-net 0.2.15 destroys a group inside its
+retention window. At 200 ms, on the same machine and the same relay,
+minutes later: five minutes with nothing skipped, and two ninety
+second captures with no gap at all.
+
+Halving the rate of groups should halve a per-group hazard, not end
+it, so the hypothesis is a RATE: about 9.4 new audio streams a second
+at 100 ms against 4.7 at 200, plus video, and a relay that limits how
+fast it will take new group streams. That is a hypothesis, not a
+finding - the publisher-side counters that would confirm it are still
+being built - so the default is set where the evidence is, and
+`audio_group_ms` is there for anyone whose relay is happier. The extra
+100 ms is absorbed by the player's own jitter buffer, which this
+package already asks for 600 ms of.
+
+`0` gives every frame a group of its own, at about 47 streams a
+second. That is what upstream hang's own publisher writes, and against
+a real relay it is **not yet sound** here: a player reading such a
+broadcast skips about one audio group in four, which is the same
+hazard as above an order of magnitude louder. The shape is several groups appended and finished inside one
 host call - a subscription's latency window defaults to zero, so a
 group that is no longer the latest when a reader reaches it is skipped
 rather than served, and groups written back to back give a reader that
@@ -219,7 +250,7 @@ carried for wasm32-wasip2 fixes upstream does not ship yet).
 ## Exports
 
 - `publish(relay, broadcast, cert DEFAULT '', token DEFAULT '',
-  audio_group_ms DEFAULT 100, rows DEFAULT 'summary')` returns `sink`: a COPY destination,
+  audio_group_ms DEFAULT 200, rows DEFAULT 'summary')` returns `sink`: a COPY destination,
   nothing comes back. It reads the whole relation - a video cell, an
   audio cell, either NULL - one rendition per row.
 - `subscribe(relay, broadcast, cert DEFAULT '', token DEFAULT '')`

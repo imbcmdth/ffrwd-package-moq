@@ -19,7 +19,7 @@ COPY (
   SELECT vid.v, aud.t
   FROM vid FULL JOIN aud ON vid.rung = aud.rung
 ) TO ffrwd.moq.publish(:'relay', :'broadcast', COALESCE(:'cert', ''),
-                     COALESCE(:'token', ''), COALESCE(:audio_group_ms, 100),
+                     COALESCE(:'token', ''), COALESCE(:audio_group_ms, 200),
                      COALESCE(:'rows', 'summary'))
   WITH (video_bitrate :'bitrates'[vid.rung], gop 30, preset 'veryfast',
         tune 'zerolatency', audio_bitrate '128k')

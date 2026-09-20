@@ -6,6 +6,6 @@ COPY (
   SELECT f.video[1]
   FROM input(:'source') f
 ) TO ffrwd.moq.publish(:'relay', :'broadcast', COALESCE(:'cert', ''),
-                     COALESCE(:'token', ''), COALESCE(:audio_group_ms, 100),
+                     COALESCE(:'token', ''), COALESCE(:audio_group_ms, 200),
                      COALESCE(:'rows', 'summary'))
   WITH (gop 30, preset 'veryfast', tune 'zerolatency')
