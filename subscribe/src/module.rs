@@ -250,7 +250,12 @@ fn source_track(
 				channels: *channels,
 				channel_layout: None,
 			}),
-			config.clone(),
+			// A decoder takes the AudioSpecificConfig, and an `mp4a`
+			// entry's record is the whole `esds` descriptor chain with
+			// that config buried in it. The catalog spells the config
+			// out, as it spells the rate and the channel count this
+			// rendition is also read from.
+			rendition.config.clone(),
 			None,
 			None,
 		),
