@@ -13,7 +13,7 @@ use exports::ffrwd::av::packet_sink::{
 use ffrwd::av::types::CodedFormat;
 use serde::{Deserialize, Serialize};
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"audio_group_ms":{"type":"integer","minimum":0,"default":100,"description":"how long an audio group runs, in milliseconds; a tenth of a second is five AAC frames at 48kHz. 0 is one frame per group, which is what upstream hang writes and is experimental here: a player skips about one group in four"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
 
 /// The base name a video track falls back to when its row's rendition
 /// carries none, and the ladder holds only the one stream.
@@ -49,6 +49,16 @@ const POLL: Duration = Duration::from_millis(20);
 /// reader or this, whichever comes first.
 const HOLD_MAX: Duration = Duration::from_secs(10);
 
+/// How long a call keeps driving the session after it has written
+/// something, and in what steps. The session makes progress only while
+/// a host call is blocked on the executor, so a group finished at the
+/// end of a call is bytes that have not left yet; these turns are what
+/// puts them on the socket before the call returns. Small: a few
+/// milliseconds against an AAC frame's 21ms, and nothing at all for a
+/// call that wrote nothing.
+const FLUSH_SLICE: Duration = Duration::from_millis(1);
+const FLUSH_TURNS: usize = 3;
+
 /// How often the catalog goes out again, the same snapshot in a fresh
 /// group, while the broadcast lives. A relay that does not retain a
 /// track's last closed group has nothing to hand a late joiner, whose
@@ -68,6 +78,15 @@ struct Params {
 	// the query text already carries.
 	#[serde(default)]
 	token: String,
+	/// How long an audio group runs, in milliseconds; the default is a
+	/// tenth of a second and 0 is one AAC frame per group, which is
+	/// experimental. See [`moq_core::group::AUDIO_GROUP_MS`].
+	#[serde(default = "default_audio_group_ms")]
+	audio_group_ms: u32,
+}
+
+fn default_audio_group_ms() -> u32 {
+	moq_core::group::AUDIO_GROUP_MS
 }
 
 /// One published group's row.
@@ -182,15 +201,19 @@ impl Rendition {
 
 	/// Publishes one single-sample fragment as one MoQ frame in the
 	/// open group, rotating the group where the discipline says one
-	/// starts. A rotation closes the group before it and returns its
-	/// row.
+	/// starts. A rotation closes the group before it, and a track whose
+	/// groups hold one fragment apiece closes this one straight after
+	/// writing it: a group is only forwarded once it is whole, so a
+	/// finish that waits for the next fragment is a frame the reader
+	/// waits on - and at the end of a batch, one it waits on until the
+	/// batch after. Each close yields that group's row.
 	fn publish_fragment(
 		&mut self,
 		fragment: ffrwd_bmff::mux::Fragment,
-	) -> Result<Option<String>, String> {
-		let mut row = None;
+	) -> Result<Vec<String>, String> {
+		let mut rows = Vec::new();
 		if self.discipline.starts_a_group(fragment.keyframe, fragment.pts) {
-			row = self.close_group()?;
+			rows.extend(self.close_group()?);
 			let track = self.track.as_mut().expect("track lives until last");
 			self.group = Some(
 				track
@@ -218,7 +241,10 @@ impl Rendition {
 		self.group_pts_min = self.group_pts_min.min(fragment.pts);
 		self.group_pts_max = self.group_pts_max.max(fragment.pts);
 		self.bytes += bytes_len;
-		Ok(row)
+		if self.discipline.one_fragment_each() {
+			rows.extend(self.close_group()?);
+		}
+		Ok(rows)
 	}
 
 	/// Closes the open group, if any, and returns its row.
@@ -431,14 +457,26 @@ impl Session {
 					})?;
 				rendition.packets += 1;
 				for fragment in fragments {
-					if let Some(row) = rendition.publish_fragment(fragment)? {
-						rows.push(row);
-					}
+					rows.extend(rendition.publish_fragment(fragment)?);
 				}
 			}
 			// Let the driver move the frames onto the wire now, not
 			// after the next call.
 			tokio::task::yield_now().await;
+		}
+
+		// And drive it until the frames and the finishes written above
+		// are actually handed to the socket. The QUIC session only runs
+		// while a host call is blocked here, so a group written at the
+		// end of a call would otherwise sit whole-but-unsent until the
+		// next one - which for a group per frame is the difference
+		// between a reader that plays it and a reader that gives up on
+		// it. One yield lets the driver poll; the slices let its timers
+		// and the socket's readiness catch up.
+		if !rows.is_empty() {
+			for _ in 0..FLUSH_TURNS {
+				tokio::time::sleep(FLUSH_SLICE).await;
+			}
 		}
 
 		if last {
@@ -451,9 +489,7 @@ impl Session {
 					format!("track '{}': {err}", self.renditions[index].name)
 				})?;
 				for fragment in flushed {
-					if let Some(row) = self.renditions[index].publish_fragment(fragment)? {
-						rows.push(row);
-					}
+					rows.extend(self.renditions[index].publish_fragment(fragment)?);
 				}
 				if let Some(row) = self.renditions[index].close_group()? {
 					rows.push(row);
@@ -502,7 +538,7 @@ impl Guest for Publish {
 		PacketSinkMeta {
 			meta: Meta {
 				name: "publish".to_string(),
-				version: "0.4.0".to_string(),
+				version: "0.5.0".to_string(),
 				params_schema: PARAMS_SCHEMA.to_string(),
 				rows_schema: ROWS_SCHEMA.to_string(),
 				// No decoded payload ever arrives, so no format list fills in.
@@ -526,6 +562,7 @@ impl Guest for Publish {
 
 	fn init(streams: Vec<InputStream>, params: String) -> Result<(), String> {
 		let params = parse_params(&params)?;
+		let audio_group_ms = params.audio_group_ms;
 		if streams.is_empty() {
 			return Err("publish reads at least one stream".into());
 		}
@@ -650,6 +687,17 @@ impl Guest for Publish {
 			DEFAULT_VIDEO_TRACK,
 			DEFAULT_AUDIO_TRACK,
 		);
+		// What each track is worth when the session has more to send than
+		// the wire takes. A relay reads every track of a broadcast on one
+		// session and asks for them alike, so this tie-break is what keeps
+		// a video keyframe from sitting in front of a sound.
+		let priorities: Vec<u8> = built
+			.iter()
+			.map(|b| match b.media {
+				Media::Video { .. } => moq_core::catalog::PRIORITY_VIDEO,
+				Media::Audio { .. } => moq_core::catalog::PRIORITY_AUDIO,
+			})
+			.collect();
 
 		let runtime = tokio::runtime::Builder::new_current_thread()
 			.enable_time()
@@ -675,12 +723,28 @@ impl Guest for Publish {
 			let info = moq_net::track::Info::default().with_latency_max(KEEP);
 			let catalog_name = moq_core::catalog::TRACK;
 			let catalog = broadcast
-				.create_track(catalog_name, info.clone())
+				.create_track(
+					catalog_name,
+					info.clone()
+						.with_priority(moq_core::catalog::PRIORITY_CATALOG),
+				)
 				.map_err(|err| format!("track '{catalog_name}': {err}"))?;
 			let mut tracks = Vec::with_capacity(names.len());
-			for name in &names {
+			for (name, priority) in names.iter().zip(&priorities) {
+				// Audio also asks to be served in sequence order. A track's
+				// groups are otherwise newest-first, which is right for
+				// video - a late picture is worth less than the next one -
+				// and wrong for sound, where a group skipped is a click and
+				// the one behind it cannot stand in. moq-net carries this in
+				// TRACK_INFO and a subscriber takes it as the default for
+				// its own subscription, so it reaches the relay's re-serve
+				// rather than only our own queue.
+				let ordered = *priority == moq_core::catalog::PRIORITY_AUDIO;
 				let track = broadcast
-					.create_track(name.as_str(), info.clone())
+					.create_track(
+						name.as_str(),
+						info.clone().with_priority(*priority).with_ordered(ordered),
+					)
 					.map_err(|err| format!("track '{name}': {err}"))?;
 				tracks.push(track);
 			}
@@ -706,9 +770,11 @@ impl Guest for Publish {
 				group: None,
 				discipline: match built.media {
 					Media::Video { .. } => moq_core::group::Groups::video(),
-					Media::Audio { .. } => {
-						moq_core::group::Groups::audio(built.time_base.0, built.time_base.1)
-					}
+					Media::Audio { .. } => moq_core::group::Groups::audio(
+						built.time_base.0,
+						built.time_base.1,
+						audio_group_ms,
+					),
 				},
 				muxer: built.muxer,
 				time_base: built.time_base,

@@ -13,24 +13,41 @@
 //! opens a group, so an all-intra stream makes every frame its own
 //! group - which is the point, since a join can then land nowhere but
 //! on a frame a decoder can start at. Audio has no keyframe to rotate
-//! on, every AAC frame being a sync sample, so it rotates once a
-//! target duration has elapsed instead; see [`AUDIO_GROUP_SECONDS`]. A
-//! group therefore always begins on a whole AAC frame, which is what a
+//! on, every AAC frame being a sync sample, so every frame is its own
+//! group unless a run asks for fewer; see [`AUDIO_GROUP_MS`]. A group
+//! therefore always begins on a whole AAC frame, which is what a
 //! decoder needs, and does not align with any video group, which is a
 //! later concern.
 //!
 //! The stream's first fragment always opens the first group.
 
-/// How long an audio group runs before it closes. One second, so a
-/// group holds a whole number of AAC frames and lands near a video
-/// group of the GOP lengths this publishes at; the frame boundary is
-/// exact, the video boundary is not.
-pub const AUDIO_GROUP_SECONDS: i64 = 1;
+/// How long an audio group runs before it closes, in milliseconds; 0
+/// is one frame per group. The default is a tenth of a second.
+///
+/// A relay forwards a group as it arrives and a player reading at the
+/// live edge holds what it has until the group it belongs to is whole,
+/// so a group that spans a second is a second of audio arriving at
+/// once, and the picture beside it runs ahead. A tenth of a second is
+/// five AAC frames at 48 kHz: short enough that nothing waits on it,
+/// long enough that a run of them still arrives one at a time.
+///
+/// 0 is what upstream hang's own publisher writes, and on a real relay
+/// it is not yet sound: a player reading a broadcast published that
+/// way skips about one audio group in four, in the shape of several
+/// groups appended inside one host call. A subscription's latency
+/// window defaults to zero - a group that is no longer the latest when
+/// a reader reaches it is skipped rather than served - and several
+/// groups finished back to back give a reader that chance. Nothing
+/// here reproduces it against a local relay, so it is offered and not
+/// recommended; see the README.
+pub const AUDIO_GROUP_MS: u32 = 100;
 
 /// What the open group is measured against.
 enum Rule {
 	/// A keyframe closes the group before it.
 	Keyframe,
+	/// Every fragment is a group of its own.
+	Fragment,
 	/// This many stream ticks past the group's first timestamp closes
 	/// it.
 	Elapsed(i64),
@@ -54,15 +71,32 @@ impl Groups {
 		}
 	}
 
-	/// The discipline for an audio track, whose time base says how many
-	/// ticks [`AUDIO_GROUP_SECONDS`] is.
-	pub fn audio(time_base_num: i32, time_base_den: i32) -> Self {
-		let ticks = AUDIO_GROUP_SECONDS * i64::from(time_base_den.max(1))
-			/ i64::from(time_base_num.max(1));
+	/// The discipline for an audio track: a group per frame for
+	/// `group_ms` of 0 ([`AUDIO_GROUP_MS`]), else a group once that many
+	/// milliseconds have elapsed, which the track's own time base counts
+	/// in ticks. A duration shorter than one frame is a frame per group
+	/// by another name, and reads as one.
+	pub fn audio(time_base_num: i32, time_base_den: i32, group_ms: u32) -> Self {
+		let rule = match group_ms {
+			0 => Rule::Fragment,
+			ms => {
+				let ticks = i64::from(ms) * i64::from(time_base_den.max(1))
+					/ (i64::from(time_base_num.max(1)) * 1000);
+				Rule::Elapsed(ticks.max(1))
+			}
+		};
 		Self {
-			rule: Rule::Elapsed(ticks.max(1)),
+			rule,
 			start_pts: None,
 		}
+	}
+
+	/// Whether this track's groups hold exactly one fragment, which is
+	/// what lets a publisher finish a group in the call that wrote it
+	/// rather than when the next fragment rotates it. A group nobody has
+	/// finished is a group a reader waits on.
+	pub fn one_fragment_each(&self) -> bool {
+		matches!(self.rule, Rule::Fragment)
 	}
 
 	/// Whether the fragment described by `keyframe` and `pts` opens a
@@ -72,6 +106,7 @@ impl Groups {
 		let opens = match (self.start_pts, &self.rule) {
 			(None, _) => true,
 			(Some(_), Rule::Keyframe) => keyframe,
+			(Some(_), Rule::Fragment) => true,
 			(Some(start), Rule::Elapsed(ticks)) => pts - start >= *ticks,
 		};
 		if opens {
@@ -245,29 +280,58 @@ mod tests {
 	}
 
 	#[test]
+	fn the_default_audio_group_is_a_tenth_of_a_second() {
+		// Five AAC frames at 48 kHz, which is what the live loop counts.
+		let mut groups = Groups::audio(1, 48000, AUDIO_GROUP_MS);
+		let starts: Vec<usize> = (0..21i64)
+			.filter(|index| groups.starts_a_group(true, index * 1024))
+			.map(|index| index as usize)
+			.collect();
+		assert_eq!(starts, [0, 5, 10, 15, 20]);
+	}
+
+	#[test]
+	fn a_zero_duration_is_a_group_per_frame() {
+		let mut groups = Groups::audio(1, 48000, 0);
+		assert!((0..50i64).all(|index| groups.starts_a_group(true, index * 1024)));
+	}
+
+	#[test]
 	fn an_audio_group_starts_past_the_target_duration() {
 		// One tick per sample at 48 kHz, 1024 samples an AAC frame: the
 		// 47th frame is the first whose timestamp stands a whole second
 		// past the group's first, so it is the one that opens the next
 		// group.
-		let mut groups = Groups::audio(1, 48000);
+		let mut groups = Groups::audio(1, 48000, 1000);
 		let starts: Vec<usize> = (0..49i64)
 			.filter(|index| groups.starts_a_group(true, index * 1024))
 			.map(|index| index as usize)
 			.collect();
 		assert_eq!(starts, [0, 47]);
+		// A hundred milliseconds is five frames, which is the rung
+		// between a frame per group and a second of them.
+		let mut hundred = Groups::audio(1, 48000, 100);
+		let starts: Vec<usize> = (0..21i64)
+			.filter(|index| hundred.starts_a_group(true, index * 1024))
+			.map(|index| index as usize)
+			.collect();
+		assert_eq!(starts, [0, 5, 10, 15, 20]);
 	}
 
 	#[test]
 	fn an_audio_time_base_with_a_numerator_still_measures_a_second() {
 		// A time base of 1001/48000 counts fewer ticks to the second,
 		// and a degenerate one still closes a group eventually.
-		let mut groups = Groups::audio(1001, 48000);
+		let mut groups = Groups::audio(1001, 48000, 1000);
 		assert!(groups.starts_a_group(true, 0));
 		assert!(!groups.starts_a_group(true, 46));
 		assert!(groups.starts_a_group(true, 48));
-		let mut degenerate = Groups::audio(1_000_000, 1);
+		let mut degenerate = Groups::audio(1_000_000, 1, 1000);
 		assert!(degenerate.starts_a_group(true, 0));
 		assert!(degenerate.starts_a_group(true, 1), "a group must still close");
+		// A target shorter than a frame is a frame per group.
+		let mut fine = Groups::audio(1, 48000, 1);
+		assert!(fine.starts_a_group(true, 0));
+		assert!(fine.starts_a_group(true, 1024));
 	}
 }

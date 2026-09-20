@@ -21,11 +21,33 @@ use serde::Serialize;
 /// The track a broadcast describes itself on: hang's `Catalog::DEFAULT_NAME`.
 pub const TRACK: &str = "catalog.json";
 
+/// What a track is worth when a session has more to send than the wire
+/// takes: hang's own three numbers, higher sent first. The catalog
+/// comes before the media it describes, and audio before video, since
+/// a picture arriving late is a picture and a sound arriving late is a
+/// click.
+///
+/// moq-net calls this the publisher's tie-break: it decides between
+/// subscriptions of EQUAL subscriber priority, which is what a relay
+/// reading every track of one broadcast at once is. The hang player
+/// asks for these same numbers on its own subscriptions, so the two
+/// legs agree.
+pub const PRIORITY_CATALOG: u8 = 100;
+/// Audio's delivery priority; see [`PRIORITY_CATALOG`].
+pub const PRIORITY_AUDIO: u8 = 80;
+/// Video's delivery priority; see [`PRIORITY_CATALOG`].
+pub const PRIORITY_VIDEO: u8 = 60;
+
 /// The buffer depth recommended to AUDIO readers, in milliseconds.
 /// Live capture hands the pipeline audio in bursts hundreds of
 /// milliseconds wide; a reader holding this much plays through them.
 /// Video gets no recommendation: it arrives smoothly, and a held-back
 /// picture at the live edge is skipped rather than shown.
+///
+/// hang's player adds this to its own buffer floor, so it is also what
+/// decides when the player's latency check throws a late group away.
+/// Upstream's publisher writes one frame duration here (~21ms for AAC
+/// at 48kHz), which is the minimum rather than what a burst wants.
 pub const AUDIO_JITTER_MS: u32 = 600;
 
 /// One video rendition's entry, hang's `VideoConfig` subset.
