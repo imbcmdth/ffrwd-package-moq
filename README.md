@@ -29,8 +29,43 @@ COPY (
 The compiler places the sink behind an encoder - shape it with the
 COPY's `WITH` options, and a value read once per row shapes each
 rung's encoder separately. The module packages each stream as
-fragmented MP4: one `moof`+`mdat` fragment per each frame, a new MoQ group at every keyframe. Audio rides beside
-the video as AAC, cut on frame edges about once a second.
+fragmented MP4: one `moof`+`mdat` fragment per each frame, a new MoQ
+group at every keyframe. Audio rides beside the video as AAC, cut on
+frame edges.
+
+### Groups
+
+A group is what a relay forwards and what a subscriber joins at. Video
+opens one at every keyframe, since a decoder can start nowhere else.
+Audio has no keyframe - every AAC frame is a sync sample - so where it
+is cut is a choice, and the choice is a delay: a relay forwards a
+group once it is whole, and a player reading at the live edge holds
+what it has until the group it is reading ends. A group that spans a
+second is a second of sound arriving at once, with the picture beside
+it running ahead.
+
+`audio_group_ms` is that duration. The default is `100`, five AAC
+frames at 48 kHz: short enough that nothing waits on it, long enough
+that a run of groups still arrives one at a time. Before 0.6.2 the
+rule was a fixed second, which is what the stutter was.
+
+`0` gives every frame a group of its own. That is what upstream hang's
+own publisher writes, and against a real relay it is **not yet sound**
+here: a player reading such a broadcast skips about one audio group in
+four. The shape is several groups appended and finished inside one
+host call - a subscription's latency window defaults to zero, so a
+group that is no longer the latest when a reader reaches it is skipped
+rather than served, and groups written back to back give a reader that
+chance. A local relay does not reproduce it: publishing a paced
+twenty seconds through `moq-relay` on this machine, 939 groups
+published and 939 received, at `0` as at `100`. So `0` is offered,
+documented and not recommended until that is understood.
+
+Tracks carry hang's own delivery priorities, higher sent first:
+`catalog.json` at 100, audio at 80, video at 60. They break the tie on
+a session whose subscriber - a relay reading the whole broadcast -
+asks for every track alike, so a video keyframe cannot sit in the send
+queue in front of a sound.
 
 A `catalog.json` track names what the broadcast carries, in the
 [hang](https://github.com/kixelated/moq) catalog schema: renditions
@@ -167,10 +202,10 @@ carried for wasm32-wasip2 fixes upstream does not ship yet).
 
 ## Exports
 
-- `publish(relay, broadcast, cert DEFAULT '', token DEFAULT '')`
-  returns `sink`: a COPY destination, nothing comes back. It reads the
-  whole relation - a video cell, an audio cell, either NULL - one
-  rendition per row.
+- `publish(relay, broadcast, cert DEFAULT '', token DEFAULT '',
+  audio_group_ms DEFAULT 100)` returns `sink`: a COPY destination,
+  nothing comes back. It reads the whole relation - a video cell, an
+  audio cell, either NULL - one rendition per row.
 - `subscribe(relay, broadcast, cert DEFAULT '', token DEFAULT '')`
   returns `source`: a FROM relation, one row per rendition of the
   broadcast's catalog, a video cell and an audio cell, either NULL.

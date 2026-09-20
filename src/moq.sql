@@ -32,8 +32,17 @@
 -- refused, both naming the same one is fine. A '?jwt=' rides along to
 -- the relay, a '?token=' is refused as a credential no relay reads,
 -- and a '#' fragment is refused rather than dropped.
+-- audio_group_ms is how long one audio group runs, in milliseconds. A
+-- relay forwards a group once it is whole and a player waits for the
+-- group it is reading, so the duration is the delay: 100, the default,
+-- is five AAC frames at 48 kHz. 0 gives every frame a group of its
+-- own, which is what upstream hang publishes and is EXPERIMENTAL here
+-- - a player skips about one such group in four on a real relay - and
+-- a larger value trades delay for fewer streams. Video groups follow
+-- the keyframes, and this does not touch them.
 CREATE FUNCTION publish(relay text, broadcast text,
-                        cert text DEFAULT '', token text DEFAULT '')
+                        cert text DEFAULT '', token text DEFAULT '',
+                        audio_group_ms number DEFAULT 100)
 RETURNS sink
   AS 'target/wasm32-wasip2/release/publish.wasm', 'publish' LANGUAGE wasm;
 
