@@ -22,14 +22,16 @@
 //! The stream's first fragment always opens the first group.
 
 /// How long an audio group runs before it closes, in milliseconds; 0
-/// is one frame per group. The default is a tenth of a second.
+/// is one frame per group. The default is a fifth of a second.
 ///
 /// A relay forwards a group as it arrives and a player reading at the
 /// live edge holds what it has until the group it belongs to is whole,
 /// so a group that spans a second is a second of audio arriving at
-/// once, and the picture beside it runs ahead. A tenth of a second is
-/// five AAC frames at 48 kHz: short enough that nothing waits on it,
-/// long enough that a run of them still arrives one at a time.
+/// once, and the picture beside it runs ahead. A fifth of a second is
+/// ten AAC frames at 48 kHz: short enough that a player's own jitter
+/// buffer swallows it, and slow enough in GROUPS A SECOND to survive a
+/// public relay under load, where a hundred milliseconds did not - see
+/// the README.
 ///
 /// 0 is what upstream hang's own publisher writes, and on a real relay
 /// it is not yet sound: a player reading a broadcast published that
@@ -40,7 +42,7 @@
 /// groups finished back to back give a reader that chance. Nothing
 /// here reproduces it against a local relay, so it is offered and not
 /// recommended; see the README.
-pub const AUDIO_GROUP_MS: u32 = 100;
+pub const AUDIO_GROUP_MS: u32 = 200;
 
 /// What the open group is measured against.
 enum Rule {
@@ -280,14 +282,14 @@ mod tests {
 	}
 
 	#[test]
-	fn the_default_audio_group_is_a_tenth_of_a_second() {
-		// Five AAC frames at 48 kHz, which is what the live loop counts.
+	fn the_default_audio_group_is_a_fifth_of_a_second() {
+		// Ten AAC frames at 48 kHz, which is what the live loop counts.
 		let mut groups = Groups::audio(1, 48000, AUDIO_GROUP_MS);
-		let starts: Vec<usize> = (0..21i64)
+		let starts: Vec<usize> = (0..31i64)
 			.filter(|index| groups.starts_a_group(true, index * 1024))
 			.map(|index| index as usize)
 			.collect();
-		assert_eq!(starts, [0, 5, 10, 15, 20]);
+		assert_eq!(starts, [0, 10, 20, 30]);
 	}
 
 	#[test]

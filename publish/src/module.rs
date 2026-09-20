@@ -13,7 +13,7 @@ use exports::ffrwd::av::packet_sink::{
 use ffrwd::av::types::CodedFormat;
 use serde::{Deserialize, Serialize};
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"rows":{"type":"string","enum":["summary","groups","none"],"default":"summary","description":"what the sink reports: 'summary' is one row per track every 5s and a final total, 'groups' a row per published group, 'none' the final total alone"},"audio_group_ms":{"type":"integer","minimum":0,"default":100,"description":"how long an audio group runs, in milliseconds; a tenth of a second is five AAC frames at 48kHz. 0 is one frame per group, which is what upstream hang writes and is experimental here: a player skips about one group in four"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"rows":{"type":"string","enum":["summary","groups","none"],"default":"summary","description":"what the sink reports: 'summary' is one row per track every 5s and a final total, 'groups' a row per published group, 'none' the final total alone"},"audio_group_ms":{"type":"integer","minimum":0,"default":200,"description":"how long an audio group runs, in milliseconds; a fifth of a second is ten AAC frames at 48kHz, and shorter groups have been seen losing whole groups through a public relay under load. 0 is one frame per group, which is what upstream hang writes and is experimental here"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
 
 /// The base name a video track falls back to when its row's rendition
 /// carries none, and the ladder holds only the one stream.
@@ -29,7 +29,7 @@ const DEFAULT_AUDIO_TRACK: &str = "audio";
 /// the seconds of media published on it; the TRAILING row, which every
 /// run ends with, carries `tracks`. `pts_start`/`pts_end` are seconds
 /// of media time.
-const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"track":{"type":"string"},"group":{"type":"integer"},"packets":{"type":"integer"},"bytes":{"type":"integer"},"pts_start":{"type":"number"},"pts_end":{"type":"number"},"groups":{"type":"integer"},"media":{"type":"number"},"tracks":{"type":"integer"},"init_bytes":{"type":"integer"}},"additionalProperties":false}"#;
+const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"track":{"type":"string"},"group":{"type":"integer"},"packets":{"type":"integer"},"bytes":{"type":"integer"},"pts_start":{"type":"number"},"pts_end":{"type":"number"},"groups":{"type":"integer"},"media":{"type":"number"},"tracks":{"type":"integer"},"init_bytes":{"type":"integer"},"appended":{"type":"integer"},"closed":{"type":"integer"},"sub_latency_ms":{"type":"integer"},"sub_priority":{"type":"integer"},"sub_ordered":{"type":"boolean"},"gap_max_ms":{"type":"integer"},"call_max_ms":{"type":"integer"}},"additionalProperties":false}"#;
 
 /// How long the session stays open after the last fragment, for the
 /// wire to drain: there is no delivered signal for a subscription.
@@ -159,6 +159,24 @@ struct TrackRow {
 	packets: u64,
 	bytes: u64,
 	media: f64,
+	/// Groups opened on the MoQ track and groups finished: they differ
+	/// only by the one still open, so anything else is a group this
+	/// module failed to close.
+	appended: u64,
+	closed: u64,
+	/// What the relay is asking for on this track, which is what
+	/// decides what a group of ours is worth to it: its latency window
+	/// in milliseconds, its priority, and whether it wants groups in
+	/// sequence order. -1 where nobody is subscribed.
+	sub_latency_ms: i64,
+	sub_priority: i64,
+	sub_ordered: bool,
+	/// The longest this window went with the session UNDRIVEN, and the
+	/// longest one call held it, in milliseconds. The session runs only
+	/// while a host call is on the executor, so the first is what a
+	/// loaded machine costs and the second is what this module costs.
+	gap_max_ms: u64,
+	call_max_ms: u64,
 }
 
 /// The trailing summary, once per run over every track.
@@ -226,6 +244,8 @@ struct Rendition {
 	bytes: u64,
 	/// The last group's end in seconds of media time, for the track row.
 	media_seconds: f64,
+	/// Groups opened on the MoQ track; see [`TrackRow`].
+	appended: u64,
 	/// The open group's accumulators, for its row when it closes.
 	group_packets: u64,
 	group_bytes: u64,
@@ -284,6 +304,7 @@ impl Rendition {
 					.append_group()
 					.map_err(|err| format!("moq group: {err}"))?,
 			);
+			self.appended += 1;
 			self.group_packets = 0;
 			self.group_bytes = 0;
 			self.group_pts_min = fragment.pts;
@@ -331,14 +352,28 @@ impl Rendition {
 		Ok(row.map(|row| serde_json::to_string(&row).expect("a group row serializes")))
 	}
 
-	/// This track's totals so far, as a row.
-	fn track_row(&self) -> String {
+	/// This track's totals so far, as a row, with what the session and
+	/// the host looked like over the window `gap_max`/`call_max` cover.
+	fn track_row(&self, gap_max: Duration, call_max: Duration) -> String {
+		let asked = self
+			.track
+			.as_ref()
+			.and_then(moq_net::track::Producer::subscription);
 		serde_json::to_string(&TrackRow {
 			track: self.name.clone(),
 			groups: self.groups,
 			packets: self.packets,
 			bytes: self.bytes,
 			media: self.media_seconds,
+			appended: self.appended,
+			closed: self.groups,
+			sub_latency_ms: asked
+				.as_ref()
+				.map_or(-1, |sub| sub.latency_max.as_millis() as i64),
+			sub_priority: asked.as_ref().map_or(-1, |sub| i64::from(sub.priority)),
+			sub_ordered: asked.as_ref().is_some_and(|sub| sub.ordered),
+			gap_max_ms: gap_max.as_millis() as u64,
+			call_max_ms: call_max.as_millis() as u64,
 		})
 		.expect("a track row serializes")
 	}
@@ -406,6 +441,11 @@ struct Session {
 	/// What this run reports, and when it last reported it.
 	rows: Rows,
 	summary_sent: Option<std::time::Instant>,
+	/// The cadence of the host's calls: the session runs only inside
+	/// them, so the gap between them is how long it lay still.
+	left_at: Option<std::time::Instant>,
+	gap_max: Duration,
+	call_max: Duration,
 }
 
 struct State {
@@ -481,6 +521,10 @@ impl Session {
 		let mut rows = Vec::new();
 		let mut trailing = Vec::new();
 		let per_group = self.rows == Rows::Groups;
+		let entered = std::time::Instant::now();
+		if let Some(left) = self.left_at {
+			self.gap_max = self.gap_max.max(entered.duration_since(left));
+		}
 
 		if !self.started {
 			// The catalog goes out to the first reader of anything: it is
@@ -581,8 +625,16 @@ impl Session {
 				.summary_sent
 				.is_none_or(|sent| sent.elapsed() >= SUMMARY_EVERY)
 		{
-			rows.extend(self.renditions.iter().map(Rendition::track_row));
+			let (gap_max, call_max) = (self.gap_max, self.call_max);
+			rows.extend(
+				self.renditions
+					.iter()
+					.map(|rendition| rendition.track_row(gap_max, call_max)),
+			);
 			self.summary_sent = Some(std::time::Instant::now());
+			// Each window's own worst, not the run's.
+			self.gap_max = Duration::ZERO;
+			self.call_max = Duration::ZERO;
 		}
 
 		if last {
@@ -633,6 +685,9 @@ impl Session {
 			);
 		}
 
+		let now = std::time::Instant::now();
+		self.call_max = self.call_max.max(now.duration_since(entered));
+		self.left_at = Some(now);
 		Ok(Processed { rows, trailing })
 	}
 }
@@ -891,6 +946,7 @@ impl Guest for Publish {
 				packets: 0,
 				bytes: 0,
 				media_seconds: 0.0,
+				appended: 0,
 				group_packets: 0,
 				group_bytes: 0,
 				group_pts_min: 0,
@@ -918,6 +974,9 @@ impl Guest for Publish {
 					catalog_sent: None,
 					rows: reporting,
 					summary_sent: None,
+					left_at: None,
+					gap_max: Duration::ZERO,
+					call_max: Duration::ZERO,
 				},
 			});
 		});
