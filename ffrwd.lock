@@ -8,20 +8,6 @@
     {
       "kind": "registry",
       "name": "ffrwd/wasm",
-      "version": "0.10.0",
-      "sha256": "123bdfb59f3ac92cdd685c1cc9626e8063edea81d841135527add91e754f28b2",
-      "store": "v1/12/123bdfb59f3ac92cdd685c1cc9626e8063edea81d841135527add91e754f28b2"
-    },
-    {
-      "kind": "registry",
-      "name": "ffrwd/wasm",
-      "version": "0.13.0",
-      "sha256": "cb0e78c8fbb2f066f649df6da3c1a25808eabc8fd7f21095d49b89c891adc788",
-      "store": "v1/cb/cb0e78c8fbb2f066f649df6da3c1a25808eabc8fd7f21095d49b89c891adc788"
-    },
-    {
-      "kind": "registry",
-      "name": "ffrwd/wasm",
       "version": "0.15.0",
       "sha256": "0942300729e217d46f5eb22504b920cfa8cf465e7e031307a636a1da7f9bc836",
       "store": "v1/09/0942300729e217d46f5eb22504b920cfa8cf465e7e031307a636a1da7f9bc836"
