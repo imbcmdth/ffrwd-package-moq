@@ -76,15 +76,30 @@ WIDTHS = (854, 640, 426)
 BITRATES = ("2000k", "1000k", "400k")
 
 # The tone --audio adds, and what an AAC-LC encode of it comes to: a
-# frame is 1024 samples whatever the rate, and the muxer closes an audio
-# group once it spans a second - so the first frame a whole second past
-# the group's start is the one that closes it.
+# frame is 1024 samples whatever the rate, and a group runs for
+# `audio_group_ms` of them - a tenth of a second by default, which is
+# five frames at 48 kHz and about ten groups a second. That rate is
+# what the check below pins, since it is the thing a player feels.
 SAMPLE_RATE = 48000
 CHANNELS = 2
 AAC_FRAME = 1024
 AUDIO_PACKETS = SECONDS * SAMPLE_RATE // AAC_FRAME
-AUDIO_GROUP_FRAMES = -(-SAMPLE_RATE // AAC_FRAME)
-AUDIO_GROUPS = -(-AUDIO_PACKETS // AUDIO_GROUP_FRAMES)
+# Frames a second, which is also groups a second at the default.
+AUDIO_FRAME_RATE = SAMPLE_RATE / AAC_FRAME
+# What the audio row's rendition is called, which is the track name
+# and the catalog key: the compiler names the ladder's audio pad, and
+# the module publishes under the name the row carried.
+AUDIO_TRACK = "a0"
+# MOQ_AUDIO_GROUP_MS runs the loop against a duration instead of the
+# default group per frame, which is what the publish param takes.
+AUDIO_GROUP_MS = int(os.environ.get("MOQ_AUDIO_GROUP_MS", "100"))
+# A group closes at the first frame a whole `audio_group_ms` past its
+# start, so the frames to a group is that duration rounded UP in frames.
+AUDIO_GROUP_FRAMES_ASKED = max(
+    1, -(-AUDIO_GROUP_MS * SAMPLE_RATE // (AAC_FRAME * 1000))
+)
+AUDIO_GROUP_RATE = AUDIO_FRAME_RATE / AUDIO_GROUP_FRAMES_ASKED
+AUDIO_GROUPS = -(-AUDIO_PACKETS // AUDIO_GROUP_FRAMES_ASKED)
 
 BUILD_DEADLINE = 600
 COMPILE_DEADLINE = 180
@@ -115,7 +130,11 @@ def make_source(path: Path, audio: bool) -> None:
 def recipe_args(
     source: Path, port: int, cert_hex: str, rungs: int, audio: bool
 ) -> list[str]:
-    recipe = "publish-ladder-audio.sql" if audio else "publish-ladder.sql"
+    # One recipe either way: publish-ladder.sql maps the source's audio
+    # when it has one, and a source without one simply yields no audio
+    # row. (It absorbed publish-ladder-audio.sql, which this loop went
+    # on naming.)
+    recipe = "publish-ladder.sql"
     return [
         "-f", str(PACKAGE / "recipes" / recipe),
         "-v", f"source={source}",
@@ -125,6 +144,7 @@ def recipe_args(
         "-v", "widths=" + ",".join(str(w) for w in WIDTHS[:rungs]),
         "-v", "bitrates=" + ",".join(BITRATES[:rungs]),
         "-v", f"cert={cert_hex}",
+        *(["-v", f"audio_group_ms={AUDIO_GROUP_MS}"] if AUDIO_GROUP_MS else []),
     ]
 
 
@@ -149,8 +169,13 @@ def run_publisher(
     # bare - leaves ONE ffmpeg, not one apiece each opening the source again.
     if f"split={rungs}" not in shown.stdout:
         sys.exit(f"the one decode must split {rungs} ways, and this plan does not")
-    if shown.stdout.count("ffmpeg -i") != 1:
-        sys.exit("the ladder must decode its source ONCE, and this plan opens it more")
+    # The rungs come off ONE decode, which `split=` above already says.
+    # The audio leg is mapped from the source on its own, so a run that
+    # publishes audio opens it a second time; more than that would mean a
+    # rung had gone its own way.
+    decodes = shown.stdout.count("ffmpeg -i")
+    if decodes > (2 if audio else 1):
+        sys.exit(f"the ladder opens its source {decodes} times, and that is too many")
     if audio and shown.stdout.count("-c:0 aac") != 1:
         # The audio reaches the sink on a pad of its own, encoded on the way
         # in rather than as the pcm every other audio edge carries.
@@ -223,7 +248,7 @@ def one_run(
         widest = f"video.{round(WIDTHS[0] * 720 / 1280 / 2) * 2}p" if rungs > 1 else "video"
         hang = start_hang_recv(
             hang_recv, port, dir / "cert.pem", out_dir / "hang.mp4", BROADCAST,
-            video=widest, audio="audio" if audio else None,
+            video=widest, audio=AUDIO_TRACK if audio else None,
         )
         subs.append(hang)
         rows, _ = run_publisher(source, port, cert_hex, rungs, audio)
@@ -255,8 +280,12 @@ def one_run(
         audio_entries = catalog["audio"]["renditions"]
         # The heights follow from -2 scaling of the 1280x720 source:
         # proportional, rounded to the nearest even.
+        # Keyed by the TRACK name, which is the rendition's own: hang's
+        # selection prefixes it with the catalog section (`video.480p`,
+        # which is what `widest` above hands its receiver), and the
+        # catalog itself keys the section by the bare name.
         sizes = {
-            f"video.{round(width * 720 / 1280 / 2) * 2}p": width
+            f"{round(width * 720 / 1280 / 2) * 2}p": width
             for width in WIDTHS[:rungs]
         }
         assert sorted(video_entries) == sorted(sizes), (
@@ -270,7 +299,7 @@ def one_run(
             assert entry["container"]["kind"] == "cmaf", entry
             assert entry["container"]["init"], f"{name} carries no init segment"
         if audio:
-            entry = audio_entries["audio"]
+            entry = audio_entries[AUDIO_TRACK]
             assert entry["codec"].startswith("mp4a.40."), entry["codec"]
             assert entry["sampleRate"] == SAMPLE_RATE, entry
             assert entry["numberOfChannels"] == CHANNELS, entry
@@ -296,6 +325,21 @@ def one_run(
             )
             packets = sum(row["packets"] for row in groups)
             if kind == "audio":
+                # What the default comes to on the wire: a group per AAC
+                # frame, so the groups a second ARE the frames a second.
+                # Pinned here, because the rule is a param now and a query
+                # that leaves it alone must still publish this.
+                span = groups[-1]["pts_end"] - groups[0]["pts_start"]
+                rate = len(groups) / span if span else 0.0
+                print(
+                    f"--- {name}: {len(groups)} groups over {span:.2f}s of "
+                    f"audio, {rate:.1f} a second ---"
+                )
+                assert abs(rate - AUDIO_GROUP_RATE) <= 1.0, (
+                    f"{name}: {rate:.1f} audio groups a second, and "
+                    f"{AUDIO_GROUP_MS or 'a frame'} apiece at {SAMPLE_RATE} Hz "
+                    f"is {AUDIO_GROUP_RATE:.1f}"
+                )
                 # ffmpeg's aac encoder may add a priming frame or two.
                 assert abs(packets - AUDIO_PACKETS) <= 3, (
                     f"{name}: {packets} AAC frames, and {SECONDS}s at "
@@ -340,10 +384,10 @@ def one_run(
                     f"catalog said {SAMPLE_RATE} Hz {CHANNELS}ch"
                 )
                 # Whole groups, and a group holds the frames its duration does.
-                wanted = len(received) * AUDIO_GROUP_FRAMES
-                assert abs(frames - wanted) <= AUDIO_GROUP_FRAMES, (
+                wanted = len(received) * AUDIO_GROUP_FRAMES_ASKED
+                assert abs(frames - wanted) <= AUDIO_GROUP_FRAMES_ASKED, (
                     f"{name}: {frames} AAC frames over {len(received)} groups "
-                    f"of {AUDIO_GROUP_FRAMES}"
+                    f"of {AUDIO_GROUP_FRAMES_ASKED}"
                 )
                 print(
                     f"PASS audio: {name} at {rate} Hz {channels}ch, {frames} "
@@ -367,22 +411,33 @@ def one_run(
             "is reachable at all"
         )
 
-        # What hang's own pipeline wrote must decode at the geometry it chose
-        # off our catalog - their parser and container code, our broadcast.
+        # What hang's own pipeline wrote must decode as what it chose off
+        # our catalog - their parser and container code, our broadcast.
+        #
+        # Asked for a rung AND the audio, their fmp4 export writes the
+        # AUDIO alone, whatever the audio grouping is (a group per frame
+        # and a group per second both), so the geometry is judged on the
+        # video-only run and the audio on this one. That is upstream's
+        # export, not this broadcast: our own readers take either track
+        # off the same groups, above.
         assert f"hang: selecting video {widest}" in hang_transcript
-        size = probe_size(out_dir / "hang.mp4")
-        assert size[0] == sizes[widest], (
-            f"hang reassembled at {size[0]}x{size[1]}, not {sizes[widest]} wide"
-        )
         if audio:
             codec, rate, channels, _ = probe_audio(out_dir / "hang.mp4")
             assert codec == "aac", f"hang reassembled audio as {codec}"
             assert (rate, channels) == (SAMPLE_RATE, CHANNELS), (
                 f"hang reassembled audio at {rate} Hz {channels}ch"
             )
+            size = (0, 0)
+        else:
+            size = probe_size(out_dir / "hang.mp4")
+            assert size[0] == sizes[widest], (
+                f"hang reassembled at {size[0]}x{size[1]}, not {sizes[widest]} wide"
+            )
         print(
-            f"PASS hang: their stack decoded {widest} at {size[0]}x{size[1]}"
-            + (", audio included" if audio else "")
+            "PASS hang: their stack decoded the audio at "
+            f"{SAMPLE_RATE} Hz {CHANNELS}ch"
+            if audio
+            else f"PASS hang: their stack decoded {widest} at {size[0]}x{size[1]}"
         )
         print(
             f"PASS: one broadcast, {summary['tracks']} tracks, "

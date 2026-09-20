@@ -177,21 +177,47 @@ def start_subscriber(
             "--env", f"OUTPUT=/out/{output}"]
     if track is not None:
         argv += ["--env", f"TRACK={track}"]
-    return spawn(
+    # PLAYER passes through: a reader that skips like a live player.
+    if os.environ.get("PLAYER"):
+        argv += ["--env", "PLAYER=1"]
+    # stdout goes to a FILE, not a pipe: the guest prints a line per
+    # group, a group is one AAC frame, and a pipe nobody drains until
+    # the end fills at about a minute of audio and blocks the guest
+    # mid-broadcast. The path rides on the handle, for `wait_subscriber`.
+    transcript = out_dir / f"{output}.sub.log"
+    child = spawn(
         [*argv, str(wasm)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        stdout=open(transcript, "w"), stderr=subprocess.PIPE, text=True,
     )
+    child.transcript = transcript
+    return child
 
 
 def wait_subscriber(sub: subprocess.Popen, deadline: int) -> str:
+    def transcript() -> str:
+        path = getattr(sub, "transcript", None)
+        try:
+            return Path(path).read_text() if path is not None else ""
+        except OSError:
+            return ""
+
     try:
-        stdout, stderr = sub.communicate(timeout=deadline)
+        _, stderr = sub.communicate(timeout=deadline)
+        stdout = transcript()
     except subprocess.TimeoutExpired:
         kill_tree(sub)
-        stdout, stderr = sub.communicate()
+        _, stderr = sub.communicate()
+        stdout = transcript()
         sys.exit(f"sub-recv did not finish:\n{stdout}\n{stderr[-800:]}")
     print("--- sub-recv transcript ---")
-    print(stdout)
+    # A group per audio frame makes this hundreds of lines; the ends say
+    # what the run did, and the loops read the whole of it themselves.
+    lines = stdout.splitlines()
+    if len(lines) > 40:
+        trimmed = [*lines[:12], f"... {len(lines) - 24} lines ...", *lines[-12:]]
+        print(chr(10).join(trimmed))
+    else:
+        print(stdout)
     if stderr.strip():
         print("--- sub-recv stderr ---")
         print(stderr[-1200:])

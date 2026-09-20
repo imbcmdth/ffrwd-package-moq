@@ -100,14 +100,32 @@ mod live {
 		let track = broadcast.track(track_name.as_str())?;
 		// Reassembly reads every group from 0, in order, tolerating
 		// backlog - the opposite of the live edge a player takes.
-		let subscriber = track.subscribe(moq_core::subscribe::from_start()).await?;
+		// PLAYER=1 reads the way a live player does: a default
+		// subscription, whose latency window is ZERO, so a group that is
+		// no longer the latest when this reader gets to it is skipped
+		// rather than served. That is the shape a lost group shows up
+		// in, and the backlog subscription below hides it.
+		let subscription = match std::env::var("PLAYER").is_ok() {
+			true => moq_net::track::Subscription::default(),
+			false => moq_core::subscribe::from_start(),
+		};
+		let subscriber = track.subscribe(subscription).await?;
 
 		// The init segment came with the catalog, not off a track.
 		println!("sub: init segment {} bytes", chosen.init.len());
 		let init = chosen.init.clone();
 
-		let mut stream = moq_core::subscribe::FrameStream::new(subscriber)
-			.on_group(|group, count| println!("sub: group {group} complete with {count} fragments"));
+		// Each group's completion is stamped with the milliseconds since
+		// this reader started: what a group per frame is worth is how
+		// evenly they arrive, and a group that completes late shows up
+		// here as a gap rather than as a missing line.
+		let opened = std::time::Instant::now();
+		let mut stream = moq_core::subscribe::FrameStream::new(subscriber).on_group(move |group, count| {
+			println!(
+				"sub: group {group} complete with {count} fragments at {}ms",
+				opened.elapsed().as_millis()
+			)
+		});
 		// A backlogged subscription may hand groups out of order - the
 		// relay serves them over parallel streams - so the fragments are
 		// collected and written in GROUP order, which is decode order.
