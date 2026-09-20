@@ -85,7 +85,26 @@ lookup, so a name is resolved over DNS-over-HTTPS against 1.1.1.1,
 then 8.8.8.8 - both pinned by IP in the module - and every address
 the answer carries is tried in turn.
 
-A relay that demands authentication takes a `token`.
+A relay that demands authentication takes a `token`, sent as the
+session's request path. The relay URL's own path is that same field, so
+the address a relay hands out with the token already in it -
+`https://relay.example/<JWT>`, which is the form a hang player takes -
+works as written:
+
+```pgsql
+COPY (...) TO ffrwd.moq.publish('https://relay.example/<JWT>', 'live/demo')
+```
+
+Either spelling alone wins, and they mean the same session. Naming the
+same token in both is fine; naming different ones is refused before
+anything is dialed, in a message that shows each token's first and last
+four characters and no more. Where the path is a broadcast root rather
+than a credential, put the token in the query instead: a `?jwt=` is
+carried to the relay, which is where a relay reads one from. A
+`?token=` is refused, since no relay reads that and the session would
+go out unauthenticated with a token in hand, and so is a `#` fragment,
+which reaches no relay at all. Nothing else in the URL is dropped on
+the way.
 
 ## What the shared crates changed
 

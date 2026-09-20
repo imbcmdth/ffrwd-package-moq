@@ -23,6 +23,15 @@
 -- sent as the session's request path; empty sends none. It lands in
 -- the module's params on the command line - scoped, expiring
 -- credentials only, the same caveat the query text carries.
+--
+-- The relay URL's own path is that same request path, which is how a
+-- relay hands its address out: publish('https://relay.example/<JWT>',
+-- ...) opens the session the token argument would, and rides the
+-- command line exactly as the argument does. Either spelling
+-- alone is taken as it stands; both naming different tokens is
+-- refused, both naming the same one is fine. A '?jwt=' rides along to
+-- the relay, a '?token=' is refused as a credential no relay reads,
+-- and a '#' fragment is refused rather than dropped.
 CREATE FUNCTION publish(relay text, broadcast text,
                         cert text DEFAULT '', token text DEFAULT '')
 RETURNS sink
