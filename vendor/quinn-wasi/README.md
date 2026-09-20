@@ -3,7 +3,7 @@
 quinn's pluggable I/O floor on standard wasi:sockets. A wasm32-wasip2
 component gets a full QUIC endpoint — handshake, streams, datagrams —
 on any host that grants it network access: wasmtime with
-`-S inherit-network`, or the ffrwd sidecar under `-net`. No invented
+`-S inherit-network`, or the ffrwd sidecar under `-udp`. No invented
 host interface; the imports are `wasi:sockets`, `wasi:io` and
 `wasi:clocks`, so the component is portable to any wasip2 host.
 

@@ -5,7 +5,7 @@
 //! This crate implements both over the standard wasi interfaces, so a
 //! wasip2 component can run a full QUIC endpoint on any host that grants
 //! it network access — wasmtime with `-S inherit-network`, or the ffrwd
-//! sidecar under its `-net` switch.
+//! sidecar under its `-udp` switch.
 //!
 //! - [`WasiRuntime`] spawns onto the ambient tokio current-thread runtime
 //!   and times with `tokio::time`, whose clock is the wasi monotonic clock.

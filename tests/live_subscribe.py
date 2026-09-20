@@ -97,7 +97,7 @@ def start_source(
         "cert": cert_hex,
         "token": "",
     })
-    argv = [str(SIDECAR), "-net", str(module), "-http", str(module),
+    argv = [str(SIDECAR), "-udp", str(module), "-http", str(module),
             "-m", str(module), "-params", params]
     for path in outputs:
         argv += ["-f", "nut", str(path)]
