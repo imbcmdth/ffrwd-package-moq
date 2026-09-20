@@ -13,7 +13,7 @@ use exports::ffrwd::av::packet_sink::{
 use ffrwd::av::types::CodedFormat;
 use serde::{Deserialize, Serialize};
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
 
 /// The base name a video track falls back to when its row's rendition
 /// carries none, and the ladder holds only the one stream.
@@ -313,7 +313,14 @@ thread_local! {
 }
 
 fn parse_params(params: &str) -> Result<Params, String> {
-	serde_json::from_str(params).map_err(|err| format!("params: {err}"))
+	let params: Params = serde_json::from_str(params).map_err(|err| format!("params: {err}"))?;
+	// The relay URL's path and the token argument are two spellings of
+	// one field, so what the session will ask for is settled here, where
+	// params are refused, rather than at the dial: a URL and a token that
+	// disagree stop the run instead of publishing a broadcast nobody
+	// scoped to the token can find.
+	moq_core::relay::session_path(&params.relay, &params.token)?;
+	Ok(params)
 }
 
 impl Session {

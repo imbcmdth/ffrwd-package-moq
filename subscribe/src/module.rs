@@ -14,7 +14,7 @@ use ffrwd::av::types::{CodedAudio, CodedFormat, CodedStream, CodedVideo, Packet,
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
 
 /// How long the relay gets to announce the broadcast, and then to hand
 /// over its catalog, before the call gives up.
@@ -68,7 +68,13 @@ struct Params {
 }
 
 fn parse_params(params: &str) -> Result<Params, String> {
-	serde_json::from_str(params).map_err(|err| format!("params: {err}"))
+	let params: Params = serde_json::from_str(params).map_err(|err| format!("params: {err}"))?;
+	// The relay URL's path and the token argument are two spellings of
+	// one field, so what the session will ask for is settled here, where
+	// params are refused. `probe` reads these params at compile time, so
+	// a URL and a token that disagree stop the query rather than the run.
+	moq_core::relay::session_path(&params.relay, &params.token)?;
+	Ok(params)
 }
 
 /// The tokio floor the session runs on. Split from [`Reader`] so a call
