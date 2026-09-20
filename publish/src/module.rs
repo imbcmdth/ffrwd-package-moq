@@ -13,7 +13,7 @@ use exports::ffrwd::av::packet_sink::{
 use ffrwd::av::types::CodedFormat;
 use serde::{Deserialize, Serialize};
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"audio_group_ms":{"type":"integer","minimum":0,"default":100,"description":"how long an audio group runs, in milliseconds; a tenth of a second is five AAC frames at 48kHz. 0 is one frame per group, which is what upstream hang writes and is experimental here: a player skips about one group in four"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"rows":{"type":"string","enum":["summary","groups","none"],"default":"summary","description":"what the sink reports: 'summary' is one row per track every 5s and a final total, 'groups' a row per published group, 'none' the final total alone"},"audio_group_ms":{"type":"integer","minimum":0,"default":100,"description":"how long an audio group runs, in milliseconds; a tenth of a second is five AAC frames at 48kHz. 0 is one frame per group, which is what upstream hang writes and is experimental here: a player skips about one group in four"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
 
 /// The base name a video track falls back to when its row's rendition
 /// carries none, and the ladder holds only the one stream.
@@ -22,10 +22,14 @@ const DEFAULT_VIDEO_TRACK: &str = "video";
 /// The base name an audio track falls back to under the same rule.
 const DEFAULT_AUDIO_TRACK: &str = "audio";
 
-/// One schema covers both row shapes: a group row carries `group`, the
-/// trailing summary carries `groups`, and each leaves the other's
-/// fields out. `pts_start`/`pts_end` are seconds of media time.
-const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"track":{"type":"string"},"group":{"type":"integer"},"packets":{"type":"integer"},"bytes":{"type":"integer"},"pts_start":{"type":"number"},"pts_end":{"type":"number"},"tracks":{"type":"integer"},"groups":{"type":"integer"},"init_bytes":{"type":"integer"}},"additionalProperties":false}"#;
+/// One schema covers the three row shapes, each leaving the others'
+/// fields out. A GROUP row (`rows => 'groups'`) carries `track` and
+/// `group`; a TRACK row (`rows => 'summary'`, every [`SUMMARY_EVERY`])
+/// carries `track` and `groups` with the totals so far and `media`,
+/// the seconds of media published on it; the TRAILING row, which every
+/// run ends with, carries `tracks`. `pts_start`/`pts_end` are seconds
+/// of media time.
+const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"track":{"type":"string"},"group":{"type":"integer"},"packets":{"type":"integer"},"bytes":{"type":"integer"},"pts_start":{"type":"number"},"pts_end":{"type":"number"},"groups":{"type":"integer"},"media":{"type":"number"},"tracks":{"type":"integer"},"init_bytes":{"type":"integer"}},"additionalProperties":false}"#;
 
 /// How long the session stays open after the last fragment, for the
 /// wire to drain: there is no delivered signal for a subscription.
@@ -48,6 +52,17 @@ const POLL: Duration = Duration::from_millis(20);
 /// feeding the module are bounded, and a stalled stage is killed. First
 /// reader or this, whichever comes first.
 const HOLD_MAX: Duration = Duration::from_secs(10);
+
+/// How often a summary row per track goes out while a run lasts.
+const SUMMARY_EVERY: Duration = Duration::from_secs(5);
+
+/// One turn of the session between two groups: enough for the driver
+/// and the serving tasks to take the group just closed before the next
+/// one is appended. A yield alone runs the ready tasks once, and the
+/// timer turn lets a task that parked on the socket come back.
+async fn drive_once() {
+	tokio::task::yield_now().await;
+}
 
 /// How long a call keeps driving the session after it has written
 /// something, and in what steps. The session makes progress only while
@@ -83,6 +98,40 @@ struct Params {
 	/// experimental. See [`moq_core::group::AUDIO_GROUP_MS`].
 	#[serde(default = "default_audio_group_ms")]
 	audio_group_ms: u32,
+	/// What the sink reports: see [`Rows`].
+	#[serde(default = "default_rows")]
+	rows: String,
+}
+
+/// What a run says about itself. A group a second is nothing; ten a
+/// second, which a tenth-of-a-second audio group comes to, is a
+/// terminal nobody can read, so the default is a periodic total.
+#[derive(Clone, Copy, PartialEq)]
+enum Rows {
+	/// One row per track every [`SUMMARY_EVERY`], and the trailing total.
+	Summary,
+	/// A row per published group, for a run piping them somewhere.
+	Groups,
+	/// The trailing total alone.
+	None,
+}
+
+impl Rows {
+	fn parse(asked: &str) -> Result<Self, String> {
+		match asked {
+			"summary" => Ok(Rows::Summary),
+			"groups" => Ok(Rows::Groups),
+			"none" => Ok(Rows::None),
+			other => Err(format!(
+				"rows '{other}': publish reports 'summary' (a row per track every {}s), 				 'groups' (a row per group) or 'none'",
+				SUMMARY_EVERY.as_secs()
+			)),
+		}
+	}
+}
+
+fn default_rows() -> String {
+	"summary".to_string()
 }
 
 fn default_audio_group_ms() -> u32 {
@@ -98,6 +147,18 @@ struct GroupRow {
 	bytes: u64,
 	pts_start: f64,
 	pts_end: f64,
+}
+
+/// One track's totals so far, every [`SUMMARY_EVERY`] while a run
+/// lasts. `media` is the seconds of media published on the track,
+/// which is what says whether it is keeping up.
+#[derive(Serialize)]
+struct TrackRow {
+	track: String,
+	groups: u64,
+	packets: u64,
+	bytes: u64,
+	media: f64,
 }
 
 /// The trailing summary, once per run over every track.
@@ -163,6 +224,8 @@ struct Rendition {
 	groups: u64,
 	packets: u64,
 	bytes: u64,
+	/// The last group's end in seconds of media time, for the track row.
+	media_seconds: f64,
 	/// The open group's accumulators, for its row when it closes.
 	group_packets: u64,
 	group_bytes: u64,
@@ -210,10 +273,11 @@ impl Rendition {
 	fn publish_fragment(
 		&mut self,
 		fragment: ffrwd_bmff::mux::Fragment,
+		emit: bool,
 	) -> Result<Vec<String>, String> {
 		let mut rows = Vec::new();
 		if self.discipline.starts_a_group(fragment.keyframe, fragment.pts) {
-			rows.extend(self.close_group()?);
+			rows.extend(self.close_group(emit)?);
 			let track = self.track.as_mut().expect("track lives until last");
 			self.group = Some(
 				track
@@ -242,29 +306,41 @@ impl Rendition {
 		self.group_pts_max = self.group_pts_max.max(fragment.pts);
 		self.bytes += bytes_len;
 		if self.discipline.one_fragment_each() {
-			rows.extend(self.close_group()?);
+			rows.extend(self.close_group(emit)?);
 		}
 		Ok(rows)
 	}
 
-	/// Closes the open group, if any, and returns its row.
-	fn close_group(&mut self) -> Result<Option<String>, String> {
+	/// Closes the open group, if any. `emit` asks for its row; a run
+	/// reporting totals counts the group and says nothing.
+	fn close_group(&mut self, emit: bool) -> Result<Option<String>, String> {
 		let Some(mut group) = self.group.take() else {
 			return Ok(None);
 		};
 		group.finish().map_err(|err| format!("moq group: {err}"))?;
-		let row = GroupRow {
+		let row = emit.then(|| GroupRow {
 			track: self.name.clone(),
 			group: self.groups,
 			packets: self.group_packets,
 			bytes: self.group_bytes,
 			pts_start: self.seconds(self.group_pts_min),
 			pts_end: self.seconds(self.group_pts_max),
-		};
+		});
 		self.groups += 1;
-		Ok(Some(
-			serde_json::to_string(&row).expect("a group row serializes"),
-		))
+		self.media_seconds = self.seconds(self.group_pts_max);
+		Ok(row.map(|row| serde_json::to_string(&row).expect("a group row serializes")))
+	}
+
+	/// This track's totals so far, as a row.
+	fn track_row(&self) -> String {
+		serde_json::to_string(&TrackRow {
+			track: self.name.clone(),
+			groups: self.groups,
+			packets: self.packets,
+			bytes: self.bytes,
+			media: self.media_seconds,
+		})
+		.expect("a track row serializes")
 	}
 
 	/// The catalog entry naming this track: its decoder configuration
@@ -327,6 +403,9 @@ struct Session {
 	started: bool,
 	/// When the catalog last went out; see [`CATALOG_REFRESH`].
 	catalog_sent: Option<std::time::Instant>,
+	/// What this run reports, and when it last reported it.
+	rows: Rows,
+	summary_sent: Option<std::time::Instant>,
 }
 
 struct State {
@@ -346,6 +425,7 @@ fn parse_params(params: &str) -> Result<Params, String> {
 	// disagree stop the run instead of publishing a broadcast nobody
 	// scoped to the token can find.
 	moq_core::relay::session_path(&params.relay, &params.token)?;
+	Rows::parse(&params.rows)?;
 	Ok(params)
 }
 
@@ -400,6 +480,7 @@ impl Session {
 	async fn drive(&mut self, pads: &[PadPackets], last: bool) -> Result<Processed, String> {
 		let mut rows = Vec::new();
 		let mut trailing = Vec::new();
+		let per_group = self.rows == Rows::Groups;
 
 		if !self.started {
 			// The catalog goes out to the first reader of anything: it is
@@ -457,7 +538,20 @@ impl Session {
 					})?;
 				rendition.packets += 1;
 				for fragment in fragments {
-					rows.extend(rendition.publish_fragment(fragment)?);
+					let closed = rendition.publish_fragment(fragment, per_group)?;
+					// A closed group is one the session has not been
+					// given a chance to take. The session runs only while
+					// this call is on the executor, so a call that closes
+					// several groups in a row - a batch spanning several
+					// boundaries, which is what a stalled upstream hands
+					// over when it catches up - would append them all
+					// before the session saw any. Drive it here, per
+					// group: a burst then leaves as a burst of groups
+					// rather than as one.
+					if !closed.is_empty() {
+						drive_once().await;
+					}
+					rows.extend(closed);
 				}
 			}
 			// Let the driver move the frames onto the wire now, not
@@ -479,6 +573,18 @@ impl Session {
 			}
 		}
 
+		// The periodic word from a run that says nothing per group: what
+		// each track has published so far, and how far into the media it
+		// has got.
+		if self.rows == Rows::Summary
+			&& self
+				.summary_sent
+				.is_none_or(|sent| sent.elapsed() >= SUMMARY_EVERY)
+		{
+			rows.extend(self.renditions.iter().map(Rendition::track_row));
+			self.summary_sent = Some(std::time::Instant::now());
+		}
+
 		if last {
 			// Every track's last fragment goes out BEFORE any track is
 			// finished: a subscriber stops at the finish, so a track told
@@ -489,9 +595,9 @@ impl Session {
 					format!("track '{}': {err}", self.renditions[index].name)
 				})?;
 				for fragment in flushed {
-					rows.extend(self.renditions[index].publish_fragment(fragment)?);
+					rows.extend(self.renditions[index].publish_fragment(fragment, per_group)?);
 				}
-				if let Some(row) = self.renditions[index].close_group()? {
+				if let Some(row) = self.renditions[index].close_group(per_group)? {
 					rows.push(row);
 				}
 			}
@@ -563,6 +669,7 @@ impl Guest for Publish {
 	fn init(streams: Vec<InputStream>, params: String) -> Result<(), String> {
 		let params = parse_params(&params)?;
 		let audio_group_ms = params.audio_group_ms;
+		let reporting = Rows::parse(&params.rows)?;
 		if streams.is_empty() {
 			return Err("publish reads at least one stream".into());
 		}
@@ -783,6 +890,7 @@ impl Guest for Publish {
 				groups: 0,
 				packets: 0,
 				bytes: 0,
+				media_seconds: 0.0,
 				group_packets: 0,
 				group_bytes: 0,
 				group_pts_min: 0,
@@ -808,6 +916,8 @@ impl Guest for Publish {
 					params,
 					started: false,
 					catalog_sent: None,
+					rows: reporting,
+					summary_sent: None,
 				},
 			});
 		});
