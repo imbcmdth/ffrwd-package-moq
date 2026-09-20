@@ -269,7 +269,7 @@ def one_run(rungs: int, keep: bool) -> None:
         transcripts = [wait_subscriber(reader, READER_DEADLINE) for reader in readers]
         readers = []
 
-        summaries = [row for row in rows if "groups" in row]
+        summaries = [row for row in rows if "tracks" in row]
         assert len(summaries) == 1, f"expected one summary row, got {len(summaries)}"
         assert summaries[0]["tracks"] == tracks, (
             f"the ladder published {summaries[0]['tracks']} tracks, and {tracks} "
@@ -350,7 +350,7 @@ def chain(rung: Path, port: int, cert_hex: str, out: Path) -> None:
                               ["-v", f"source={rung}"])
     rows = wait_publish(publisher, RUN_DEADLINE)
     wait_source(reader, READER_DEADLINE)
-    assert [row for row in rows if "groups" in row], "the copy published no summary"
+    assert [row for row in rows if "tracks" in row], "the copy published no summary"
     assert copy.exists(), "the copy came back with no track"
     read = probe(copy, "v:0", "codec_name,width,height")
     original = probe(rung, "v:0", "codec_name,width,height")

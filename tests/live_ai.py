@@ -314,7 +314,7 @@ def publish(
 def check_broadcast(published: Published, expected_frames: int, named: str) -> None:
     """The module's own rows, the subscriber's transcript and ffprobe must agree."""
     group_rows = [r for r in published.rows if "group" in r]
-    summaries = [r for r in published.rows if "groups" in r]
+    summaries = [r for r in published.rows if "tracks" in r]
     assert group_rows, f"{named}: the module emitted no group rows"
     assert len(summaries) == 1, f"{named}: expected one summary row, got {len(summaries)}"
     summary = summaries[0]

@@ -107,7 +107,10 @@ def run_publisher(
             "-v", f"source={source}",
             "-v", f"relay={relay}",
             "-v", f"broadcast={broadcast}",
-            "-v", f"cert={cert_hex}"]
+            "-v", f"cert={cert_hex}",
+            # A row per group, which is what this loop counts; a run
+            # says one row per track every few seconds by default.
+            "-v", "rows=groups"]
     if token:
         args += ["-v", f"token={token}"]
     shown = run(
@@ -164,7 +167,7 @@ def one_run(publish_wasm: Path, sub_wasm: Path, certgen: Path, keep: bool) -> No
         transcript = wait_subscriber(sub, SUBSCRIBER_DEADLINE)
 
         group_rows = [r for r in rows if "group" in r]
-        summaries = [r for r in rows if "groups" in r]
+        summaries = [r for r in rows if "tracks" in r]
         assert group_rows, "the module emitted no group rows"
         assert len(summaries) == 1, f"expected one summary row, got {len(summaries)}"
         summary = summaries[0]
@@ -251,7 +254,7 @@ def scoped_run(sub_wasm: Path, certgen: Path, keep: bool, *, in_url: bool) -> No
             rows, _ = run_publisher(source, port, cert_hex, token=SCOPED_ROOT)
         wait_subscriber(sub, SUBSCRIBER_DEADLINE)
 
-        summaries = [r for r in rows if "groups" in r]
+        summaries = [r for r in rows if "tracks" in r]
         assert len(summaries) == 1, f"expected one summary row, got {len(summaries)}"
         expected_frames = SCOPED_SECONDS * RATE
         assert summaries[0]["packets"] == expected_frames, (

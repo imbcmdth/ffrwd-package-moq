@@ -144,6 +144,9 @@ def recipe_args(
         "-v", "widths=" + ",".join(str(w) for w in WIDTHS[:rungs]),
         "-v", "bitrates=" + ",".join(BITRATES[:rungs]),
         "-v", f"cert={cert_hex}",
+        # A row per group, which is what this loop counts; a run says
+        # one row per track every few seconds by default.
+        "-v", "rows=groups",
         *(["-v", f"audio_group_ms={AUDIO_GROUP_MS}"] if AUDIO_GROUP_MS else []),
     ]
 
@@ -256,7 +259,7 @@ def one_run(
         transcripts = [wait_subscriber(sub, SUBSCRIBER_DEADLINE) for sub in subs]
 
         group_rows = [r for r in rows if "group" in r]
-        summaries = [r for r in rows if "groups" in r]
+        summaries = [r for r in rows if "tracks" in r]
         assert group_rows, "the module emitted no group rows"
         assert len(summaries) == 1, f"expected one summary row, got {len(summaries)}"
         summary = summaries[0]
