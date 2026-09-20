@@ -116,10 +116,13 @@ enum Media {
 /// One stream packaged before the relay is dialed, waiting for the MoQ
 /// tracks it will publish on.
 struct Built {
-	muxer: moq_core::mux::Muxer,
+	muxer: ffrwd_bmff::mux::Muxer,
 	codec: String,
 	media: Media,
 	time_base: (i32, i32),
+	/// The NAL length prefix this track's `avcC` declares; 0 for audio,
+	/// whose frames carry no framing of their own.
+	length_size: usize,
 }
 
 /// One track: one encoded stream, its own fmp4 muxer, and the MoQ track
@@ -129,10 +132,14 @@ struct Rendition {
 	codec: String,
 	media: Media,
 	track: Option<moq_net::track::Producer>,
-	/// The open MoQ group, rotated where the muxer marks a group start.
+	/// The open MoQ group, rotated where the group discipline says.
 	group: Option<moq_net::group::Producer>,
-	muxer: moq_core::mux::Muxer,
+	/// Which fragments open a group: this package's own convention, not
+	/// anything the muxer decides.
+	discipline: moq_core::group::Groups,
+	muxer: ffrwd_bmff::mux::Muxer,
 	time_base: (i32, i32),
+	length_size: usize,
 	init_bytes: u64,
 	groups: u64,
 	packets: u64,
@@ -149,15 +156,40 @@ impl Rendition {
 		ticks as f64 * self.time_base.0 as f64 / self.time_base.1 as f64
 	}
 
+	/// One packet as the muxer stores it: an h264 packet reframed from
+	/// the Annex-B the encoded edge carries into the length prefixes
+	/// this track's `avcC` declares, an AAC frame exactly as it
+	/// arrived. No NAL payload is touched either way.
+	fn stored(&self, pts: i64, data: &[u8]) -> Result<Vec<u8>, String> {
+		match self.media {
+			Media::Video { .. } => {
+				let framed =
+					ffrwd_nal::annexb::annexb_to_length_prefixed(data, self.length_size)
+						.map_err(|err| {
+							format!("track '{}': the packet at pts {pts}: {err}", self.name)
+						})?;
+				if framed.is_empty() {
+					return Err(format!(
+						"track '{}': the packet at pts {pts} carries no Annex-B start code",
+						self.name
+					));
+				}
+				Ok(framed)
+			}
+			Media::Audio { .. } => Ok(data.to_vec()),
+		}
+	}
+
 	/// Publishes one single-sample fragment as one MoQ frame in the
-	/// open group, rotating the group where the muxer marked a start.
-	/// A rotation closes the group before it and returns its row.
+	/// open group, rotating the group where the discipline says one
+	/// starts. A rotation closes the group before it and returns its
+	/// row.
 	fn publish_fragment(
 		&mut self,
-		fragment: moq_core::mux::Fragment,
+		fragment: ffrwd_bmff::mux::Fragment,
 	) -> Result<Option<String>, String> {
 		let mut row = None;
-		if fragment.starts_group {
+		if self.discipline.starts_a_group(fragment.keyframe, fragment.pts) {
 			row = self.close_group()?;
 			let track = self.track.as_mut().expect("track lives until last");
 			self.group = Some(
@@ -171,7 +203,7 @@ impl Rendition {
 			self.group_pts_max = fragment.pts;
 		}
 		let timestamp_us =
-			moq_core::mux::ticks_to_micros(fragment.pts, self.time_base.0, self.time_base.1);
+			ffrwd_bmff::time::ticks_to_micros(fragment.pts, self.time_base.0, self.time_base.1);
 		let bytes_len = fragment.bytes.len() as u64;
 		let group = self.group.as_mut().expect("a group start opened one");
 		group
@@ -218,7 +250,7 @@ impl Rendition {
 			Media::Video { width, height } => moq_core::catalog::Track::video(
 				self.name.clone(),
 				self.codec.clone(),
-				self.muxer.decoder_config(),
+				self.muxer.config(),
 				width,
 				height,
 				init,
@@ -229,7 +261,7 @@ impl Rendition {
 			} => moq_core::catalog::Track::audio(
 				self.name.clone(),
 				self.codec.clone(),
-				self.muxer.decoder_config(),
+				self.muxer.config(),
 				sample_rate,
 				channels,
 				init,
@@ -371,13 +403,25 @@ impl Session {
 				continue;
 			};
 			for packet in &pad.packets {
-				let fragments = rendition.muxer.push(moq_core::mux::Packet {
-					pts: packet.pts,
-					dts: packet.dts,
-					duration: packet.duration,
-					keyframe: packet.keyframe,
-					data: &packet.data,
-				})?;
+				let stored = rendition.stored(packet.pts, &packet.data)?;
+				let fragments = rendition
+					.muxer
+					.push(ffrwd_bmff::mux::Packet {
+						pts: packet.pts,
+						dts: packet.dts,
+						duration: packet.duration,
+						// Every AAC frame can be decoded from, whatever
+						// the wire said about it.
+						keyframe: packet.keyframe
+							|| matches!(rendition.media, Media::Audio { .. }),
+						data: &stored,
+					})
+					.map_err(|err| {
+						format!(
+							"track '{}': the packet at pts {}: {err}",
+							rendition.name, packet.pts
+						)
+					})?;
 				rendition.packets += 1;
 				for fragment in fragments {
 					if let Some(row) = rendition.publish_fragment(fragment)? {
@@ -396,7 +440,10 @@ impl Session {
 			// it is over while its own tail is still queued loses that
 			// tail. The yield is what lets the driver move them.
 			for index in 0..self.renditions.len() {
-				for fragment in self.renditions[index].muxer.finish()? {
+				let flushed = self.renditions[index].muxer.finish().map_err(|err| {
+					format!("track '{}': {err}", self.renditions[index].name)
+				})?;
+				for fragment in flushed {
 					if let Some(row) = self.renditions[index].publish_fragment(fragment)? {
 						rows.push(row);
 					}
@@ -488,23 +535,42 @@ impl Guest for Publish {
 							coded.codec
 						));
 					}
-					let muxer = moq_core::mux::Muxer::video(
-						&coded.extradata,
-						video.width,
-						video.height,
-						coded.time_base.num,
-						coded.time_base.den,
-					)?;
+					// The avcC is built here, from the Annex-B SPS/PPS
+					// the wire carried out of band, and handed to the
+					// muxer as an opaque record: the container layer
+					// reads no codec bytes.
+					let (sps, pps) = ffrwd_nal::config::parse_parameter_sets(&coded.extradata);
+					let avcc = ffrwd_nal::config::build_avcc(&sps, &pps).map_err(|err| {
+						format!("the h264 stream's extradata builds no avcC: {err}")
+					})?;
 					// The stream's own profile and level name the codec;
 					// parsing the avcC is the fallback for a wire that
 					// does not say.
-					let avcc = muxer.avcc().expect("a video muxer builds an avcC");
 					let codec = match (coded.profile, coded.level) {
-						(Some(profile), Some(level)) => {
-							moq_core::catalog::avc_codec_from(profile, level, avcc)
-						}
-						_ => moq_core::catalog::avc_codec(avcc),
+						(Some(profile), Some(level)) => ffrwd_nal::codec_string::avc_codec_from(
+							profile as u8,
+							level as u8,
+							&avcc,
+						),
+						_ => ffrwd_nal::codec_string::avc_codec(&avcc),
 					};
+					let length_size = ffrwd_nal::config::avcc_length_size(&avcc);
+					let muxer = ffrwd_bmff::mux::Muxer::video(
+						ffrwd_bmff::mux::Video {
+							kind: *b"avc1",
+							width: video.width,
+							height: video.height,
+							config: avcc,
+						},
+						coded.time_base.num,
+						coded.time_base.den,
+					)
+					.map_err(|err| {
+						format!(
+							"the h264 stream at time base {}/{} packages as no avc1 track: {err}",
+							coded.time_base.num, coded.time_base.den
+						)
+					})?;
 					Built {
 						muxer,
 						codec,
@@ -513,6 +579,7 @@ impl Guest for Publish {
 							height: video.height,
 						},
 						time_base: (coded.time_base.num, coded.time_base.den),
+						length_size,
 					}
 				}
 				CodedFormat::Audio(audio) => {
@@ -522,13 +589,21 @@ impl Guest for Publish {
 							coded.codec
 						));
 					}
-					let muxer = moq_core::mux::Muxer::audio(
-						&coded.extradata,
-						audio.sample_rate,
-						audio.channels,
+					let muxer = ffrwd_bmff::mux::Muxer::audio(
+						ffrwd_bmff::mux::Audio {
+							sample_rate: audio.sample_rate,
+							channels: audio.channels,
+							config: coded.extradata.clone(),
+						},
 						coded.time_base.num,
 						coded.time_base.den,
-					)?;
+					)
+					.map_err(|err| {
+						format!(
+							"the aac stream at time base {}/{} packages as no mp4a track: {err}",
+							coded.time_base.num, coded.time_base.den
+						)
+					})?;
 					Built {
 						muxer,
 						// The AudioSpecificConfig crosses as extradata,
@@ -539,6 +614,7 @@ impl Guest for Publish {
 							channels: audio.channels,
 						},
 						time_base: (coded.time_base.num, coded.time_base.den),
+						length_size: 0,
 					}
 				}
 			});
@@ -621,8 +697,15 @@ impl Guest for Publish {
 				media: built.media,
 				track: Some(track),
 				group: None,
+				discipline: match built.media {
+					Media::Video { .. } => moq_core::group::Groups::video(),
+					Media::Audio { .. } => {
+						moq_core::group::Groups::audio(built.time_base.0, built.time_base.1)
+					}
+				},
 				muxer: built.muxer,
 				time_base: built.time_base,
+				length_size: built.length_size,
 				init_bytes: 0,
 				groups: 0,
 				packets: 0,

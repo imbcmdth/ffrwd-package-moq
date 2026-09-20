@@ -109,12 +109,14 @@ enum Wire {
 /// One rendition being read: how to take its fragments apart, where
 /// its groups have got to, and whether its packets have started.
 struct Rendition {
-	track: moq_core::demux::Track,
+	track: ffrwd_bmff::track::Track,
 	video: bool,
-	/// False until a video track's first sync sample; a subscription
-	/// begins at the group in flight, and the samples before that
-	/// keyframe are a group no decoder can start at.
-	started: bool,
+	/// The NAL length prefix this track's `avcC` declares; 0 for audio,
+	/// whose frames carry no framing of their own.
+	length_size: usize,
+	/// Where this reader may start, and what a fragment carrying
+	/// nothing for the track means.
+	join: moq_core::group::Join,
 	/// Completed groups waiting for the one before them.
 	pending: std::collections::BTreeMap<u64, Vec<Bytes>>,
 	/// The next group in sequence; None until the first goes out.
@@ -203,20 +205,23 @@ async fn open_broadcast(params: &Params, wait: Duration) -> Result<Opened, Strin
 fn source_track(
 	index: usize,
 	rendition: &moq_core::catalog::Rendition,
-) -> Result<(SourceTrack, moq_core::demux::Track), String> {
-	let track = moq_core::demux::Track::read(&rendition.init)
+) -> Result<(SourceTrack, ffrwd_bmff::track::Track), String> {
+	let track = ffrwd_bmff::track::Track::from_init(&rendition.init)
 		.map_err(|err| format!("rendition '{}': init segment: {err}", rendition.name))?;
 	let time_base = Rational {
 		num: 1,
 		den: track.timescale as i32,
 	};
-	let (kind, codec, format, extradata, profile, level) = match (&rendition.kind, &track.media) {
-		(
-			moq_core::catalog::Kind::Video { width, height },
-			moq_core::demux::Media::Video { avcc, .. },
-		) => {
-			let extradata = moq_core::avc::avcc_to_annexb_extradata(avcc)
-				.map_err(|err| format!("rendition '{}': {err}", rendition.name))?;
+	let config = &track.entry.config;
+	let (kind, codec, format, extradata, profile, level) = match (&rendition.kind, &track.entry.kind)
+	{
+		(moq_core::catalog::Kind::Video { width, height }, b"avc1" | b"avc3") => {
+			let extradata = ffrwd_nal::config::avcc_to_annexb_extradata(config)
+				.map_err(|err| format!("rendition '{}': its avcC: {err}", rendition.name))?;
+			let (profile, level) = match ffrwd_nal::sps::profile_level(config) {
+				Some((profile, level)) => (Some(i32::from(profile)), Some(i32::from(level))),
+				None => (None, None),
+			};
 			(
 				"video",
 				"h264",
@@ -227,8 +232,8 @@ fn source_track(
 					color: None,
 				}),
 				extradata,
-				avcc.get(1).map(|byte| i32::from(*byte)),
-				avcc.get(3).map(|byte| i32::from(*byte)),
+				profile,
+				level,
 			)
 		}
 		(
@@ -236,7 +241,7 @@ fn source_track(
 				sample_rate,
 				channels,
 			},
-			moq_core::demux::Media::Audio { asc, .. },
+			b"mp4a",
 		) => (
 			"audio",
 			"aac",
@@ -245,14 +250,16 @@ fn source_track(
 				channels: *channels,
 				channel_layout: None,
 			}),
-			asc.clone(),
+			config.clone(),
 			None,
 			None,
 		),
-		_ => {
+		(_, other) => {
 			return Err(format!(
-				"rendition '{}' is described as one kind and packaged as another",
-				rendition.name
+				"rendition '{}' is packaged as '{}', and this reads avc1 video and mp4a audio \
+				 described as what they are",
+				rendition.name,
+				String::from_utf8_lossy(other)
 			))
 		}
 	};
@@ -323,11 +330,19 @@ fn catalog_of(
 		let rendition = &renditions[index];
 		let (track, demux) = source_track(index, rendition)?;
 		let video = matches!(rendition.kind, moq_core::catalog::Kind::Video { .. });
+		let length_size = match video {
+			true => ffrwd_nal::config::avcc_length_size(&demux.entry.config),
+			false => 0,
+		};
 		tracks.push(track);
 		readers.push(Rendition {
 			track: demux,
 			video,
-			started: !video,
+			length_size,
+			join: match video {
+				true => moq_core::group::Join::video(),
+				false => moq_core::group::Join::audio(),
+			},
 			pending: std::collections::BTreeMap::new(),
 			cursor: None,
 			gap_since: None,
@@ -456,6 +471,11 @@ fn into_pads(pads: Vec<Vec<Packet>>) -> Vec<PadPackets> {
 /// video track's samples before its first sync sample do not, since a
 /// subscription joins at the group in flight and no decoder can start
 /// in the middle of one.
+///
+/// A fragment that carries nothing for this track - a `moof` whose
+/// track fragments are all somebody else's - holds no samples and is
+/// simply skipped. The reader's cursor is the group sequence, which
+/// such a fragment does not disturb.
 fn take_fragment(
 	rendition: &mut Rendition,
 	index: usize,
@@ -463,22 +483,21 @@ fn take_fragment(
 	pad: &mut Vec<Packet>,
 ) -> Result<bool, String> {
 	let samples = rendition
-		.track
-		.samples(fragment)
+		.join
+		.playable(&rendition.track, fragment)
 		.map_err(|err| format!("track {index}: {err}"))?;
 	let mut any = false;
 	for sample in samples {
-		if !rendition.started {
-			if !sample.keyframe {
-				continue;
-			}
-			rendition.started = true;
-		}
+		// The bytes are borrowed out of the fragment; an h264 sample is
+		// reframed from the length prefixes the avcC declares into the
+		// Annex-B an encoded edge expects, and an AAC frame is copied.
+		let stored = ffrwd_bmff::fragment::sample_bytes(fragment, 0, &sample)
+			.map_err(|err| format!("track {index}: {err}"))?;
 		let data = if rendition.video {
-			moq_core::avc::avcc_to_annexb(&sample.data, rendition.track.length_size())
+			ffrwd_nal::annexb::length_prefixed_to_annexb(stored, rendition.length_size)
 				.map_err(|err| format!("track {index}: {err}"))?
 		} else {
-			sample.data
+			stored.to_vec()
 		};
 		pad.push(Packet {
 			pts: sample.pts,
