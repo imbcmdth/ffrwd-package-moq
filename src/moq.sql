@@ -40,9 +40,16 @@
 -- - a player skips about one such group in four on a real relay - and
 -- a larger value trades delay for fewer streams. Video groups follow
 -- the keyframes, and this does not touch them.
+-- rows is what the sink reports: 'summary', the default, is one row
+-- per track every 5 seconds - its groups, packets, bytes and how many
+-- seconds of media have gone out on it - and one total row at the end;
+-- 'groups' is a row per published group, which at ten audio groups a
+-- second is for piping somewhere rather than for reading; 'none' is
+-- the final total alone.
 CREATE FUNCTION publish(relay text, broadcast text,
                         cert text DEFAULT '', token text DEFAULT '',
-                        audio_group_ms number DEFAULT 100)
+                        audio_group_ms number DEFAULT 100,
+                        rows text DEFAULT 'summary')
 RETURNS sink
   AS 'target/wasm32-wasip2/release/publish.wasm', 'publish' LANGUAGE wasm;
 

@@ -33,6 +33,18 @@ fragmented MP4: one `moof`+`mdat` fragment per each frame, a new MoQ
 group at every keyframe. Audio rides beside the video as AAC, cut on
 frame edges.
 
+### What a run says
+
+`rows` decides. `'summary'`, the default, is one row per track every
+five seconds - `track`, `groups`, `packets`, `bytes`, and `media`, the
+seconds of media that have gone out on it, which is what says whether
+a live run is keeping up - and one trailing row over the whole
+broadcast (`tracks`, `groups`, `packets`, `bytes`, `init_bytes`).
+`'groups'` is the older shape, a row per published group (`track`,
+`group`, `packets`, `bytes`, `pts_start`, `pts_end`): ten a second for
+audio alone, so it is for piping somewhere rather than for watching.
+`'none'` leaves the trailing row alone.
+
 ### Groups
 
 A group is what a relay forwards and what a subscriber joins at. Video
@@ -203,7 +215,7 @@ carried for wasm32-wasip2 fixes upstream does not ship yet).
 ## Exports
 
 - `publish(relay, broadcast, cert DEFAULT '', token DEFAULT '',
-  audio_group_ms DEFAULT 100)` returns `sink`: a COPY destination,
+  audio_group_ms DEFAULT 100, rows DEFAULT 'summary')` returns `sink`: a COPY destination,
   nothing comes back. It reads the whole relation - a video cell, an
   audio cell, either NULL - one rendition per row.
 - `subscribe(relay, broadcast, cert DEFAULT '', token DEFAULT '')`
