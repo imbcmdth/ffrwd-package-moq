@@ -10,6 +10,10 @@
 //!
 //! - [`group`] is that decision: where a group opens, at keyframes for
 //!   video and on a target duration for audio, which has none.
+//! - [`order`] is the same decision on the way in: a subscription
+//!   hands a track's groups over in arrival order, and [`order::Queue`]
+//!   is what puts them back in sequence, what it waits for before it
+//!   gives up on one, and what it counts while it does.
 //! - [`catalog`] is the document a broadcast describes itself with - in
 //!   the hang media layer's shape, each rendition's init segment inside
 //!   - and the names its renditions publish under.
@@ -26,6 +30,7 @@
 pub mod catalog;
 pub mod dns;
 pub mod group;
+pub mod order;
 pub mod relay;
 pub mod subscribe;
 
