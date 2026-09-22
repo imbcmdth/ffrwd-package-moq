@@ -136,12 +136,23 @@ def free_udp_port() -> int:
         return held.getsockname()[1]
 
 
-def start_relay(port: int, cert: Path, key: Path, log: Path) -> subprocess.Popen:
+def start_relay(
+    port: int, cert: Path, key: Path, log: Path, extra: list[str] | None = None
+) -> subprocess.Popen:
+    """One moq-relay on the loopback, with whatever `extra` says about its cache.
+
+    A relay left alone keeps what each track's own retention window asks for
+    and no more. `extra` is where a loop that cares says so outright
+    (`--cache-duration 300s` to hold a long backlog, `--cache-capacity 1MB` to
+    starve one on purpose), and MOQ_RELAY_ARGS adds to it from the
+    environment, for a run being poked at by hand.
+    """
     relay = tool("MOQ_RELAY", "moq-relay")
+    named = os.environ.get("MOQ_RELAY_ARGS", "").split()
     child = spawn(
         [relay, "--server-bind", f"127.0.0.1:{port}",
          "--tls-cert", str(cert), "--tls-key", str(key),
-         "--auth-public", ""],
+         "--auth-public", "", *(extra or []), *named],
         stdout=subprocess.DEVNULL, stderr=open(log, "w"),
     )
     time.sleep(1.5)
