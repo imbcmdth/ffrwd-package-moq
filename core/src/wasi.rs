@@ -17,6 +17,12 @@ use std::sync::Arc;
 use rustls::pki_types::CertificateDer;
 use rustls::RootCertStore;
 
+/// How many concurrent streams either direction of a session may have
+/// open. One MoQ group is one stream, so this is how much of a backlog
+/// a relay can hand over at once; moq-native's own default, for the
+/// same reason.
+const MAX_STREAMS: u32 = 1024;
+
 /// Where and whom to dial: the relay's address, its TLS name, and what
 /// to trust for it.
 pub struct Relay {
@@ -79,6 +85,16 @@ pub async fn connect(
 	// and the QUIC floor of 1200 always fits.
 	let mut transport = quinn::TransportConfig::default();
 	transport.mtu_discovery_config(None);
+	// How many streams the relay may have open toward this session at
+	// once. MoQ opens ONE PER GROUP, and a subscriber asking for a
+	// backlog is served hundreds of them at once: quinn's default of 100
+	// makes the relay queue the rest in `open_uni`, where a group can
+	// wait tens of seconds for credit that the wire had to spare. That
+	// is not reordering a reader can hold for - it is the relay handing
+	// over a group long after everything around it - so the window is
+	// raised to what moq-native uses for the same reason.
+	transport.max_concurrent_uni_streams(MAX_STREAMS.into());
+	transport.max_concurrent_bidi_streams(MAX_STREAMS.into());
 	config.transport_config(Arc::new(transport));
 
 	let endpoint = quinn_wasi::endpoint(
