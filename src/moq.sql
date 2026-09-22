@@ -71,7 +71,27 @@ RETURNS sink
 -- packets they were built from, so a rung crosses the graph encoded.
 --
 -- relay, cert and token read exactly as publish's do.
+--
+-- A subscription asks for the whole backlog the relay still holds, and
+-- a relay serves a backlog in its own arrival order with the newest
+-- group sent first, so the groups arrive nothing like in sequence. They
+-- are put back in order in a HOLD, since what leaves this module is
+-- packets in decode order and no stream-copy muxer takes a timestamp
+-- that goes backwards. hold_ms is how long a hole in the sequence waits
+-- for the group that would fill it: 30000, the default, is the
+-- subscription's own latency window, which is as long as the relay may
+-- still serve it. hold_mib is how much one track holds meanwhile, 64 by
+-- default, which is 30 seconds of about 17 Mbit/s. join_ms is how long
+-- a reader that has just joined waits for a lower group sequence before
+-- it fixes its cursor, 2000 by default: a cursor fixed at the first
+-- group to arrive would put the rest of the backlog below itself. A
+-- hole given up on and a group that arrives too late to be used are
+-- both counted and named in a row on the module's stderr, never dropped
+-- in silence; see the README.
 CREATE FUNCTION subscribe(relay text, broadcast text,
-                          cert text DEFAULT '', token text DEFAULT '')
+                          cert text DEFAULT '', token text DEFAULT '',
+                          hold_ms number DEFAULT 30000,
+                          hold_mib number DEFAULT 64,
+                          join_ms number DEFAULT 2000)
 RETURNS source
   AS 'target/wasm32-wasip2/release/subscribe.wasm', 'subscribe' LANGUAGE wasm;

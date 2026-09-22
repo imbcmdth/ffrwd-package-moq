@@ -11,10 +11,11 @@ use exports::ffrwd::av::packet_source::{
 	Catalog, Guest, Meta, PadPackets, RenditionMeta, SourceTrack, StreamInfo,
 };
 use ffrwd::av::types::{CodedAudio, CodedFormat, CodedStream, CodedVideo, Packet, Rational};
+use moq_core::order::{Hold, Queue};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"hold_ms":{"type":"integer","minimum":0,"default":30000,"description":"how long a hole in a track's group sequence is held open for the group that would fill it, in milliseconds; the default is the subscription's own latency window, which is as long as the relay may still serve it"},"hold_mib":{"type":"integer","minimum":1,"default":64,"description":"how much one track holds meanwhile, in MiB; 64 covers a 30s window up to about 17 Mbit/s"},"join_ms":{"type":"integer","minimum":0,"default":2000,"description":"how long a joining reader waits for a lower group sequence before it fixes its cursor, in milliseconds; 0 starts at the first group that arrives"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
 
 /// How long the relay gets to announce the broadcast, and then to hand
 /// over its catalog, before the call gives up.
@@ -26,16 +27,11 @@ const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"s
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How long a hole in a track's group sequence is held open for the
-/// group that would fill it. Groups travel over parallel streams and a
-/// relay serving a backlog sends them newest-first, so arrival order is
-/// nothing like sequence order; a group that has not arrived by this
-/// much later was lost rather than reordered, and the ones behind it go
-/// out without it.
-const GAP_WAIT: Duration = Duration::from_secs(3);
-
-/// How many groups one track holds meanwhile, whatever the clock says.
-const GAP_HOLD: usize = 256;
+/// How long one wait for the wire lasts before the hold's own clocks
+/// are looked at again. The hold releases on a deadline as well as on
+/// an arrival, so a call that parked on the channel alone would sleep
+/// through the deadline on a track that has gone quiet.
+const TICK: Duration = Duration::from_millis(20);
 
 /// How many times a track whose wire broke is taken up again, and how
 /// long between tries. A relay serving a public network drops a stream
@@ -65,6 +61,27 @@ struct Params {
 	// the query text already carries.
 	#[serde(default)]
 	token: String,
+	/// The hold, per track: see [`moq_core::order`]. A run whose relay
+	/// keeps less history than this package asks for, or one that would
+	/// rather stall for less time, says so here.
+	#[serde(default = "default_hold_ms")]
+	hold_ms: u64,
+	#[serde(default = "default_hold_mib")]
+	hold_mib: u64,
+	#[serde(default = "default_join_ms")]
+	join_ms: u64,
+}
+
+fn default_hold_ms() -> u64 {
+	moq_core::order::HOLD_WAIT.as_millis() as u64
+}
+
+fn default_hold_mib() -> u64 {
+	moq_core::order::HOLD_BYTES >> 20
+}
+
+fn default_join_ms() -> u64 {
+	moq_core::order::JOIN_SETTLE.as_millis() as u64
 }
 
 fn parse_params(params: &str) -> Result<Params, String> {
@@ -108,12 +125,24 @@ enum Wire {
 	/// One complete group: its sequence and its frames, each frame a
 	/// complete fmp4 fragment.
 	Group(usize, u64, Vec<Bytes>),
+	/// The relay was asked for one group outright and would not serve
+	/// it: it does not have it, so the hole waiting for it is a hole
+	/// nothing will fill. Carries why.
+	Gone(usize, u64, String),
+	/// The track was taken up again on a fresh subscription, which
+	/// starts at the live edge: whatever the hold is waiting for is not
+	/// coming.
+	Restarted(usize),
+	/// A track's reader has finished: the publisher ended it, or the
+	/// wire broke past mending. Which track it was does not matter -
+	/// what the run waits for is all of them.
+	Finished,
 	/// The track failed, and why.
 	Failed(usize, String),
 }
 
-/// One rendition being read: how to take its fragments apart, where
-/// its groups have got to, and whether its packets have started.
+/// One rendition being read: how to take its fragments apart, where its
+/// groups have got to, and whether its packets have started.
 struct Rendition {
 	track: ffrwd_bmff::track::Track,
 	video: bool,
@@ -123,12 +152,8 @@ struct Rendition {
 	/// Where this reader may start, and what a fragment carrying
 	/// nothing for the track means.
 	join: moq_core::group::Join,
-	/// Completed groups waiting for the one before them.
-	pending: std::collections::BTreeMap<u64, Vec<Bytes>>,
-	/// The next group in sequence; None until the first goes out.
-	cursor: Option<u64>,
-	/// When the hole at the head of `pending` opened; see [`GAP_WAIT`].
-	gap_since: Option<std::time::Instant>,
+	/// The group sequence this rendition's fragments arrive in.
+	queue: Queue,
 }
 
 /// Every track being read, and the session under them.
@@ -137,6 +162,17 @@ struct Reader {
 	session: Option<moq_net::Session>,
 	renditions: Vec<Rendition>,
 	frames: mpsc::UnboundedReceiver<Wire>,
+	/// The broadcast, and a sender into the channel above: what a fetch
+	/// for a missing group needs. Holding a sender is why the end of the
+	/// run is counted rather than read off a closed channel.
+	broadcast: moq_net::broadcast::Consumer,
+	sender: mpsc::UnboundedSender<Wire>,
+	/// Tracks whose reader has finished, and the groups a hole is
+	/// waiting on an answer for.
+	finished: usize,
+	asking: Vec<(usize, u64)>,
+	/// What every track's hold is bounded by.
+	hold: Hold,
 }
 
 /// The executor and the reader it drives, split so a call can block on
@@ -354,9 +390,7 @@ fn catalog_of(
 				true => moq_core::group::Join::video(),
 				false => moq_core::group::Join::audio(),
 			},
-			pending: std::collections::BTreeMap::new(),
-			cursor: None,
-			gap_since: None,
+			queue: Queue::new(rendition.name.clone()),
 		});
 	}
 	Ok((
@@ -385,19 +419,30 @@ impl Reader {
 			while let Ok(wire) = self.frames.try_recv() {
 				self.hold(wire)?;
 			}
-			produced |= self.release(&mut pads, false)?;
+			produced |= self.release(&mut pads, self.over())?;
+			self.ask();
+			self.report();
 			if produced {
 				break;
 			}
-			// Nothing ready: wait for the wire. Every reader task is
-			// gone once every track has finished, which closes this and
-			// makes whatever is still held the last of it.
-			match self.frames.recv().await {
-				Some(wire) => self.hold(wire)?,
-				None => {
-					produced |= self.release(&mut pads, true)?;
-					return Ok(produced.then(|| into_pads(pads)));
+			if self.over() {
+				// Every track has finished and no answer is outstanding:
+				// whatever was held has just gone out, and this is the
+				// end of the run.
+				for rendition in &mut self.renditions {
+					rendition.queue.report(true);
 				}
+				return Ok(produced.then(|| into_pads(pads)));
+			}
+			// Nothing ready: wait for the wire, but only for a tick. The
+			// hold releases on a deadline as well as on an arrival, and a
+			// track that has gone quiet would otherwise sleep through it.
+			match tokio::time::timeout(TICK, self.frames.recv()).await {
+				Ok(Some(wire)) => self.hold(wire)?,
+				// Nothing holds a sender but this reader, so the channel
+				// closes only if it has been dropped out from under us.
+				Ok(None) => return Ok(None),
+				Err(_) => {}
 			}
 		}
 
@@ -410,6 +455,7 @@ impl Reader {
 				self.hold(wire)?;
 			}
 			self.release(&mut pads, false)?;
+			self.ask();
 			idle = if arrived { 0 } else { idle + 1 };
 			if idle >= IDLE_TURNS {
 				break;
@@ -418,19 +464,63 @@ impl Reader {
 		Ok(Some(into_pads(pads)))
 	}
 
-	/// Files one completed group under its track, or fails the pull when
-	/// a track did. A group behind one already sent is dropped: its place
-	/// in the sequence has passed.
-	fn hold(&mut self, wire: Wire) -> Result<(), String> {
-		let (index, sequence, frames) = match wire {
-			Wire::Group(index, sequence, frames) => (index, sequence, frames),
-			Wire::Failed(index, err) => return Err(format!("track {index}: {err}")),
-		};
-		let rendition = &mut self.renditions[index];
-		if rendition.cursor.is_some_and(|next| sequence < next) {
-			return Ok(());
+	/// Whether the run is over: every track's reader has finished and
+	/// no track is still waiting for an answer about a missing group.
+	fn over(&self) -> bool {
+		self.finished >= self.renditions.len()
+			&& self
+				.renditions
+				.iter()
+				.all(|rendition| rendition.queue.fetching.is_none())
+	}
+
+	/// Asks the relay for the groups the holds have given up waiting
+	/// for, one task apiece. They answer into the same channel the
+	/// subscriptions do.
+	fn ask(&mut self) {
+		for (index, sequence) in self.asking.drain(..) {
+			let name = self.renditions[index].queue.name.clone();
+			tokio::task::spawn_local(fetch_group(
+				index,
+				self.broadcast.clone(),
+				name,
+				sequence,
+				self.hold.wait(),
+				self.sender.clone(),
+			));
 		}
-		rendition.pending.insert(sequence, frames);
+	}
+
+	/// What each track has done, every [`REPORT_EVERY`].
+	fn report(&mut self) {
+		for rendition in &mut self.renditions {
+			if rendition
+				.queue
+				.reported
+				.is_none_or(|sent| sent.elapsed() >= moq_core::order::REPORT_EVERY)
+			{
+				rendition.queue.report(false);
+			}
+		}
+	}
+
+	/// Files one completed group under its track, or fails the pull when
+	/// a track did. What each kind of word means is [`Queue`]'s business.
+	fn hold(&mut self, wire: Wire) -> Result<(), String> {
+		match wire {
+			Wire::Group(index, sequence, frames) => {
+				self.renditions[index].queue.push(sequence, frames)
+			}
+			Wire::Gone(index, sequence, why) => {
+				self.renditions[index].queue.refused(sequence, &why)
+			}
+			Wire::Restarted(index) => self.renditions[index].queue.restarted = true,
+			Wire::Finished => self.finished += 1,
+			Wire::Failed(index, err) => {
+				let name = &self.renditions[index].queue.name;
+				return Err(format!("track '{name}': {err}"));
+			}
+		}
 		Ok(())
 	}
 
@@ -439,34 +529,17 @@ impl Reader {
 	/// nothing more is coming. True when packets went out.
 	fn release(&mut self, pads: &mut [Vec<Packet>], last: bool) -> Result<bool, String> {
 		let mut any = false;
+		let hold = self.hold;
+		let asking = &mut self.asking;
+		let mut ask = Vec::new();
 		for (index, (rendition, pad)) in self.renditions.iter_mut().zip(pads.iter_mut()).enumerate()
 		{
-			loop {
-				let Some((&oldest, _)) = rendition.pending.iter().next() else {
-					rendition.gap_since = None;
-					break;
-				};
-				let ready = match rendition.cursor {
-					// The first group out is where the sequence starts.
-					None => true,
-					Some(next) if oldest == next => true,
-					Some(_) => {
-						let since = *rendition
-							.gap_since
-							.get_or_insert_with(std::time::Instant::now);
-						last || since.elapsed() >= GAP_WAIT || rendition.pending.len() > GAP_HOLD
-					}
-				};
-				if !ready {
-					break;
-				}
-				let frames = rendition.pending.remove(&oldest).expect("just found");
-				rendition.cursor = Some(oldest + 1);
-				rendition.gap_since = None;
+			while let Some((_, frames)) = rendition.queue.take(hold, last, &mut ask) {
 				for fragment in frames {
 					any |= take_fragment(rendition, index, &fragment, pad)?;
 				}
 			}
+			asking.extend(ask.drain(..).map(|sequence| (index, sequence)));
 		}
 		Ok(any)
 	}
@@ -528,10 +601,12 @@ impl Guest for Subscribe {
 	fn describe() -> Meta {
 		Meta {
 			name: "subscribe".to_string(),
-			version: "0.4.0".to_string(),
+			version: "0.5.0".to_string(),
 			params_schema: PARAMS_SCHEMA.to_string(),
-			// A source emits no rows.
-			rows_schema: String::new(),
+			// A packet source has no row channel in `ffrwd:av`, so this
+			// is the shape of the rows that go to stderr instead; see
+			// [`moq_core::order::ROWS_SCHEMA`].
+			rows_schema: moq_core::order::ROWS_SCHEMA.to_string(),
 			// No decoded payload ever crosses, so no format list fills in.
 			pixel_formats: vec![],
 			sample_formats: vec![],
@@ -580,7 +655,7 @@ impl Guest for Subscribe {
 			let (catalog, renditions) = catalog_of(&opened.renditions, &order)?;
 			// Only the tracks this run was told to pull are subscribed
 			// to, and each becomes the pad at its place in `order`.
-			let (sender, frames) = mpsc::unbounded_channel();
+			let (sender, frames) = mpsc::unbounded_channel::<Wire>();
 			for (pad, &index) in order.iter().enumerate() {
 				let rendition = &opened.renditions[index];
 				// Subscribed once here, so a name the broadcast does not
@@ -594,9 +669,6 @@ impl Guest for Subscribe {
 					sender.clone(),
 				));
 			}
-			// The last sender here, so the receiver closes once every
-			// reader task has finished its track.
-			drop(sender);
 			Ok::<_, String>((
 				catalog,
 				Reader {
@@ -604,6 +676,11 @@ impl Guest for Subscribe {
 					session: Some(opened.session),
 					renditions,
 					frames,
+					broadcast: opened.broadcast,
+					sender,
+					finished: 0,
+					asking: Vec::new(),
+					hold: Hold::new(params.hold_ms, params.hold_mib, params.join_ms),
 				},
 			))
 		})?;
@@ -654,7 +731,50 @@ async fn subscribe_track(
 		.map_err(|err| format!("track '{name}': {err}"))
 }
 
-/// One track's groups onto the shared channel until it finishes.
+/// One group asked for by sequence, outside any subscription.
+///
+/// What a hold does when a hole has stood open for its whole window:
+/// rather than guess whether the group is still coming, ask the relay
+/// for it. A relay that has it in its cache serves it here and the hole
+/// closes; one that does not refuses, and the refusal - not a clock -
+/// is what lets the cursor step over the hole. No answer inside the
+/// window counts as a refusal, since the hold has to move eventually.
+async fn fetch_group(
+	index: usize,
+	broadcast: moq_net::broadcast::Consumer,
+	name: String,
+	sequence: u64,
+	wait: Duration,
+	sender: mpsc::UnboundedSender<Wire>,
+) {
+	let asked = async {
+		let track = broadcast
+			.track(&name)
+			.map_err(|err| format!("track '{name}': {err}"))?;
+		let mut group = track
+			.fetch_group(sequence, None)
+			.await
+			.map_err(|err| err.to_string())?;
+		let mut frames = Vec::new();
+		while let Some(frame) = group.read_frame().await.map_err(|err| err.to_string())? {
+			frames.push(frame.payload);
+		}
+		Ok::<_, String>(frames)
+	};
+	let wire = match tokio::time::timeout(wait, asked).await {
+		Ok(Ok(frames)) => Wire::Group(index, sequence, frames),
+		Ok(Err(err)) => Wire::Gone(index, sequence, err),
+		Err(_) => Wire::Gone(
+			index,
+			sequence,
+			format!("no answer within {}s", wait.as_secs()),
+		),
+	};
+	let _ = sender.send(wire);
+}
+
+/// One track's groups onto the shared channel until it finishes, and
+/// the word that it has.
 ///
 /// Frames are gathered per group and the group goes out whole: the
 /// stream reads a group to completion before the next, so the first
@@ -670,6 +790,20 @@ async fn read_track(
 	name: String,
 	subscriber: moq_net::track::Subscriber,
 	sender: mpsc::UnboundedSender<Wire>,
+) {
+	read_groups(index, broadcast, name, subscriber, &sender).await;
+	// The reader holds no sender of its own once this returns, so the
+	// end of the run is counted rather than read off a closed channel:
+	// a fetch for a missing group answers on the same one.
+	let _ = sender.send(Wire::Finished);
+}
+
+async fn read_groups(
+	index: usize,
+	broadcast: moq_net::broadcast::Consumer,
+	name: String,
+	subscriber: moq_net::track::Subscriber,
+	sender: &mpsc::UnboundedSender<Wire>,
 ) {
 	let mut stream = moq_core::subscribe::FrameStream::new(subscriber);
 	let mut attempts = 0u32;
@@ -719,7 +853,15 @@ async fn read_track(
 		// subscription rather than serve it will do so again, and the
 		// latest group is what it does have.
 		match subscribe_track(&broadcast, &name, false).await {
-			Ok(subscriber) => stream = moq_core::subscribe::FrameStream::new(subscriber),
+			Ok(subscriber) => {
+				// The new subscription starts at the live edge, so the
+				// groups between are gone: the hold is told, rather than
+				// left waiting out its whole window for one of them.
+				if sender.send(Wire::Restarted(index)).is_err() {
+					return;
+				}
+				stream = moq_core::subscribe::FrameStream::new(subscriber);
+			}
 			Err(err) => {
 				let _ = sender.send(Wire::Failed(index, err));
 				return;
@@ -729,3 +871,4 @@ async fn read_track(
 }
 
 export!(Subscribe);
+
