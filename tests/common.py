@@ -5,6 +5,10 @@ whole process tree - `taskkill /T` on Windows, the process group elsewhere -
 because a killed direct child (uv, say) leaves its ffmpeg and sidecar holding
 the output pipes, and a harness that then waits for pipe EOF waits forever.
 
+`Tail` is the other half: a child whose rows are read while it runs, which is
+what a loop needs when it has to know what the publisher has published before
+it decides when to attach a reader.
+
 Toolchain overrides: WASMTIME, MOQ_RELAY, WASI_SDK_PATH (or CC_wasm32_wasip2
 directly), FFRWD_WASM for the sidecar binary, FFRWD_CLI for an installed
 ffrwd, FFRWD_REPO for the checkout holding the compiler and the sidecar.
@@ -12,10 +16,12 @@ ffrwd, FFRWD_REPO for the checkout holding the compiler and the sidecar.
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -128,6 +134,95 @@ def run(argv: list[str], deadline: int, **kwargs) -> subprocess.CompletedProcess
             shown = shown.decode(errors="replace")
         sys.exit(f"deadline ({deadline}s) expired: {argv[0]}\n{shown[-1200:]}")
     return subprocess.CompletedProcess(argv, child.returncode, stdout, stderr)
+
+
+class Tail:
+    """A child's stdout and stderr drained as they come, kept whole.
+
+    Both pipes are read by threads: a publisher writing a row per group
+    fills a pipe nobody drains, and so does a subscriber reporting on its
+    hold.
+
+    `dump` is where `ffrwd run` was told to write every member's own
+    stderr (FFRWD_DUMP_STDERR). A run leaves the sidecar's stderr to the
+    CLI, which keeps it to itself unless the run failed, so this is where
+    the module's rows are read from.
+    """
+
+    def __init__(self, child: subprocess.Popen, dump: Path | None = None) -> None:
+        self.child = child
+        self.dump = dump
+        self.out: list[str] = []
+        self.err: list[str] = []
+        self.rows: list[dict] = []
+        self.lock = threading.Lock()
+        self.threads = [
+            threading.Thread(target=self._drain, args=(child.stdout, self.out, True), daemon=True),
+            threading.Thread(target=self._drain, args=(child.stderr, self.err, False), daemon=True),
+        ]
+        for thread in self.threads:
+            thread.start()
+
+    def _drain(self, pipe, into: list[str], parse: bool) -> None:
+        if pipe is None:
+            return
+        for line in pipe:
+            with self.lock:
+                into.append(line)
+                if parse and line.lstrip().startswith("{"):
+                    try:
+                        self.rows.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+
+    def group_rows(self, kind: str) -> list[dict]:
+        """The publisher's per-group rows for the audio or the video tracks.
+
+        A track's name says its kind: the publisher's own fallback names
+        are `video`, `video.<height>p` and `audio`, so the first letter
+        is enough and a ladder's rungs all read as video.
+        """
+        with self.lock:
+            rows = list(self.rows)
+        audio = kind == "audio"
+        return [
+            row for row in rows
+            if "group" in row and row.get("track", "").startswith("a") == audio
+        ]
+
+    def module_stderr(self) -> str:
+        """What the run's own members wrote, plus what the CLI passed on."""
+        with self.lock:
+            mine = "".join(self.err)
+        if self.dump is None or not self.dump.is_dir():
+            return mine
+        members = sorted(self.dump.glob("*.stderr"))
+        return mine + "".join(path.read_text(errors="replace") for path in members)
+
+    def counters(self) -> list[dict]:
+        """The subscribe module's own rows, off its stderr."""
+        out = []
+        for line in self.module_stderr().splitlines():
+            marker = line.find("subscribe: row ")
+            if marker >= 0:
+                try:
+                    out.append(json.loads(line[marker + len("subscribe: row "):]))
+                except json.JSONDecodeError:
+                    pass
+        return out
+
+    def text(self) -> tuple[str, str]:
+        with self.lock:
+            return "".join(self.out), "".join(self.err)
+
+    def finish(self, deadline: int) -> int:
+        try:
+            self.child.wait(timeout=deadline)
+        except subprocess.TimeoutExpired:
+            kill_tree(self.child)
+        for thread in self.threads:
+            thread.join(timeout=30)
+        return self.child.returncode
 
 
 def free_udp_port() -> int:

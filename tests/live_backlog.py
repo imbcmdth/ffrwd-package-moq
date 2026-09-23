@@ -3,12 +3,12 @@
     python tests/live_backlog.py [--seconds N] [--keepalive N] [--work DIR]
                                  [--report-only] [--keep]
 
-A subscriber that joins a broadcast already running asks for the backlog,
-and a relay serves a backlog in the order the groups arrived while sending
-the newest one first. So the groups land wildly out of sequence: two
-minutes of audio is six hundred of them, and they come back in something
-close to reverse order. What this loop proves is that none of them is
-thrown away.
+A subscriber that asks for the backlog - the `start` argument, since
+0.6.5; before it every subscribe did - is served by the relay in the order
+the groups arrived, newest one first. So the groups land wildly out of
+sequence: two minutes of audio is six hundred of them, and they come back
+in something close to reverse order. What this loop proves is that none of
+them is thrown away.
 
 The shape of a run: one publisher writes two renditions to a local relay.
 The media rendition is the audio of a `--seconds` file read UNPACED, so
@@ -44,12 +44,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 
 from common import (
     PACKAGE,
+    Tail,
     build_guests,
     ffrwd_argv,
     free_udp_port,
@@ -100,19 +100,23 @@ COPY (
 
 # The subscriber: the rendition with no geometry is the audio one, which
 # is the media. Stream-copied to the destination, packet for packet. The
-# hold is spelled out so a run can starve it on purpose.
+# hold is spelled out so a run can starve it on purpose, and so is the
+# BACKLOG: a subscribe joins at the live edge unless it is asked not to,
+# and what this loop is about is the other end.
 SUBSCRIBE_QUERY = """
 COPY (
   SELECT s.audio[1]
   FROM ffrwd.moq.subscribe(:'relay', :'broadcast', COALESCE(:'cert', ''), '',
+                           'backlog',
                            COALESCE(:hold_ms, 30000), COALESCE(:hold_mib, 64),
                            COALESCE(:join_ms, 2000)) s
   WHERE s.height IS NULL
 ) TO :'dest'
 """
 
-# The same against a package whose subscribe takes no hold: what 0.6.3
-# and before are measured with, for a before and after over one loop.
+# The same against a package whose subscribe takes neither a hold nor a
+# start: what 0.6.4 and before are measured with, for a before and after
+# over one loop. Those versions always asked for the backlog.
 PLAIN_QUERY = """
 COPY (
   SELECT s.audio[1]
@@ -138,95 +142,6 @@ def make_sources(source: Path, keepalive: Path, seconds: int, keep_seconds: int)
     ], TOOL_DEADLINE, capture_output=True, text=True)
     if done.returncode != 0:
         sys.exit(f"building the keepalive source failed:\n{done.stderr[-800:]}")
-
-
-class Tail:
-    """A child's stdout and stderr drained as they come, kept whole.
-
-    Both pipes are read by threads: a publisher writing a row per group
-    fills a pipe nobody drains, and so does a subscriber reporting on its
-    hold.
-
-    `dump` is where `ffrwd run` was told to write every member's own
-    stderr (FFRWD_DUMP_STDERR). A run leaves the sidecar's stderr to the
-    CLI, which keeps it to itself unless the run failed, so this is where
-    the module's rows are read from.
-    """
-
-    def __init__(self, child: subprocess.Popen, dump: Path | None = None) -> None:
-        self.child = child
-        self.dump = dump
-        self.out: list[str] = []
-        self.err: list[str] = []
-        self.rows: list[dict] = []
-        self.lock = threading.Lock()
-        self.threads = [
-            threading.Thread(target=self._drain, args=(child.stdout, self.out, True), daemon=True),
-            threading.Thread(target=self._drain, args=(child.stderr, self.err, False), daemon=True),
-        ]
-        for thread in self.threads:
-            thread.start()
-
-    def _drain(self, pipe, into: list[str], parse: bool) -> None:
-        if pipe is None:
-            return
-        for line in pipe:
-            with self.lock:
-                into.append(line)
-                if parse and line.lstrip().startswith("{"):
-                    try:
-                        self.rows.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        pass
-
-    def group_rows(self, kind: str) -> list[dict]:
-        """The publisher's per-group rows for the audio or the video track.
-
-        A track's name says its kind here the way it does in live_burst:
-        the audio rendition's name begins with `a`.
-        """
-        with self.lock:
-            rows = list(self.rows)
-        audio = kind == "audio"
-        return [
-            row for row in rows
-            if "group" in row and row.get("track", "").startswith("a") == audio
-        ]
-
-    def module_stderr(self) -> str:
-        """What the run's own members wrote, plus what the CLI passed on."""
-        with self.lock:
-            mine = "".join(self.err)
-        if self.dump is None or not self.dump.is_dir():
-            return mine
-        members = sorted(self.dump.glob("*.stderr"))
-        return mine + "".join(path.read_text(errors="replace") for path in members)
-
-    def counters(self) -> list[dict]:
-        """The subscribe module's own rows, off its stderr."""
-        lines = self.module_stderr().splitlines()
-        out = []
-        for line in lines:
-            marker = line.find("subscribe: row ")
-            if marker >= 0:
-                try:
-                    out.append(json.loads(line[marker + len("subscribe: row "):]))
-                except json.JSONDecodeError:
-                    pass
-        return out
-
-    def text(self) -> tuple[str, str]:
-        with self.lock:
-            return "".join(self.out), "".join(self.err)
-
-    def finish(self, deadline: int) -> int:
-        try:
-            self.child.wait(timeout=deadline)
-        except subprocess.TimeoutExpired:
-            kill_tree(self.child)
-        for thread in self.threads:
-            thread.join(timeout=30)
-        return self.child.returncode
 
 
 def start_publisher(query: Path, source: Path, keepalive: Path, port: int,
@@ -384,11 +299,16 @@ def judge(name: str, published: list[dict], reader: Tail, dest: Path,
         )
     if summary["dropped_late"]:
         failures.append(f"{summary['dropped_late']} groups arrived below the cursor")
-    if delivered + int(summary["dropped_late"]) + int(summary["repeated"]) != received:
+    # A backlog join starts at the lowest sequence it is given, so it
+    # steps over nothing: `skipped_join` is a live join's business.
+    if summary.get("skipped_join"):
+        failures.append(f"{summary['skipped_join']} groups stepped over at the join")
+    accounted = (delivered + int(summary["dropped_late"]) + int(summary["repeated"])
+                 + int(summary.get("skipped_join", 0)))
+    if accounted != received:
         failures.append(
-            f"{received} groups received, and {delivered} delivered plus "
-            f"{summary['dropped_late']} late plus {summary['repeated']} repeated "
-            "does not account for them"
+            f"{received} groups received, and {accounted} delivered, late, "
+            "repeated or stepped over does not account for them"
         )
     if delivered != last - first + 1:
         failures.append(
@@ -455,7 +375,7 @@ def judge_starved(published: list[dict], reader: Tail, dest: Path) -> bool:
             f"{summary['dropped_late']} groups came too late and {len(late)} named"
         )
     accounted = (int(summary["delivered"]) + int(summary["dropped_late"])
-                 + int(summary["repeated"]))
+                 + int(summary["repeated"]) + int(summary.get("skipped_join", 0)))
     if accounted != int(summary["received"]):
         failures.append(
             f"{summary['received']} received and {accounted} accounted for"
@@ -619,8 +539,9 @@ def main() -> None:
     parser.add_argument("--no-starve", dest="starve", action="store_false",
                         help="leave out the reader whose hold is too small")
     parser.add_argument("--plain", action="store_true",
-                        help="a subscribe that takes no hold arguments, which is "
-                             "how a package older than 0.6.4 is measured")
+                        help="a subscribe that takes neither hold nor start "
+                             "arguments, which is how a package older than "
+                             "0.6.5 is measured")
     parser.add_argument("--keep", action="store_true", help="keep the work directory")
     args = parser.parse_args()
     one_run(args)
