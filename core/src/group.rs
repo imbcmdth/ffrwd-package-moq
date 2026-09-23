@@ -2,9 +2,10 @@
 //! start on the way in. This package's own transport convention, in
 //! both directions.
 //!
-//! A subscription begins at the LATEST group and no decoder can start
-//! in the middle of one, so where the groups are cut is what decides
-//! where a subscriber may join. That is a transport decision rather
+//! A subscription begins at the LATEST group by default and no decoder
+//! can start in the middle of one, so where the groups are cut is what
+//! decides where a subscriber may join, and how far behind live it
+//! lands when it does. That is a transport decision rather
 //! than anything a container says, which is why it lives here and not
 //! in the muxer: [`ffrwd_bmff::mux`] hands back one fragment per
 //! sample and says nothing about what a group is.
@@ -121,11 +122,17 @@ impl Groups {
 /// Where a reader may start, once it has joined a broadcast already
 /// running.
 ///
-/// A subscription begins at the group in flight rather than at its
-/// start, so a video track's first fragments may sit past the keyframe
-/// their group opened with. Those samples are a group no decoder can
-/// begin at, so they are absorbed rather than passed on. Audio has no
-/// such gate: every AAC frame can be decoded from.
+/// A video track's first fragments may sit past the keyframe their
+/// group opened with - a group served from part way through, a
+/// publisher that cuts its groups somewhere else, a track taken up
+/// again after the wire broke. Those samples are a picture no decoder
+/// can begin in, so they are absorbed rather than passed on. Audio has
+/// no such gate: every AAC frame can be decoded from.
+///
+/// It is the LAST gate, not the first. Which group a reader starts at
+/// is [`crate::order::Queue`]'s, and on a live join it already picks
+/// one whose first frame is a keyframe; see
+/// [`crate::subscribe::Start`].
 pub struct Join {
 	started: bool,
 }

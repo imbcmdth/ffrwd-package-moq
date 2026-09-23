@@ -5,8 +5,8 @@
 //! order and read to completion; the stream ends when the publisher
 //! finishes the track.
 //!
-//! Beside it, what any subscriber does before the media: the
-//! subscription a reader asks for ([`from_start`]) and the one
+//! Beside it, what any subscriber does before the media: where a
+//! reader joins a broadcast already running ([`Start`]) and the one
 //! document off [`crate::catalog::TRACK`] that says what a broadcast
 //! carries ([`read_catalog`]).
 
@@ -16,28 +16,88 @@ use bytes::Bytes;
 
 use crate::Error;
 
-/// How long a backlogged group is waited for rather than skipped. The
-/// default drops a non-latest group the moment a newer one exists,
-/// which is the opposite of what a reader feeding a pipeline wants.
+/// How long a group that is no longer the latest is waited for rather
+/// than skipped, on the wire and in this package's own hold.
+///
+/// This is moq-net's `latency_max`, and the number matters because the
+/// value it replaces is zero: "The maximum age of a non-latest group
+/// before it is skipped. `Duration::ZERO` skips immediately (e.g. group
+/// 8 arriving means group 7 is skipped); a larger value tolerates that
+/// much reordering before giving up on the older group." A subscription
+/// left at its default therefore loses a group the moment a newer one
+/// exists, which is what a player wanting the smallest delay takes and
+/// the opposite of what a reader feeding a pipeline wants. Every
+/// subscription this package opens asks for 30 seconds instead.
+///
+/// It is a REQUEST. The publisher's own track window caps it - this
+/// package publishes with the same 30 seconds - and a relay's
+/// `--cache-duration` caps that in turn.
 pub const BACKLOG: Duration = Duration::from_secs(30);
 
-/// Every group the publisher still holds, in order, tolerating
-/// backlog: a reader joins at the oldest group still cached, which on
-/// a broadcast that has been running is the live edge less its
-/// retention window.
-///
-/// The alternative - the latest group alone, which is what a default
-/// subscription asks for - is what a player wanting the smallest delay
-/// takes, and it is not what a reader feeding a pipeline wants: the
-/// default skips a group the moment a newer one exists, so a publisher
-/// running ahead of real time loses most of what it sent.
+/// Where a reader joins a broadcast that is already running.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Start {
+	/// At the live edge, which is the default: the publisher serves from
+	/// its newest group and the reader starts at the first group it can
+	/// decode from. A node reading a live broadcast is then one group
+	/// behind it rather than a retention window behind it.
+	#[default]
+	Live,
+	/// At the oldest group the publisher still holds, which on a
+	/// broadcast that has been running is the live edge less its
+	/// retention window.
+	///
+	/// What this is for is a publisher running AHEAD of real time - a
+	/// file poured into a relay as fast as it will take it - and a
+	/// reader that wants every frame of it rather than the newest ones.
+	/// It is the capture tool, and it costs the whole backlog's delay
+	/// before the first packet comes out.
+	Backlog,
+}
+
+impl Start {
+	/// The name a query spells this with.
+	pub fn parse(text: &str) -> Result<Self, String> {
+		match text {
+			"live" => Ok(Start::Live),
+			"backlog" => Ok(Start::Backlog),
+			other => Err(format!(
+				"start is 'live' (join at the live edge) or 'backlog' (take what the relay still \
+				 holds), and not '{other}'"
+			)),
+		}
+	}
+
+	/// The subscription this asks the publisher for.
+	pub fn subscription(self) -> moq_net::track::Subscription {
+		match self {
+			Start::Live => live_edge(),
+			Start::Backlog => from_start(),
+		}
+	}
+}
+
+/// Every group the publisher still holds, in order: a `group_start` of
+/// 0 asks to be served from the oldest sequence there can be, and what
+/// arrives is whatever of it is still in the cache.
 pub fn from_start() -> moq_net::track::Subscription {
 	live_edge().with_group_start(0)
 }
 
-/// The same, from the latest group instead: what a relay that will not
-/// serve a backlog leaves, and all a broadcast running for hours has
-/// near its edge anyway.
+/// From the publisher's newest group instead, which is what leaving
+/// `group_start` unset means: "First group the publisher should
+/// deliver, or `None` to start at the latest group."
+///
+/// What it does NOT mean is that the newest group keeps being jumped
+/// to. moq-net's publisher fixes the cursor once, at the group that was
+/// latest when the subscription was accepted - `start_group.or_else(||
+/// track.latest())` - and from there serves every group in arrival
+/// order off that one cursor. A reader that falls behind is not skipped
+/// ahead; it loses a group only if the publisher's cache evicts one
+/// before the serving loop reaches it, and that is [`BACKLOG`] of the
+/// group going untouched. So a live node that lags catches up, which is
+/// what a node should do, and a node lagging by more than the window
+/// has a problem no transport setting papers over.
 pub fn live_edge() -> moq_net::track::Subscription {
 	moq_net::track::Subscription::default()
 		.with_ordered(true)
