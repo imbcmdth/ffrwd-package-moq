@@ -3,7 +3,8 @@
 -- instead of filtered. NULLS LAST is what makes it the tallest rung
 -- rather than the audio row, since DESC alone sorts a row with no
 -- height first. The audio comes from its own row, the way subscribe
--- takes it.
+-- takes it. Both halves join at the LIVE EDGE, which is subscribe's
+-- default; see subscribe.sql and the README.
 -- variables: relay (relay URL, host by name or IP), broadcast (broadcast path), dest (output file path), cert (a private relay's certificate, DER as hex; leave unset for a public relay), token (an auth token the relay demands; leave unset if it demands none)
 -- example: ffrwd compile -f packages/ffrwd/moq/recipes/subscribe-widest.sql -v relay=moqt://127.0.0.1:4443 -v broadcast=live/demo -v dest=top.mp4
 COPY (

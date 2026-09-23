@@ -147,17 +147,92 @@ What a broadcast carries decides the shape of a query over it. A
 demuxed ladder puts a rung's video and the broadcast's audio on
 different rows; a muxed broadcast carries both on one row.
 
+### Where a reader joins
+
+`start` says which end of a running broadcast to join at. It is `'live'`
+by default, and that is the answer for anything reading a live stream:
+
+```pgsql
+COPY (
+  SELECT s.video[1], s.audio[1]
+  FROM ffrwd.moq.subscribe(:'relay', :'from') s
+) TO ffrwd.moq.publish(:'relay', :'into')
+```
+
+**A live join is one GROUP behind the broadcast.** The publisher serves
+a live subscription from its newest group, and the reader starts at the
+first group it can decode from:
+
+- **video**, at the first group whose FIRST FRAME is a keyframe. Every
+  MoQ group here opens at a keyframe, by this package's convention and
+  by hang's, but the join is exactly where trusting that would buy a
+  broken picture, so the flag is read off the packets. That puts the
+  first picture out of a live join up to one GOP old - 1 second at
+  `gop 30` and 30 fps.
+- **audio**, at the first whole group, every AAC frame being a sync
+  sample. That is `audio_group_ms`, so 200 ms by default.
+
+A ladder joined in one query joins together: every track's subscription
+is registered before any of them is waited on, so they all take the same
+edge rather than each one a round trip further along. Measured against a
+local relay, a session pulling two video rungs and the audio joined all
+three within 0.59 seconds of media of each other, every track one group
+from the publisher's newest.
+
+**`'backlog'` is the other end**, and what every version before 0.6.5
+did: join at the oldest group the relay still holds. That is a retention
+window of delay before the first packet comes out, and on a broadcast
+that has been running it means reading the whole cache first. It is for
+a publisher running AHEAD of real time - a file poured into a relay as
+fast as it will take it - and a reader that wants every frame rather
+than the newest. It is the capture tool:
+
+```pgsql
+COPY (
+  SELECT s.audio[1]
+  FROM ffrwd.moq.subscribe(:'relay', :'broadcast', '', '', 'backlog') s
+  WHERE s.height IS NULL
+) TO 'whole.mkv'
+```
+
+A wasm function's arguments are positional, so `start` sits fifth,
+before the three hold numbers 0.6.4 added - `subscribe(relay, broadcast,
+cert, token, start, hold_ms, hold_mib, join_ms)`. A query written
+against 0.6.4 that passed `hold_ms` positionally has to move it along
+one.
+
+**What a live subscription does when the reader lags.** moq-net's
+`group_start` is "the first group the publisher should deliver, or
+`None` to start at the latest group", and `None` is what a live join
+sends. The publisher fixes that cursor ONCE, at the group that was
+latest when it accepted the subscription (`start_group.or_else(||
+track.latest())`), and from there serves every group in arrival order
+off that one cursor. A reader that falls behind is never skipped
+forward; it loses a group only if the publisher's cache evicts one
+before the serving loop reaches it, and that takes `latency_max` of the
+group going untouched - 30 seconds, here, both on the wire and in the
+publisher's own retention window. So a node that lags catches up, which
+is what a node should do. It is a `latency_max` of ZERO - moq-net's own
+default, which this package never sends - that "skips a non-latest group
+the moment a newer one exists".
+
+Measured: a live reader joined a paced broadcast a minute into it and
+was loaded on purpose while it read. It delivered every group from the
+join to the end of the broadcast in sequence, with nothing abandoned and
+nothing arriving below the cursor. `tests/live_edge.py` is that loop.
+
 ### The hold
 
-A subscription asks for the whole backlog the relay still holds, and a
-relay serves a backlog in its own arrival order with the newest group
-sent first. So the groups arrive nothing like in sequence: reading two
-minutes of audio back off a local relay, this package measured a hold
-556 groups deep before the oldest one landed, and blocks of a dozen
-groups arriving tens of seconds behind their neighbours with the track
-silent in between. What leaves this module is packets in decode order,
-which is what `ffrwd:av` promises and what every stream-copy muxer
-downstream needs, so the reordering is absorbed in a HOLD.
+A subscription asking for the backlog is served in the relay's own
+arrival order with the newest group sent first. So the groups arrive
+nothing like in sequence: reading two minutes of audio back off a local
+relay, this package measured a hold 556 groups deep before the oldest
+one landed, and blocks of a dozen groups arriving tens of seconds behind
+their neighbours with the track silent in between. What leaves this
+module is packets in decode order, which is what `ffrwd:av` promises and
+what every stream-copy muxer downstream needs, so the reordering is
+absorbed in a HOLD. The same hold runs on a live join, where what it has
+to absorb is a group or two rather than hundreds.
 
 The hold waits, and it does not give up on a missing group on a timer.
 `hold_ms` (30000 by default, the subscription's own latency window) is
@@ -171,12 +246,13 @@ magnitude more than audio needs), a resubscribe after the wire broke,
 since the new subscription starts at the live edge and what is missing
 is gone, and the end of the track.
 
-`join_ms` (2000 by default) is the other half. A cursor fixed at the
-first group that arrives puts the whole backlog BELOW itself, and every
-group of it is then a late arrival with nowhere to go. So a reader that
-has just joined holds what it is given and fixes its cursor at the
-lowest sequence that has stopped falling: each lower group restarts the
-wait, and group 0 ends it outright.
+`join_ms` (2000 by default) is the other half, and a backlog idea alone.
+A cursor fixed at the first group that arrives puts the whole backlog
+BELOW itself, and every group of it is then a late arrival with nowhere
+to go. So a reader that has just joined a backlog holds what it is given
+and fixes its cursor at the lowest sequence that has stopped falling:
+each lower group restarts the wait, and group 0 ends it outright. A live
+join has nothing older coming and waits for none of it.
 
 A session also has to be able to TAKE a backlog. MoQ opens one QUIC
 stream per group, and quinn's default of 100 concurrent streams leaves
@@ -205,7 +281,18 @@ old hold throws away a twentieth of the broadcast: the bound WAS the
 loss. 0.6.4 keeps all of it, 563 of 563 groups and 5626 of 5626 packets
 on both readers over three runs, with nothing abandoned and nothing
 dropped late. `tests/live_backlog.py` is that measurement, and
-`--plain` is how it reads a package older than this one.
+`--plain` is how it reads a package older than this one. Since 0.6.5 it
+asks for `'backlog'` outright, the default having moved.
+
+One thing the hold cannot put back is a group the relay no longer has.
+A backlog join on a relay carrying a LIVE broadcast is reading a
+retention window, and the oldest of it can age out while the replay is
+still working through it: `tests/live_edge.py` sees one such hole per
+track on a 40 second replay off a 30 second window. That is the relay's
+answer rather than a defect, and it is named in a HOLE row like any
+other. A relay told to keep more (`--cache-duration`) or a publisher
+running ahead of real time, which is what `backlog` is for, does not
+reach it.
 
 ### What a subscriber says
 
@@ -223,14 +310,19 @@ the relay handed over, and groups handed on in sequence), `repeated`,
 `holes_abandoned_budget`, `holes_abandoned_restart` and
 `holes_abandoned_end`, `dropped_late` (groups that arrived below the
 cursor, which no consumer taking packets in decode order can be
-handed), `fetches` and `fetches_refused` (groups asked for outright,
+handed), `skipped_join` (groups held at a live join that began before
+the group the reader started at - a video group with no keyframe to
+begin in; not a loss, since nothing had started, but not silent
+either), `fetches` and `fetches_refused` (groups asked for outright,
 and the ones the relay would not serve), `hold_max_groups` and
 `hold_max_bytes`, `reorder_max` (the widest the hold ever had to
 stretch in sequence), and `first` and `last`.
 
 Beside them, a row per incident: a HOLE row for every hole given up on
-(`from`, `to`, `reason`, and what was held at the time), and a LATE row
-for every group that arrived too late to use. Neither is ever silent, so
+(`from`, `to`, `reason`, and what was held at the time), a LATE row for
+every group that arrived too late to use, and a SKIPPED row, the same
+shape, for every group a live join stepped over on its way to one a
+decoder can start at. None of them is ever silent, so
 a run that lost something says which groups by sequence. The first 256
 of each per track are spelled out and the rest are only counted.
 
@@ -341,11 +433,13 @@ carried for wasm32-wasip2 fixes upstream does not ship yet).
   nothing comes back. It reads the whole relation - a video cell, an
   audio cell, either NULL - one rendition per row.
 - `subscribe(relay, broadcast, cert DEFAULT '', token DEFAULT '',
-  hold_ms DEFAULT 30000, hold_mib DEFAULT 64, join_ms DEFAULT 2000)`
+  start DEFAULT 'live', hold_ms DEFAULT 30000, hold_mib DEFAULT 64,
+  join_ms DEFAULT 2000)`
   returns `source`: a FROM relation, one row per rendition of the
   broadcast's catalog, a video cell and an audio cell, either NULL.
-  Unbounded. The three numbers are the hold a backlog is put back in
-  order in; see above.
+  Unbounded. `start` is which end of a running broadcast to join at,
+  `'live'` or `'backlog'`; the three numbers are the hold the groups are
+  put back in order in. See above.
 
 ## Building
 

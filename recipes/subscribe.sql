@@ -6,6 +6,12 @@
 -- height, and the cross join pairs the two singles. A muxed broadcast
 -- has no audio-only row, so it wants a query of its own. The broadcast
 -- is live, so the run ends when the publisher's tracks do.
+--
+-- Both halves join at the LIVE EDGE, which is subscribe's default: the
+-- picture starts at the first group whose first frame is a keyframe and
+-- the sound at the first whole group, so the file begins where the
+-- broadcast was rather than a retention window earlier. Writing the
+-- backlog out instead is subscribe's `start` argument; see the README.
 -- variables: relay (relay URL, host by name or IP), broadcast (broadcast path), height (the rung's frame height, e.g. 720), dest (output file path), cert (a private relay's certificate, DER as hex; leave unset for a public relay), token (an auth token the relay demands; leave unset if it demands none)
 -- example: ffrwd compile -f packages/ffrwd/moq/recipes/subscribe.sql -v relay=moqt://127.0.0.1:4443 -v broadcast=live/demo -v height=720 -v dest=rung.mp4
 COPY (
