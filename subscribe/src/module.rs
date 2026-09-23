@@ -12,10 +12,11 @@ use exports::ffrwd::av::packet_source::{
 };
 use ffrwd::av::types::{CodedAudio, CodedFormat, CodedStream, CodedVideo, Packet, Rational};
 use moq_core::order::{Hold, Queue};
+use moq_core::subscribe::Start;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"hold_ms":{"type":"integer","minimum":0,"default":30000,"description":"how long a hole in a track's group sequence is held open for the group that would fill it, in milliseconds; the default is the subscription's own latency window, which is as long as the relay may still serve it"},"hold_mib":{"type":"integer","minimum":1,"default":64,"description":"how much one track holds meanwhile, in MiB; 64 covers a 30s window up to about 17 Mbit/s"},"join_ms":{"type":"integer","minimum":0,"default":2000,"description":"how long a joining reader waits for a lower group sequence before it fixes its cursor, in milliseconds; 0 starts at the first group that arrives"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"hold_ms":{"type":"integer","minimum":0,"default":30000,"description":"how long a hole in a track's group sequence is held open for the group that would fill it, in milliseconds; the default is the subscription's own latency window, which is as long as the relay may still serve it"},"hold_mib":{"type":"integer","minimum":1,"default":64,"description":"how much one track holds meanwhile, in MiB; 64 covers a 30s window up to about 17 Mbit/s"},"join_ms":{"type":"integer","minimum":0,"default":2000,"description":"how long a joining reader waits for a lower group sequence before it fixes its cursor on a backlog join, in milliseconds; 0 starts at the first group that arrives, and a live join never waits at all"},"start":{"type":"string","enum":["live","backlog"],"default":"live","description":"where to join a broadcast already running: 'live' at the publisher's newest group, starting at the first group a decoder can begin at - a keyframe group for video, any group for audio - or 'backlog' at the oldest group the relay still holds, which reads the whole cache before the first packet comes out"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
 
 /// How long the relay gets to announce the broadcast, and then to hand
 /// over its catalog, before the call gives up.
@@ -70,6 +71,11 @@ struct Params {
 	hold_mib: u64,
 	#[serde(default = "default_join_ms")]
 	join_ms: u64,
+	/// Where this reader joins a broadcast already running: the live
+	/// edge, which is the default, or the backlog; see
+	/// [`moq_core::subscribe::Start`].
+	#[serde(default = "default_start")]
+	start: String,
 }
 
 fn default_hold_ms() -> u64 {
@@ -84,14 +90,21 @@ fn default_join_ms() -> u64 {
 	moq_core::order::JOIN_SETTLE.as_millis() as u64
 }
 
-fn parse_params(params: &str) -> Result<Params, String> {
+fn default_start() -> String {
+	"live".to_string()
+}
+
+fn parse_params(params: &str) -> Result<(Params, Start), String> {
 	let params: Params = serde_json::from_str(params).map_err(|err| format!("params: {err}"))?;
 	// The relay URL's path and the token argument are two spellings of
 	// one field, so what the session will ask for is settled here, where
 	// params are refused. `probe` reads these params at compile time, so
 	// a URL and a token that disagree stop the query rather than the run.
 	moq_core::relay::session_path(&params.relay, &params.token)?;
-	Ok(params)
+	// And so is a start nobody spells: a typo stops the query rather
+	// than quietly reading the wrong end of the broadcast.
+	let start = Start::parse(&params.start)?;
+	Ok((params, start))
 }
 
 /// The tokio floor the session runs on. Split from [`Reader`] so a call
@@ -370,6 +383,7 @@ fn chosen(
 fn catalog_of(
 	renditions: &[moq_core::catalog::Rendition],
 	order: &[usize],
+	start: Start,
 ) -> Result<(Catalog, Vec<Rendition>), String> {
 	let mut tracks = Vec::with_capacity(order.len());
 	let mut readers = Vec::with_capacity(order.len());
@@ -390,7 +404,7 @@ fn catalog_of(
 				true => moq_core::group::Join::video(),
 				false => moq_core::group::Join::audio(),
 			},
-			queue: Queue::new(rendition.name.clone()),
+			queue: Queue::new(rendition.name.clone(), start),
 		});
 	}
 	Ok((
@@ -509,7 +523,13 @@ impl Reader {
 	fn hold(&mut self, wire: Wire) -> Result<(), String> {
 		match wire {
 			Wire::Group(index, sequence, frames) => {
-				self.renditions[index].queue.push(sequence, frames)
+				let rendition = &mut self.renditions[index];
+				// Whether a decoder could start at this group, which is
+				// what a live join lands on. The keyframe flag comes off
+				// the fragment the publisher wrote rather than off a
+				// convention about where groups are cut.
+				let decodable = decodable(rendition, &frames);
+				rendition.queue.push(sequence, frames, decodable)
 			}
 			Wire::Gone(index, sequence, why) => {
 				self.renditions[index].queue.refused(sequence, &why)
@@ -545,6 +565,29 @@ impl Reader {
 	}
 }
 
+/// Whether a decoder can start at this group, which is what a live
+/// join has to land on.
+///
+/// A MoQ group opens at a keyframe by this package's own convention and
+/// by hang's, and a live join is exactly where trusting that would buy
+/// a broken picture - so it is read off the packets instead: the first
+/// sample the group carries for this track has to be a sync sample.
+/// Audio has no such gate, every AAC frame being one, so a group with
+/// any sample in it will do. A fragment carrying nothing for this track,
+/// a `moof` whose track fragments are all somebody else's, says nothing
+/// either way, and the next one is read.
+fn decodable(rendition: &Rendition, frames: &[Bytes]) -> bool {
+	for fragment in frames {
+		let Ok(samples) = rendition.track.fragment_samples(fragment) else {
+			return false;
+		};
+		if let Some(sample) = samples.first() {
+			return !rendition.video || sample.keyframe;
+		}
+	}
+	false
+}
+
 fn into_pads(pads: Vec<Vec<Packet>>) -> Vec<PadPackets> {
 	pads.into_iter()
 		.map(|packets| PadPackets { packets })
@@ -552,9 +595,14 @@ fn into_pads(pads: Vec<Vec<Packet>>) -> Vec<PadPackets> {
 }
 
 /// One fmp4 fragment's samples onto a pad. True when any went out; a
-/// video track's samples before its first sync sample do not, since a
-/// subscription joins at the group in flight and no decoder can start
-/// in the middle of one.
+/// video track's samples before its first sync sample do not, since no
+/// decoder can start in the middle of a picture.
+///
+/// [`moq_core::order::Queue`] has already chosen a group a decoder can
+/// start at on a live join, and a backlog join starts at the oldest
+/// group there is, so this gate is what catches whatever neither
+/// covers: a resubscribe after the wire broke, and a publisher whose
+/// groups do not open at keyframes.
 ///
 /// A fragment that carries nothing for this track - a `moof` whose
 /// track fragments are all somebody else's - holds no samples and is
@@ -617,7 +665,7 @@ impl Guest for Subscribe {
 	}
 
 	fn probe(params: String) -> Result<Catalog, String> {
-		let params = parse_params(&params)?;
+		let (params, start) = parse_params(&params)?;
 		let executor = Executor::new()?;
 		executor.enter(async {
 			let opened = open_broadcast(&params, PROBE_TIMEOUT).await?;
@@ -626,7 +674,7 @@ impl Guest for Subscribe {
 			// rendition this module cannot read is named here rather
 			// than at run time.
 			let every = (0..opened.renditions.len()).collect::<Vec<_>>();
-			let (catalog, _) = catalog_of(&opened.renditions, &every)?;
+			let (catalog, _) = catalog_of(&opened.renditions, &every, start)?;
 			drop(opened.broadcast);
 			drop(opened.session);
 			opened.endpoint.wait_idle().await;
@@ -635,7 +683,7 @@ impl Guest for Subscribe {
 	}
 
 	fn open(params: String, tracks: Vec<u32>) -> Result<Catalog, String> {
-		let params = parse_params(&params)?;
+		let (params, start) = parse_params(&params)?;
 		let executor = Executor::new()?;
 		let (catalog, reader) = executor.enter(async {
 			let opened = open_broadcast(&params, OPEN_TIMEOUT).await?;
@@ -643,28 +691,49 @@ impl Guest for Subscribe {
 			// One line per run naming what this source pulls, so a run can
 			// be read back against the catalog it narrowed.
 			eprintln!(
-				"subscribe: pulling {} of {} rendition(s): {}",
+				"subscribe: pulling {} of {} rendition(s) at the {} edge: {}",
 				order.len(),
 				opened.renditions.len(),
+				match start {
+					Start::Live => "live",
+					Start::Backlog => "oldest cached",
+				},
 				order
 					.iter()
 					.map(|&index| format!("{index}={}", opened.renditions[index].name))
 					.collect::<Vec<_>>()
 					.join(", ")
 			);
-			let (catalog, renditions) = catalog_of(&opened.renditions, &order)?;
+			let (catalog, renditions) = catalog_of(&opened.renditions, &order, start)?;
 			// Only the tracks this run was told to pull are subscribed
 			// to, and each becomes the pad at its place in `order`.
+			//
+			// Every one of them is REGISTERED before any is awaited, which
+			// is what keeps a ladder's rungs together: a live subscription
+			// starts at whatever group was the publisher's latest when it
+			// was accepted, so subscribing a track and then waiting out a
+			// round trip before subscribing the next would join each rung
+			// a round trip further on. moq-net registers the subscription
+			// in `Consumer::subscribe` and only the wait for the track's
+			// info is deferred to the await, so these go out in one flight
+			// and every track joins the same edge.
 			let (sender, frames) = mpsc::unbounded_channel::<Wire>();
-			for (pad, &index) in order.iter().enumerate() {
-				let rendition = &opened.renditions[index];
+			let mut opening = Vec::with_capacity(order.len());
+			for &index in &order {
 				// Subscribed once here, so a name the broadcast does not
 				// carry is refused by `open` rather than mid-run.
-				let subscriber = subscribe_track(&opened.broadcast, &rendition.name, true).await?;
+				let name = opened.renditions[index].name.clone();
+				let subscribing = subscribe_track(&opened.broadcast, &name, start)?;
+				opening.push((name, subscribing));
+			}
+			for (pad, (name, subscribing)) in opening.into_iter().enumerate() {
+				let subscriber = subscribing
+					.await
+					.map_err(|err| format!("track '{name}': {err}"))?;
 				tokio::task::spawn_local(read_track(
 					pad,
 					opened.broadcast.clone(),
-					rendition.name.clone(),
+					name,
 					subscriber,
 					sender.clone(),
 				));
@@ -710,25 +779,23 @@ impl Guest for Subscribe {
 	}
 }
 
-/// Subscribes to one named track of a broadcast, asking for the whole
-/// backlog the publisher still holds, or - once that has been refused -
-/// for the latest group and whatever follows it.
-async fn subscribe_track(
+/// Registers a subscription to one named track of a broadcast, at the
+/// live edge or over the whole backlog the publisher still holds.
+///
+/// This does NOT wait: moq-net registers the subscription here and the
+/// value handed back is what resolves once the track's info arrives.
+/// Every track of a run is registered before any of them is awaited,
+/// so they go out together and each one joins the same edge.
+fn subscribe_track(
 	broadcast: &moq_net::broadcast::Consumer,
 	name: &str,
-	backlog: bool,
-) -> Result<moq_net::track::Subscriber, String> {
-	let subscription = if backlog {
-		moq_core::subscribe::from_start()
-	} else {
-		moq_core::subscribe::live_edge()
-	};
-	broadcast
+	start: Start,
+) -> Result<impl std::future::Future<Output = Result<moq_net::track::Subscriber, moq_net::Error>>, String>
+{
+	Ok(broadcast
 		.track(name)
 		.map_err(|err| format!("track '{name}': {err}"))?
-		.subscribe(subscription)
-		.await
-		.map_err(|err| format!("track '{name}': {err}"))
+		.subscribe(start.subscription()))
 }
 
 /// One group asked for by sequence, outside any subscription.
@@ -849,10 +916,15 @@ async fn read_groups(
 		}
 		eprintln!("subscribe: track '{name}': {failure}; subscribing again");
 		tokio::time::sleep(TRACK_RETRY).await;
-		// The backlog is asked for once. A relay that dropped the
+		// Always at the live edge, whichever end this run joined at. A
+		// backlog is asked for once: a relay that dropped the
 		// subscription rather than serve it will do so again, and the
-		// latest group is what it does have.
-		match subscribe_track(&broadcast, &name, false).await {
+		// latest group is what it does have either way.
+		let taken = match subscribe_track(&broadcast, &name, Start::Live) {
+			Ok(subscribing) => subscribing.await.map_err(|err| err.to_string()),
+			Err(err) => Err(err),
+		};
+		match taken {
 			Ok(subscriber) => {
 				// The new subscription starts at the live edge, so the
 				// groups between are gone: the hold is told, rather than
@@ -863,7 +935,7 @@ async fn read_groups(
 				stream = moq_core::subscribe::FrameStream::new(subscriber);
 			}
 			Err(err) => {
-				let _ = sender.send(Wire::Failed(index, err));
+				let _ = sender.send(Wire::Failed(index, format!("track '{name}': {err}")));
 				return;
 			}
 		}

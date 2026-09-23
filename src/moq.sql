@@ -72,24 +72,43 @@ RETURNS sink
 --
 -- relay, cert and token read exactly as publish's do.
 --
--- A subscription asks for the whole backlog the relay still holds, and
--- a relay serves a backlog in its own arrival order with the newest
--- group sent first, so the groups arrive nothing like in sequence. They
--- are put back in order in a HOLD, since what leaves this module is
--- packets in decode order and no stream-copy muxer takes a timestamp
--- that goes backwards. hold_ms is how long a hole in the sequence waits
--- for the group that would fill it: 30000, the default, is the
--- subscription's own latency window, which is as long as the relay may
--- still serve it. hold_mib is how much one track holds meanwhile, 64 by
--- default, which is 30 seconds of about 17 Mbit/s. join_ms is how long
--- a reader that has just joined waits for a lower group sequence before
--- it fixes its cursor, 2000 by default: a cursor fixed at the first
--- group to arrive would put the rest of the backlog below itself. A
--- hole given up on and a group that arrives too late to be used are
--- both counted and named in a row on the module's stderr, never dropped
--- in silence; see the README.
+-- start is where a reader joins a broadcast that is already running.
+-- 'live', the default, joins at the publisher's newest group and starts
+-- at the first group a decoder can begin at: for video the first group
+-- whose first frame is a keyframe, for audio the first whole group. A
+-- node reading a live broadcast is then ONE GROUP behind it - a fifth
+-- of a second for audio, one GOP for video - and the publisher serves
+-- every group from the join on, so a reader that falls behind catches
+-- up rather than being skipped forward. 'backlog' joins at the oldest
+-- group the relay still holds instead, which reads the whole cache
+-- before the first packet comes out: it is for a publisher running
+-- AHEAD of real time - a file poured into a relay as fast as it will
+-- take it - and a reader that wants every frame of it. It stands where
+-- it does, before the three hold numbers 0.6.4 added, because a wasm
+-- function's arguments are positional: a query asking for the backlog
+-- would otherwise have to spell out the tuning it does not care about.
+--
+-- A relay serves a backlog in its own arrival order with the newest
+-- group sent first, so on a backlog join the groups arrive nothing like
+-- in sequence. They are put back in order in a HOLD, since what leaves
+-- this module is packets in decode order and no stream-copy muxer takes
+-- a timestamp that goes backwards. The same hold runs on a live join,
+-- where the reordering is a group or two rather than hundreds. hold_ms
+-- is how long a hole in the sequence waits for the group that would
+-- fill it: 30000, the default, is the subscription's own latency
+-- window, which is as long as the relay may still serve it. hold_mib is
+-- how much one track holds meanwhile, 64 by default, which is 30
+-- seconds of about 17 Mbit/s. join_ms is how long a reader that has
+-- just joined a BACKLOG waits for a lower group sequence before it
+-- fixes its cursor, 2000 by default: a cursor fixed at the first group
+-- to arrive would put the rest of the backlog below itself. A live join
+-- has nothing older coming and never waits. A hole given up on and a
+-- group that arrives too late to be used are both counted and named in
+-- a row on the module's stderr, never dropped in silence; see the
+-- README.
 CREATE FUNCTION subscribe(relay text, broadcast text,
                           cert text DEFAULT '', token text DEFAULT '',
+                          start text DEFAULT 'live',
                           hold_ms number DEFAULT 30000,
                           hold_mib number DEFAULT 64,
                           join_ms number DEFAULT 2000)
