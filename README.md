@@ -58,6 +58,12 @@ and `call_max_ms` (the longest the QUIC session lay undriven, and the
 longest one call held it: the session runs only while a host call is
 on the executor, so the first is what a loaded machine costs).
 
+A session the relay dropped is replaced rather than the run ended; see
+"A dropped session" below. The publisher says so in a row of its own,
+whatever `rows` asks for: `event` is `reconnect`, with `attempts` (the
+dials it took), `down_ms` (from the old session ending to the new one
+being in) and `error` (what ended the old one).
+
 ### Groups
 
 A group is what a relay forwards and what a subscriber joins at. Video
@@ -235,9 +241,14 @@ absorbed in a HOLD. The same hold runs on a live join, where what it has
 to absorb is a group or two rather than hundreds.
 
 The hold waits, and it does not give up on a missing group on a timer.
-`hold_ms` (30000 by default, the subscription's own latency window) is
-how long a hole stands open before the relay is ASKED for that group by
-sequence, not how long before the group is written off. A relay that
+`hold_ms` is how long a hole stands open before the relay is ASKED for
+that group by sequence, not how long before the group is written off.
+Left out, it follows `start`: 30000 on a backlog join, the
+subscription's own latency window, and 1000 on a live join. A live
+reader has given up the past on purpose, and every group behind a hole
+waits on it: in a demo tree one audio group the relay never delivered
+held 67 groups behind it for 26 seconds, and the leaf's encoder, waiting
+on its sound, stopped painting. A relay that
 still has it serves it and the hole closes; one that does not refuses,
 and only that refusal lets the cursor step over the hole. The other
 ways out are `hold_mib` (64 by default: the memory one track's hold may
@@ -294,6 +305,44 @@ other. A relay told to keep more (`--cache-duration`) or a publisher
 running ahead of real time, which is what `backlog` is for, does not
 reach it.
 
+### A dropped session
+
+A public relay resets sessions now and then, every one at once: two
+leaves of a demo tree on the same root lost theirs at the same instant
+after 45 minutes, and their one resubscribe on the dead session failed.
+Both halves of this package open a new session instead, for as long as
+`reconnect_s` allows (60 by default; 0 ends the run on the first drop).
+
+The subscriber notices when the session's protocol task ends, or when
+a track cannot be subscribed to again on it. It dials again, a doubling
+wait apart (half a second up to five), waits for the broadcast to be
+announced, reads the catalog again and takes every track up at the live
+edge. The tracks have to come back under the same names with the same
+init segments, or what follows is not the stream this run described,
+and that stops it. So does a track whose first group on the new session
+is numbered below where the reader had got: that publisher started
+again, and its timestamps went back with it. Otherwise each hold is
+told its track restarted, which gives up the hole between the two
+sessions at once, and a video track waits for a sync sample again,
+since the frames it would have referred back to went with that hole.
+
+The publisher keeps its broadcast in the module rather than the
+session, so groups go on being written while a new session is dialed
+in the background, the new session announces the same broadcast, and
+its group numbers carry on. The catalog goes out again the moment the
+new session is in.
+
+A relay that goes away without closing the session - a process gone, a
+network gone - says nothing either side can hear, so each finds out
+when nothing has come back for the QUIC idle timeout, 10 seconds, with
+a keep-alive every 2 seconds holding a quiet session open meanwhile. A
+relay that resets a session closes it, and that is heard at once.
+`tests/live_reconnect.py` kills a local relay a few seconds into a
+paced broadcast and starts it again on the same port: both halves come
+back on the first dial, and the reader's video and audio go on after a
+gap of the idle timeout plus the time the relay was away, the first
+video packet after it a keyframe.
+
 ### What a subscriber says
 
 A packet source has no row channel in `ffrwd:av`: `next` hands back
@@ -322,8 +371,10 @@ Beside them, a row per incident: a HOLE row for every hole given up on
 (`from`, `to`, `reason`, and what was held at the time), a LATE row for
 every group that arrived too late to use, and a SKIPPED row, the same
 shape, for every group a live join stepped over on its way to one a
-decoder can start at. None of them is ever silent, so
-a run that lost something says which groups by sequence. The first 256
+decoder can start at. A RECONNECT row says a dropped session was
+replaced (`attempts`, `down_ms`, `error`, as the publisher's). None of
+them is ever silent, so a run that lost something says which groups by
+sequence. The first 256
 of each per track are spelled out and the rest are only counted.
 
 ## Relay
@@ -429,17 +480,19 @@ carried for wasm32-wasip2 fixes upstream does not ship yet).
 ## Exports
 
 - `publish(relay, broadcast, cert DEFAULT '', token DEFAULT '',
-  audio_group_ms DEFAULT 200, rows DEFAULT 'summary')` returns `sink`: a COPY destination,
+  audio_group_ms DEFAULT 200, rows DEFAULT 'summary',
+  reconnect_s DEFAULT 60)` returns `sink`: a COPY destination,
   nothing comes back. It reads the whole relation - a video cell, an
   audio cell, either NULL - one rendition per row.
 - `subscribe(relay, broadcast, cert DEFAULT '', token DEFAULT '',
-  start DEFAULT 'live', hold_ms DEFAULT 30000, hold_mib DEFAULT 64,
-  join_ms DEFAULT 2000)`
+  start DEFAULT 'live', hold_ms DEFAULT NULL, hold_mib DEFAULT 64,
+  join_ms DEFAULT 2000, reconnect_s DEFAULT 60)`
   returns `source`: a FROM relation, one row per rendition of the
   broadcast's catalog, a video cell and an audio cell, either NULL.
   Unbounded. `start` is which end of a running broadcast to join at,
-  `'live'` or `'backlog'`; the three numbers are the hold the groups are
-  put back in order in. See above.
+  `'live'` or `'backlog'`; the three numbers after it are the hold the
+  groups are put back in order in, and `reconnect_s` how long a dropped
+  session is tried again for. See above.
 
 ## Building
 

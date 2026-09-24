@@ -48,10 +48,17 @@
 -- 'groups' is a row per published group, which at ten audio groups a
 -- second is for piping somewhere rather than for reading; 'none' is
 -- the final total alone.
+-- reconnect_s is how long a publisher whose session the relay dropped
+-- keeps dialing for a new one, in seconds, 60 by default. The broadcast
+-- lives in the module rather than the session, so groups go on being
+-- written meanwhile and the new session announces the same broadcast,
+-- its group numbers carrying on; a row with event 'reconnect' says when
+-- it is back. 0 ends the run on the first drop.
 CREATE FUNCTION publish(relay text, broadcast text,
                         cert text DEFAULT '', token text DEFAULT '',
                         audio_group_ms number DEFAULT 200,
-                        rows text DEFAULT 'summary')
+                        rows text DEFAULT 'summary',
+                        reconnect_s number DEFAULT 60)
 RETURNS sink
   AS 'target/wasm32-wasip2/release/publish.wasm', 'publish' LANGUAGE wasm;
 
@@ -95,8 +102,11 @@ RETURNS sink
 -- a timestamp that goes backwards. The same hold runs on a live join,
 -- where the reordering is a group or two rather than hundreds. hold_ms
 -- is how long a hole in the sequence waits for the group that would
--- fill it: 30000, the default, is the subscription's own latency
--- window, which is as long as the relay may still serve it. hold_mib is
+-- fill it before the relay is asked for it outright. Left NULL it
+-- follows start: 1000 on a live join, which has given up the past
+-- already and whose every later group waits behind the hole, and 30000
+-- on a backlog join, the subscription's own latency window, which is as
+-- long as the relay may still serve it. hold_mib is
 -- how much one track holds meanwhile, 64 by default, which is 30
 -- seconds of about 17 Mbit/s. join_ms is how long a reader that has
 -- just joined a BACKLOG waits for a lower group sequence before it
@@ -106,11 +116,23 @@ RETURNS sink
 -- group that arrives too late to be used are both counted and named in
 -- a row on the module's stderr, never dropped in silence; see the
 -- README.
+--
+-- reconnect_s is how long a reader whose session the relay dropped
+-- keeps dialing for a new one, in seconds, 60 by default. A relay resets
+-- sessions now and then, every one at once; the reader opens a new
+-- session, reads the catalog again and takes its tracks up at the live
+-- edge, so what is lost is the stretch the relay was away and the run
+-- goes on. The tracks have to come back under the same names with the
+-- same init segments, and a broadcast whose group numbers started again
+-- - a publisher that restarted, its clock with it - stops the run
+-- instead. A row with kind 'reconnect' says when it is back. 0 ends the
+-- run on the first drop.
 CREATE FUNCTION subscribe(relay text, broadcast text,
                           cert text DEFAULT '', token text DEFAULT '',
                           start text DEFAULT 'live',
-                          hold_ms number DEFAULT 30000,
+                          hold_ms number DEFAULT NULL,
                           hold_mib number DEFAULT 64,
-                          join_ms number DEFAULT 2000)
+                          join_ms number DEFAULT 2000,
+                          reconnect_s number DEFAULT 60)
 RETURNS source
   AS 'target/wasm32-wasip2/release/subscribe.wasm', 'subscribe' LANGUAGE wasm;

@@ -30,13 +30,14 @@ use serde::Serialize;
 ///
 /// A packet source has no row channel in `ffrwd:av`: `next` hands back
 /// packets and nothing else. So these go out as `subscribe: row <json>`
-/// lines instead, one object to a line. `kind` says which of the four
+/// lines instead, one object to a line. `kind` says which of the five
 /// shapes it is: a TRACK row every [`REPORT_EVERY`] and once more when
 /// the track ends (`final`), a HOLE row for every hole given up on, a
 /// LATE row for every group that arrived below the cursor and could not
 /// be used, and a SKIPPED row for every group a live join stepped over
-/// on its way to one a decoder can start at.
-pub const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","enum":["track","hole","late","skipped"]},"track":{"type":"string"},"received":{"type":"integer"},"delivered":{"type":"integer"},"repeated":{"type":"integer"},"bytes":{"type":"integer"},"holes_opened":{"type":"integer"},"holes_filled":{"type":"integer"},"holes_abandoned_gone":{"type":"integer"},"holes_abandoned_budget":{"type":"integer"},"holes_abandoned_restart":{"type":"integer"},"holes_abandoned_end":{"type":"integer"},"dropped_late":{"type":"integer"},"skipped_join":{"type":"integer"},"fetches":{"type":"integer"},"fetches_refused":{"type":"integer"},"hold_max_groups":{"type":"integer"},"hold_max_bytes":{"type":"integer"},"reorder_max":{"type":"integer"},"first":{"type":["integer","null"]},"last":{"type":["integer","null"]},"final":{"type":"boolean"},"from":{"type":"integer"},"to":{"type":"integer"},"reason":{"type":"string","enum":["gone","budget","restart","end"]},"held_groups":{"type":"integer"},"held_bytes":{"type":"integer"},"group":{"type":"integer"},"cursor":{"type":"integer"}},"additionalProperties":false}"#;
+/// on its way to one a decoder can start at, and a RECONNECT row each
+/// time a session the relay dropped was replaced by a new one.
+pub const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","enum":["track","hole","late","skipped","reconnect"]},"track":{"type":"string"},"received":{"type":"integer"},"delivered":{"type":"integer"},"repeated":{"type":"integer"},"bytes":{"type":"integer"},"holes_opened":{"type":"integer"},"holes_filled":{"type":"integer"},"holes_abandoned_gone":{"type":"integer"},"holes_abandoned_budget":{"type":"integer"},"holes_abandoned_restart":{"type":"integer"},"holes_abandoned_end":{"type":"integer"},"dropped_late":{"type":"integer"},"skipped_join":{"type":"integer"},"fetches":{"type":"integer"},"fetches_refused":{"type":"integer"},"hold_max_groups":{"type":"integer"},"hold_max_bytes":{"type":"integer"},"reorder_max":{"type":"integer"},"first":{"type":["integer","null"]},"last":{"type":["integer","null"]},"final":{"type":"boolean"},"from":{"type":"integer"},"to":{"type":"integer"},"reason":{"type":"string","enum":["gone","budget","restart","end"]},"held_groups":{"type":"integer"},"held_bytes":{"type":"integer"},"group":{"type":"integer"},"cursor":{"type":"integer"},"attempts":{"type":"integer"},"down_ms":{"type":"integer"},"error":{"type":"string"}},"additionalProperties":false}"#;
 
 /// How long a hole in a track's group sequence is held open for the
 /// group that would fill it, and how much one track holds meanwhile.
@@ -75,6 +76,13 @@ pub const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"
 /// on is counted and reported, never dropped in silence. See
 /// [`Counters`].
 pub const HOLD_WAIT: Duration = crate::subscribe::BACKLOG;
+
+/// The same wait on a LIVE join, which is where a reader of a relay tree
+/// sits. It started at the newest group on purpose, so a group the relay
+/// never delivered is not worth the backlog's half minute: every group
+/// behind it waits too, and a leaf whose encoder waits on its sound
+/// stops painting. A second, and then the relay is asked outright.
+pub const HOLD_WAIT_LIVE: Duration = Duration::from_secs(1);
 pub const HOLD_BYTES: u64 = 64 << 20;
 
 /// How long a reader that has just joined a BACKLOG waits for a lower
@@ -277,6 +285,26 @@ struct LateRow<'a> {
 	cursor: u64,
 }
 
+/// A session the relay dropped, replaced: how many dials that took, how
+/// long the tracks were without one, and what ended the old session.
+#[derive(Serialize)]
+struct ReconnectRow<'a> {
+	kind: &'static str,
+	attempts: u64,
+	down_ms: u64,
+	error: &'a str,
+}
+
+/// Says that a dropped session was replaced; see [`ReconnectRow`].
+pub fn report_reconnect(attempts: u64, down_ms: u64, error: &str) {
+	row(&ReconnectRow {
+		kind: "reconnect",
+		attempts,
+		down_ms,
+		error,
+	});
+}
+
 /// One row on stderr, which is where a packet source's rows go; see
 /// [`ROWS_SCHEMA`].
 fn row(body: &impl Serialize) {
@@ -305,6 +333,11 @@ impl Queue {
 			reported: None,
 			rows: 0,
 		}
+	}
+
+	/// The next group sequence this track hands on, once it has one.
+	pub fn cursor(&self) -> Option<u64> {
+		self.cursor
 	}
 
 	/// Files one group the relay handed over.

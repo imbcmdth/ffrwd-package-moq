@@ -16,7 +16,7 @@ use moq_core::subscribe::Start;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"hold_ms":{"type":"integer","minimum":0,"default":30000,"description":"how long a hole in a track's group sequence is held open for the group that would fill it, in milliseconds; the default is the subscription's own latency window, which is as long as the relay may still serve it"},"hold_mib":{"type":"integer","minimum":1,"default":64,"description":"how much one track holds meanwhile, in MiB; 64 covers a 30s window up to about 17 Mbit/s"},"join_ms":{"type":"integer","minimum":0,"default":2000,"description":"how long a joining reader waits for a lower group sequence before it fixes its cursor on a backlog join, in milliseconds; 0 starts at the first group that arrives, and a live join never waits at all"},"start":{"type":"string","enum":["live","backlog"],"default":"live","description":"where to join a broadcast already running: 'live' at the publisher's newest group, starting at the first group a decoder can begin at - a keyframe group for video, any group for audio - or 'backlog' at the oldest group the relay still holds, which reads the whole cache before the first packet comes out"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"hold_ms":{"type":"integer","minimum":0,"description":"how long a hole in a track's group sequence is held open for the group that would fill it before the relay is asked for it, in milliseconds; left out, 1000 on a live join, which has given up the past already, and 30000 on a backlog join, the subscription's own latency window"},"hold_mib":{"type":"integer","minimum":1,"default":64,"description":"how much one track holds meanwhile, in MiB; 64 covers a 30s window up to about 17 Mbit/s"},"join_ms":{"type":"integer","minimum":0,"default":2000,"description":"how long a joining reader waits for a lower group sequence before it fixes its cursor on a backlog join, in milliseconds; 0 starts at the first group that arrives, and a live join never waits at all"},"reconnect_s":{"type":"integer","minimum":0,"default":60,"description":"how long a reader whose session the relay dropped keeps trying to open a new one and take its tracks up again at the live edge, in seconds; 0 ends the run on the first drop"},"start":{"type":"string","enum":["live","backlog"],"default":"live","description":"where to join a broadcast already running: 'live' at the publisher's newest group, starting at the first group a decoder can begin at - a keyframe group for video, any group for audio - or 'backlog' at the oldest group the relay still holds, which reads the whole cache before the first packet comes out"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
 
 /// How long the relay gets to announce the broadcast, and then to hand
 /// over its catalog, before the call gives up.
@@ -40,6 +40,13 @@ const TICK: Duration = Duration::from_millis(20);
 /// it.
 const TRACK_RETRIES: u32 = 5;
 const TRACK_RETRY: Duration = Duration::from_millis(500);
+
+/// How long a reader whose session ended waits between tries at a new
+/// one: the first wait, and the longest the doubling reaches. A relay
+/// that reset every session at once is taking them all back, and a try
+/// a few seconds apart is what gets one in without hammering it.
+const RECONNECT_FIRST: Duration = Duration::from_millis(500);
+const RECONNECT_MAX: Duration = Duration::from_secs(5);
 
 /// How long one pull keeps the session turning after it has something
 /// to hand back, and how many idle turns end it early. The QUIC driver
@@ -65,8 +72,9 @@ struct Params {
 	/// The hold, per track: see [`moq_core::order`]. A run whose relay
 	/// keeps less history than this package asks for, or one that would
 	/// rather stall for less time, says so here.
-	#[serde(default = "default_hold_ms")]
-	hold_ms: u64,
+	/// Left out, it follows `start`; see [`hold_ms`].
+	#[serde(default)]
+	hold_ms: Option<u64>,
 	#[serde(default = "default_hold_mib")]
 	hold_mib: u64,
 	#[serde(default = "default_join_ms")]
@@ -76,10 +84,27 @@ struct Params {
 	/// [`moq_core::subscribe::Start`].
 	#[serde(default = "default_start")]
 	start: String,
+	/// How long a dropped session is tried again for, in seconds; see
+	/// [`Reader::reconnect`].
+	#[serde(default = "default_reconnect_s")]
+	reconnect_s: u64,
 }
 
-fn default_hold_ms() -> u64 {
-	moq_core::order::HOLD_WAIT.as_millis() as u64
+fn default_reconnect_s() -> u64 {
+	60
+}
+
+/// How long a hole waits before the relay is asked for the group, when
+/// the query did not say: a live join has given up the past on purpose,
+/// so a group the relay never delivered is asked for after a second
+/// rather than held for the whole backlog window with everything behind
+/// it waiting too.
+fn hold_ms(params: &Params, start: Start) -> u64 {
+	params.hold_ms.unwrap_or(match start {
+		Start::Live => moq_core::order::HOLD_WAIT_LIVE,
+		Start::Backlog => moq_core::order::HOLD_WAIT,
+	}
+	.as_millis() as u64)
 }
 
 fn default_hold_mib() -> u64 {
@@ -146,12 +171,13 @@ enum Wire {
 	/// starts at the live edge: whatever the hold is waiting for is not
 	/// coming.
 	Restarted(usize),
-	/// A track's reader has finished: the publisher ended it, or the
-	/// wire broke past mending. Which track it was does not matter -
-	/// what the run waits for is all of them.
+	/// A track's reader has finished: the publisher ended it. Which
+	/// track it was does not matter - what the run waits for is all of
+	/// them.
 	Finished,
-	/// The track failed, and why.
-	Failed(usize, String),
+	/// A track could not be taken up again on this session, and why:
+	/// the session itself is what has to be opened again.
+	Lost(usize, String),
 }
 
 /// One rendition being read: how to take its fragments apart, where its
@@ -167,12 +193,47 @@ struct Rendition {
 	join: moq_core::group::Join,
 	/// The group sequence this rendition's fragments arrive in.
 	queue: Queue,
+	/// Its catalog name and init segment, which a broadcast opened again
+	/// on a new session has to carry unchanged.
+	name: String,
+	init: Vec<u8>,
+	/// Set when the track was taken up on a new session and nothing has
+	/// arrived on it yet: its first group says whether the publisher
+	/// carried on or started again.
+	resumed: bool,
+}
+
+impl Rendition {
+	/// The track was taken up on a fresh subscription at the live edge:
+	/// what its hold waits for is not coming, and a picture has to start
+	/// again at a sync sample, since the frames it would have referred
+	/// back to went with the groups in between.
+	fn restart(&mut self) {
+		self.queue.restarted = true;
+		if self.video {
+			self.join = moq_core::group::Join::video();
+		}
+	}
+}
+
+/// Why taking the tracks up on a new session did not work: a broadcast
+/// that is no longer the one this run describes, or something that may
+/// well work on the next try.
+enum Resume {
+	Refused(String),
+	Again(String),
 }
 
 /// Every track being read, and the session under them.
 struct Reader {
 	endpoint: quinn::Endpoint,
 	session: Option<moq_net::Session>,
+	/// The session's protocol task, which ends when the session does.
+	driver: tokio::task::JoinHandle<Result<(), moq_net::Error>>,
+	/// Why the session has to be opened again, when a track has said so.
+	lost: Option<String>,
+	/// What the session was opened with, to open it again.
+	params: Params,
 	renditions: Vec<Rendition>,
 	frames: mpsc::UnboundedReceiver<Wire>,
 	/// The broadcast, and a sender into the channel above: what a fetch
@@ -204,6 +265,7 @@ thread_local! {
 struct Opened {
 	endpoint: quinn::Endpoint,
 	session: moq_net::Session,
+	driver: tokio::task::JoinHandle<Result<(), moq_net::Error>>,
 	broadcast: moq_net::broadcast::Consumer,
 	renditions: Vec<moq_core::catalog::Rendition>,
 }
@@ -220,10 +282,7 @@ async fn open_broadcast(params: &Params, wait: Duration) -> Result<Opened, Strin
 		moq_net::Client::new().with_subscriber(origin.clone()),
 	)
 	.await?;
-	let driver = connected.driver;
-	tokio::task::spawn_local(async move {
-		let _ = driver.await;
-	});
+	let driver = tokio::task::spawn_local(connected.driver);
 
 	let path = params.broadcast.as_str();
 	let broadcast = tokio::time::timeout(wait, origin.consume().announced_broadcast(path))
@@ -249,6 +308,7 @@ async fn open_broadcast(params: &Params, wait: Duration) -> Result<Opened, Strin
 	Ok(Opened {
 		endpoint: connected.endpoint,
 		session: connected.session,
+		driver,
 		broadcast,
 		renditions: moq_core::catalog::parse(&document)
 			.map_err(|err| format!("broadcast '{path}': {err}"))?,
@@ -405,6 +465,9 @@ fn catalog_of(
 				false => moq_core::group::Join::audio(),
 			},
 			queue: Queue::new(rendition.name.clone(), start),
+			name: rendition.name.clone(),
+			init: rendition.init.to_vec(),
+			resumed: false,
 		});
 	}
 	Ok((
@@ -432,6 +495,20 @@ impl Reader {
 		loop {
 			while let Ok(wire) = self.frames.try_recv() {
 				self.hold(wire)?;
+			}
+			// The session ended under the tracks, or one of them could not
+			// be taken up again on it: open a new one before anything else.
+			if self.driver.is_finished() || self.lost.is_some() {
+				let why = match self.lost.take() {
+					Some(why) => why,
+					None => match (&mut self.driver).await {
+						Ok(Ok(())) => "the relay closed the session".to_string(),
+						Ok(Err(err)) => err.to_string(),
+						Err(err) => err.to_string(),
+					},
+				};
+				self.reconnect(why).await?;
+				continue;
 			}
 			produced |= self.release(&mut pads, self.over())?;
 			self.ask();
@@ -524,6 +601,22 @@ impl Reader {
 		match wire {
 			Wire::Group(index, sequence, frames) => {
 				let rendition = &mut self.renditions[index];
+				// The first group on a new session. A publisher that carried
+				// on counts on from where it was; one that started again
+				// counts from nothing, and its clock went back with it,
+				// which no reader downstream of this one can follow.
+				if std::mem::take(&mut rendition.resumed) {
+					if let Some(cursor) = rendition.queue.cursor() {
+						if sequence + 1 < cursor {
+							return Err(format!(
+								"track '{}' came back on a new session at group {sequence}, \
+								 below the {cursor} this reader had reached: its publisher \
+								 started again, and its timestamps with it",
+								rendition.name
+							));
+						}
+					}
+				}
 				// Whether a decoder could start at this group, which is
 				// what a live join lands on. The keyframe flag comes off
 				// the fragment the publisher wrote rather than off a
@@ -534,13 +627,129 @@ impl Reader {
 			Wire::Gone(index, sequence, why) => {
 				self.renditions[index].queue.refused(sequence, &why)
 			}
-			Wire::Restarted(index) => self.renditions[index].queue.restarted = true,
+			Wire::Restarted(index) => self.renditions[index].restart(),
 			Wire::Finished => self.finished += 1,
-			Wire::Failed(index, err) => {
+			Wire::Lost(index, err) => {
 				let name = &self.renditions[index].queue.name;
-				return Err(format!("track '{name}': {err}"));
+				self.lost.get_or_insert(format!("track '{name}': {err}"));
 			}
 		}
+		Ok(())
+	}
+
+	/// Opens a new session and takes every track up again at the live
+	/// edge, trying for as long as `reconnect_s` allows.
+	///
+	/// A relay resets sessions now and then - every one at once, the
+	/// same instant for two readers on two machines - and a live
+	/// broadcast outlives that. So the reader dials again, waits for the
+	/// broadcast to be announced, and reads its catalog: the tracks it
+	/// pulls have to be there under the same names with the same init
+	/// segments, or what comes next is not the stream this run was
+	/// describing, and that stops it. Everything that fails before then
+	/// is tried again, a doubling wait apart, until the window is spent.
+	async fn reconnect(&mut self, why: String) -> Result<(), String> {
+		let window = Duration::from_secs(self.params.reconnect_s);
+		if window.is_zero() {
+			return Err(why);
+		}
+		eprintln!("subscribe: the session ended: {why}; connecting again");
+		let began = std::time::Instant::now();
+		let mut wait = RECONNECT_FIRST;
+		let mut attempts = 0u64;
+		loop {
+			attempts += 1;
+			let left = window.saturating_sub(began.elapsed());
+			let failure = match open_broadcast(&self.params, left.max(RECONNECT_FIRST)).await {
+				Ok(opened) => match self.resume(opened).await {
+					Ok(()) => {
+						moq_core::order::report_reconnect(
+							attempts,
+							began.elapsed().as_millis() as u64,
+							&why,
+						);
+						return Ok(());
+					}
+					Err(Resume::Refused(err)) => return Err(err),
+					Err(Resume::Again(err)) => err,
+				},
+				Err(err) => err,
+			};
+			let left = window.saturating_sub(began.elapsed());
+			if left.is_zero() {
+				return Err(format!(
+					"{why}; no new session took the tracks up within {}s ({attempts} tries, \
+					 the last: {failure})",
+					window.as_secs()
+				));
+			}
+			eprintln!("subscribe: connecting again: {failure}; trying again");
+			tokio::time::sleep(wait.min(left)).await;
+			wait = (wait * 2).min(RECONNECT_MAX);
+		}
+	}
+
+	/// Takes every track up on a freshly opened broadcast. The old
+	/// session's readers answer into a channel nobody reads any more, so
+	/// nothing of it reaches the holds; each hold is told its track
+	/// restarted, which is the hole between the two sessions.
+	async fn resume(&mut self, opened: Opened) -> Result<(), Resume> {
+		for rendition in &self.renditions {
+			let Some(now) = opened
+				.renditions
+				.iter()
+				.find(|candidate| candidate.name == rendition.name)
+			else {
+				return Err(Resume::Refused(format!(
+					"the broadcast came back on a new session without track '{}'",
+					rendition.name
+				)));
+			};
+			if now.init[..] != rendition.init[..] {
+				return Err(Resume::Refused(format!(
+					"the broadcast came back on a new session with another init segment for \
+					 track '{}': its publisher started again with other settings",
+					rendition.name
+				)));
+			}
+		}
+		let (sender, frames) = mpsc::unbounded_channel::<Wire>();
+		let mut opening = Vec::with_capacity(self.renditions.len());
+		for rendition in &self.renditions {
+			let subscribing = subscribe_track(&opened.broadcast, &rendition.name, Start::Live)
+				.map_err(Resume::Again)?;
+			opening.push((rendition.name.clone(), subscribing));
+		}
+		let mut subscribers = Vec::with_capacity(opening.len());
+		for (name, subscribing) in opening {
+			let subscriber = subscribing
+				.await
+				.map_err(|err| Resume::Again(format!("track '{name}': {err}")))?;
+			subscribers.push((name, subscriber));
+		}
+		for (pad, (name, subscriber)) in subscribers.into_iter().enumerate() {
+			tokio::task::spawn_local(read_track(
+				pad,
+				opened.broadcast.clone(),
+				name,
+				subscriber,
+				sender.clone(),
+			));
+		}
+		for rendition in &mut self.renditions {
+			rendition.restart();
+			rendition.queue.fetching = None;
+			rendition.resumed = true;
+		}
+		self.driver.abort();
+		self.endpoint = opened.endpoint;
+		self.session = Some(opened.session);
+		self.driver = opened.driver;
+		self.broadcast = opened.broadcast;
+		self.sender = sender;
+		self.frames = frames;
+		self.finished = 0;
+		self.asking.clear();
 		Ok(())
 	}
 
@@ -743,13 +952,16 @@ impl Guest for Subscribe {
 				Reader {
 					endpoint: opened.endpoint,
 					session: Some(opened.session),
+					driver: opened.driver,
+					lost: None,
+					params: params.clone(),
 					renditions,
 					frames,
 					broadcast: opened.broadcast,
 					sender,
 					finished: 0,
 					asking: Vec::new(),
-					hold: Hold::new(params.hold_ms, params.hold_mib, params.join_ms),
+					hold: Hold::new(hold_ms(&params, start), params.hold_mib, params.join_ms),
 				},
 			))
 		})?;
@@ -908,10 +1120,10 @@ async fn read_groups(
 
 		// The wire broke under the track. A live broadcast outlives one
 		// subscription, so the track is taken up again; one that will
-		// not stay up is what stops the run.
+		// not stay up on this session is the session's to mend.
 		attempts += 1;
 		if attempts > TRACK_RETRIES {
-			let _ = sender.send(Wire::Failed(index, failure));
+			let _ = sender.send(Wire::Lost(index, failure));
 			return;
 		}
 		eprintln!("subscribe: track '{name}': {failure}; subscribing again");
@@ -934,8 +1146,11 @@ async fn read_groups(
 				}
 				stream = moq_core::subscribe::FrameStream::new(subscriber);
 			}
+			// The subscription could not even be asked for again, which
+			// is what a session the relay has dropped looks like from
+			// here.
 			Err(err) => {
-				let _ = sender.send(Wire::Failed(index, format!("track '{name}': {err}")));
+				let _ = sender.send(Wire::Lost(index, err));
 				return;
 			}
 		}

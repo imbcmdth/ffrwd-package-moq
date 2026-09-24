@@ -13,7 +13,7 @@ use exports::ffrwd::av::packet_sink::{
 use ffrwd::av::types::CodedFormat;
 use serde::{Deserialize, Serialize};
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"rows":{"type":"string","enum":["summary","groups","none"],"default":"summary","description":"what the sink reports: 'summary' is one row per track every 5s and a final total, 'groups' a row per published group, 'none' the final total alone"},"audio_group_ms":{"type":"integer","minimum":0,"default":200,"description":"how long an audio group runs, in milliseconds; a fifth of a second is ten AAC frames at 48kHz, and shorter groups have been seen losing whole groups through a public relay under load. 0 is one frame per group, which is what upstream hang writes and is experimental here"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"rows":{"type":"string","enum":["summary","groups","none"],"default":"summary","description":"what the sink reports: 'summary' is one row per track every 5s and a final total, 'groups' a row per published group, 'none' the final total alone"},"reconnect_s":{"type":"integer","minimum":0,"default":60,"description":"how long a publisher whose session the relay dropped keeps trying to open a new one and announce the broadcast again, in seconds; groups are still written meanwhile, and 0 ends the run on the first drop"},"audio_group_ms":{"type":"integer","minimum":0,"default":200,"description":"how long an audio group runs, in milliseconds; a fifth of a second is ten AAC frames at 48kHz, and shorter groups have been seen losing whole groups through a public relay under load. 0 is one frame per group, which is what upstream hang writes and is experimental here"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
 
 /// The base name a video track falls back to when its row's rendition
 /// carries none, and the ladder holds only the one stream.
@@ -29,7 +29,7 @@ const DEFAULT_AUDIO_TRACK: &str = "audio";
 /// the seconds of media published on it; the TRAILING row, which every
 /// run ends with, carries `tracks`. `pts_start`/`pts_end` are seconds
 /// of media time.
-const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"track":{"type":"string"},"group":{"type":"integer"},"packets":{"type":"integer"},"bytes":{"type":"integer"},"pts_start":{"type":"number"},"pts_end":{"type":"number"},"groups":{"type":"integer"},"media":{"type":"number"},"tracks":{"type":"integer"},"init_bytes":{"type":"integer"},"appended":{"type":"integer"},"closed":{"type":"integer"},"sub_latency_ms":{"type":"integer"},"sub_priority":{"type":"integer"},"sub_ordered":{"type":"boolean"},"gap_max_ms":{"type":"integer"},"call_max_ms":{"type":"integer"}},"additionalProperties":false}"#;
+const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"track":{"type":"string"},"group":{"type":"integer"},"packets":{"type":"integer"},"bytes":{"type":"integer"},"pts_start":{"type":"number"},"pts_end":{"type":"number"},"groups":{"type":"integer"},"media":{"type":"number"},"tracks":{"type":"integer"},"init_bytes":{"type":"integer"},"appended":{"type":"integer"},"closed":{"type":"integer"},"sub_latency_ms":{"type":"integer"},"sub_priority":{"type":"integer"},"sub_ordered":{"type":"boolean"},"gap_max_ms":{"type":"integer"},"call_max_ms":{"type":"integer"},"event":{"type":"string","enum":["reconnect"]},"attempts":{"type":"integer"},"down_ms":{"type":"integer"},"error":{"type":"string"}},"additionalProperties":false}"#;
 
 /// How long the session stays open after the last fragment, for the
 /// wire to drain: there is no delivered signal for a subscription.
@@ -81,6 +81,11 @@ const FLUSH_TURNS: usize = 3;
 /// the cost is nothing.
 const CATALOG_REFRESH: Duration = Duration::from_secs(3);
 
+/// How long a publisher whose session ended waits between tries at a
+/// new one: the first wait, and the longest the doubling reaches.
+const RECONNECT_FIRST: Duration = Duration::from_millis(500);
+const RECONNECT_MAX: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Params {
@@ -101,6 +106,14 @@ struct Params {
 	/// What the sink reports: see [`Rows`].
 	#[serde(default = "default_rows")]
 	rows: String,
+	/// How long a dropped session is tried again for, in seconds; see
+	/// [`Session::mend`].
+	#[serde(default = "default_reconnect_s")]
+	reconnect_s: u64,
+}
+
+fn default_reconnect_s() -> u64 {
+	60
 }
 
 /// What a run says about itself. A group a second is nothing; ten a
@@ -180,6 +193,14 @@ struct TrackRow {
 }
 
 /// The trailing summary, once per run over every track.
+#[derive(Serialize)]
+struct ReconnectRow<'a> {
+	event: &'static str,
+	attempts: u64,
+	down_ms: u64,
+	error: &'a str,
+}
+
 #[derive(Serialize)]
 struct SummaryRow {
 	tracks: u64,
@@ -429,7 +450,14 @@ fn write_group(
 struct Session {
 	endpoint: quinn::Endpoint,
 	session: Option<moq_net::Session>,
-	driver: Option<tokio::task::JoinHandle<()>>,
+	/// The session's protocol task, which ends when the session does.
+	driver: Option<tokio::task::JoinHandle<Result<(), moq_net::Error>>>,
+	/// What the broadcast lives in. It outlives any one session: a new
+	/// session publishes the same origin, so the broadcast, its tracks and
+	/// their group numbers carry on across a drop.
+	origin: moq_net::origin::Producer,
+	/// A new session being opened, with when the old one ended and why.
+	redial: Option<Redial>,
 	broadcast: Option<moq_net::broadcast::Producer>,
 	catalog: Option<moq_net::track::Producer>,
 	renditions: Vec<Rendition>,
@@ -446,6 +474,52 @@ struct Session {
 	left_at: Option<std::time::Instant>,
 	gap_max: Duration,
 	call_max: Duration,
+}
+
+/// A new session being opened in the background while groups go on
+/// being written.
+struct Redial {
+	task: tokio::task::JoinHandle<Result<(moq_core::wasi::Connected, u64), String>>,
+	since: std::time::Instant,
+	why: String,
+}
+
+/// Dials until a session opens or `window` is spent, a doubling wait
+/// apart. The origin is what the new session announces, so a relay that
+/// took every session back is handed the same broadcast again.
+async fn redial(
+	params: Params,
+	origin: moq_net::origin::Consumer,
+	window: Duration,
+	why: String,
+) -> Result<(moq_core::wasi::Connected, u64), String> {
+	let began = std::time::Instant::now();
+	let mut wait = RECONNECT_FIRST;
+	let mut attempts = 0u64;
+	loop {
+		attempts += 1;
+		let failure = match moq_core::relay::dial(
+			&params.relay,
+			&params.cert,
+			&params.token,
+			moq_net::Client::new().with_publisher(origin.clone()),
+		)
+		.await
+		{
+			Ok(connected) => return Ok((connected, attempts)),
+			Err(err) => err,
+		};
+		let left = window.saturating_sub(began.elapsed());
+		if left.is_zero() {
+			return Err(format!(
+				"{why}; no new session opened within {}s ({attempts} tries, the last: {failure})",
+				window.as_secs()
+			));
+		}
+		eprintln!("publish: connecting again: {failure}; trying again");
+		tokio::time::sleep(wait.min(left)).await;
+		wait = (wait * 2).min(RECONNECT_MAX);
+	}
 }
 
 struct State {
@@ -497,6 +571,76 @@ impl Session {
 		})
 	}
 
+	/// Replaces a session the relay dropped, without holding up the
+	/// groups: the tracks live in the origin, not the session, so they go
+	/// on being written while a new session is dialed in the background,
+	/// and a subscriber on the new one starts at the latest of them.
+	///
+	/// A row goes out when the new session is in. A window spent without
+	/// one, or a window of 0, is what stops the run.
+	async fn mend(&mut self, rows: &mut Vec<String>) -> Result<(), String> {
+		if let Some(redial) = &self.redial {
+			if !redial.task.is_finished() {
+				return Ok(());
+			}
+			let redial = self.redial.take().expect("just looked");
+			let (connected, attempts) = redial
+				.task
+				.await
+				.map_err(|err| format!("{}; {err}", redial.why))??;
+			let down = redial.since.elapsed();
+			self.endpoint = connected.endpoint;
+			self.session = Some(connected.session);
+			self.driver = Some(tokio::task::spawn_local(connected.driver));
+			// A reader on the new session reads the catalog before it names
+			// a rendition, so it goes out again now rather than on the timer.
+			self.publish_catalog()?;
+			eprintln!(
+				"publish: a new session is in after {}ms and {attempts} tries",
+				down.as_millis()
+			);
+			rows.push(
+				serde_json::to_string(&ReconnectRow {
+					event: "reconnect",
+					attempts,
+					down_ms: down.as_millis() as u64,
+					error: &redial.why,
+				})
+				.expect("a reconnect row serializes"),
+			);
+			return Ok(());
+		}
+		let Some(driver) = self.driver.as_mut() else {
+			return Ok(());
+		};
+		if !driver.is_finished() {
+			return Ok(());
+		}
+		let why = match driver.await {
+			Ok(Ok(())) => "the relay closed the session".to_string(),
+			Ok(Err(err)) => err.to_string(),
+			Err(err) => err.to_string(),
+		};
+		self.driver = None;
+		drop(self.session.take());
+		let window = Duration::from_secs(self.params.reconnect_s);
+		if window.is_zero() {
+			return Err(why);
+		}
+		eprintln!("publish: the session ended: {why}; connecting again");
+		self.redial = Some(Redial {
+			task: tokio::task::spawn_local(redial(
+				self.params.clone(),
+				self.origin.consume(),
+				window,
+				why.clone(),
+			)),
+			since: std::time::Instant::now(),
+			why,
+		});
+		Ok(())
+	}
+
 	/// The catalog onto its own track, once, before any fragment. It
 	/// carries every rendition's init segment, so nothing else has to go
 	/// out before the media.
@@ -524,6 +668,9 @@ impl Session {
 		let entered = std::time::Instant::now();
 		if let Some(left) = self.left_at {
 			self.gap_max = self.gap_max.max(entered.duration_since(left));
+		}
+		if !last {
+			self.mend(&mut rows).await?;
 		}
 
 		if !self.started {
@@ -669,6 +816,9 @@ impl Session {
 			tokio::time::sleep(DRAIN).await;
 			drop(self.broadcast.take());
 			drop(self.session.take());
+			if let Some(redial) = self.redial.take() {
+				redial.task.abort();
+			}
 			if let Some(driver) = self.driver.take() {
 				let _ = driver.await;
 			}
@@ -872,7 +1022,7 @@ impl Guest for Publish {
 		// included. The broadcast and its tracks exist before the
 		// session: the session's driver announces whatever the origin
 		// already carries.
-		let (broadcast, catalog, tracks, connected) = executor.enter(async {
+		let (origin, broadcast, catalog, tracks, connected) = executor.enter(async {
 			let origin = moq_net::Origin::random().produce();
 			let mut broadcast = origin
 				.create_broadcast(
@@ -917,7 +1067,7 @@ impl Guest for Publish {
 				moq_net::Client::new().with_publisher(origin.consume()),
 			)
 			.await?;
-			Ok::<_, String>((broadcast, catalog, tracks, connected))
+			Ok::<_, String>((origin, broadcast, catalog, tracks, connected))
 		})?;
 
 		let renditions = built
@@ -954,10 +1104,7 @@ impl Guest for Publish {
 			})
 			.collect();
 
-		let driver = connected.driver;
-		let driver = executor.local.spawn_local(async move {
-			let _ = driver.await;
-		});
+		let driver = executor.local.spawn_local(connected.driver);
 
 		STATE.with(|s| {
 			*s.borrow_mut() = Some(State {
@@ -966,6 +1113,8 @@ impl Guest for Publish {
 					endpoint: connected.endpoint,
 					session: Some(connected.session),
 					driver: Some(driver),
+					origin,
+					redial: None,
 					broadcast: Some(broadcast),
 					catalog: Some(catalog),
 					renditions,
