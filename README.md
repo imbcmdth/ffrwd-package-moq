@@ -334,9 +334,13 @@ new session is in.
 
 A relay that goes away without closing the session - a process gone, a
 network gone - says nothing either side can hear, so each finds out
-when nothing has come back for the QUIC idle timeout, 10 seconds, with
-a keep-alive every 2 seconds holding a quiet session open meanwhile. A
-relay that resets a session closes it, and that is heard at once.
+when nothing has come back for the QUIC idle timeout, 30 seconds, with
+a keep-alive every 2 seconds holding a quiet session open meanwhile. It
+is no shorter because the session runs only inside a host call: a
+module the host stops calling for a while, behind a full pipe or a slow
+rows output, is silent to the relay for that long, and a shorter
+timeout would turn that stall into a dropped session. A relay that
+resets a session closes it, and that is heard at once.
 `tests/live_reconnect.py` kills a local relay a few seconds into a
 paced broadcast and starts it again on the same port: both halves come
 back on the first dial, and the reader's video and audio go on after a

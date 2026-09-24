@@ -62,14 +62,14 @@ BROADCAST = "live/reconnect"
 RATE = 30
 GOP = 30
 SAMPLE_RATE = 48000
-SECONDS = 70
+SECONDS = 90
 WARMUP = 12.0
 DOWN = 4.0
 BUILD_DEADLINE = 1800
 TOOL_DEADLINE = 120
-# The idle timeout (10s) plus the reconnect backoff plus the relay's own
+# The idle timeout (30s) plus the reconnect backoff plus the relay's own
 # start, with room.
-MEND_DEADLINE = 60.0
+MEND_DEADLINE = 90.0
 
 PUBLISH_QUERY = """
 COPY (

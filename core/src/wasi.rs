@@ -28,7 +28,7 @@ const MAX_STREAMS: u32 = 1024;
 /// goes without hearing from the relay before it counts as gone; see
 /// [`connect`].
 const KEEP_ALIVE: Duration = Duration::from_secs(2);
-const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Where and whom to dial: the relay's address, its TLS name, and what
 /// to trust for it.
@@ -104,9 +104,14 @@ pub async fn connect(
 	transport.max_concurrent_bidi_streams(MAX_STREAMS.into());
 	// A relay that goes away without closing the connection - a process
 	// gone, a network gone - is found out only when nothing has come back
-	// for the idle timeout, and quinn's own is 30s of a live stream lost
-	// before anything tries again. A keep-alive holds a quiet session open
-	// meanwhile, so a broadcast with nothing to send is not taken for dead.
+	// for the idle timeout. It stays at quinn's 30s rather than anything
+	// shorter because this session runs only inside a host call: a module
+	// the host stops calling - a downstream pipe full, a sink's rows output
+	// waiting on a slow disk - hears nothing and answers nothing until the
+	// next call, and the relay counts that silence against the same timer.
+	// A shorter one turns a stall into a dropped session. The keep-alive
+	// holds a quiet session open, so a broadcast with nothing to send is
+	// not taken for dead.
 	transport.keep_alive_interval(Some(KEEP_ALIVE));
 	transport.max_idle_timeout(Some(
 		IDLE_TIMEOUT
