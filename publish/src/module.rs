@@ -1114,12 +1114,30 @@ impl Guest for Publish {
 		// session and asks for them alike, so this tie-break is what keeps
 		// a video keyframe from sitting in front of a sound, and either of
 		// them in front of a message announcing what comes next.
-		let kinds: Vec<(u8, bool)> = built
+		//
+		// A track's frame timestamps travel in its own timescale, which
+		// moq-net sets at milliseconds unless told otherwise. A media
+		// track's time rides inside its fragments and the wire's is only a
+		// label, but a message's pts IS the frame's timestamp, so a data
+		// track counts in microseconds, which is what it is written in.
+		let kinds: Vec<(u8, bool, moq_net::Timescale)> = built
 			.iter()
 			.map(|b| match b.media {
-				Media::Video { .. } => (moq_core::catalog::PRIORITY_VIDEO, false),
-				Media::Audio { .. } => (moq_core::catalog::PRIORITY_AUDIO, true),
-				Media::Data { .. } => (moq_core::catalog::PRIORITY_DATA, true),
+				Media::Video { .. } => (
+					moq_core::catalog::PRIORITY_VIDEO,
+					false,
+					moq_net::Timescale::default(),
+				),
+				Media::Audio { .. } => (
+					moq_core::catalog::PRIORITY_AUDIO,
+					true,
+					moq_net::Timescale::default(),
+				),
+				Media::Data { .. } => (
+					moq_core::catalog::PRIORITY_DATA,
+					true,
+					moq_net::Timescale::MICRO,
+				),
 			})
 			.collect();
 
@@ -1154,7 +1172,7 @@ impl Guest for Publish {
 				)
 				.map_err(|err| format!("track '{catalog_name}': {err}"))?;
 			let mut tracks = Vec::with_capacity(names.len());
-			for (name, &(priority, ordered)) in names.iter().zip(&kinds) {
+			for (name, &(priority, ordered, timescale)) in names.iter().zip(&kinds) {
 				// Audio also asks to be served in sequence order. A track's
 				// groups are otherwise newest-first, which is right for
 				// video - a late picture is worth less than the next one -
@@ -1167,7 +1185,10 @@ impl Guest for Publish {
 				let track = broadcast
 					.create_track(
 						name.as_str(),
-						info.clone().with_priority(priority).with_ordered(ordered),
+						info.clone()
+							.with_priority(priority)
+							.with_ordered(ordered)
+							.with_timescale(timescale),
 					)
 					.map_err(|err| format!("track '{name}': {err}"))?;
 				tracks.push(track);

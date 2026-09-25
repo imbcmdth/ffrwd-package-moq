@@ -6,13 +6,12 @@ wit_bindgen::generate!({
 use std::cell::RefCell;
 use std::time::Duration;
 
-use bytes::Bytes;
 use exports::ffrwd::av::packet_source::{
 	Catalog, Guest, Meta, PadPackets, RenditionMeta, SourceTrack, StreamInfo,
 };
 use ffrwd::av::types::{CodedAudio, CodedFormat, CodedStream, CodedVideo, Packet, Rational};
 use moq_core::order::{Hold, Queue};
-use moq_core::subscribe::Start;
+use moq_core::subscribe::{Received, Start, Step};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -161,8 +160,8 @@ impl Executor {
 /// What one reader task says about its track.
 enum Wire {
 	/// One complete group: its sequence and its frames, each frame a
-	/// complete fmp4 fragment.
-	Group(usize, u64, Vec<Bytes>),
+	/// complete fmp4 fragment, or for a data track the one message.
+	Group(usize, u64, Vec<Received>),
 	/// The relay was asked for one group outright and would not serve
 	/// it: it does not have it, so the hole waiting for it is a hole
 	/// nothing will fill. Carries why.
@@ -180,23 +179,33 @@ enum Wire {
 	Lost(usize, String),
 }
 
+/// How a rendition's frames are taken apart.
+enum Body {
+	/// fmp4 fragments, read by the track the init segment describes.
+	Media(ffrwd_bmff::track::Track),
+	/// One message per group: the frame is the message's bytes, and its
+	/// timestamp is the pts, handed on in `1/timescale` ticks.
+	Data { timescale: u32 },
+}
+
 /// One rendition being read: how to take its fragments apart, where its
 /// groups have got to, and whether its packets have started.
 struct Rendition {
-	track: ffrwd_bmff::track::Track,
+	body: Body,
 	video: bool,
-	/// The NAL length prefix this track's `avcC` declares; 0 for audio,
-	/// whose frames carry no framing of their own.
+	/// The NAL length prefix this track's `avcC` declares; 0 for audio
+	/// and data, whose frames carry no framing of their own.
 	length_size: usize,
 	/// Where this reader may start, and what a fragment carrying
 	/// nothing for the track means.
 	join: moq_core::group::Join,
 	/// The group sequence this rendition's fragments arrive in.
-	queue: Queue,
-	/// Its catalog name and init segment, which a broadcast opened again
-	/// on a new session has to carry unchanged.
+	queue: Queue<Received>,
+	/// Its catalog name, init segment and kind, which a broadcast opened
+	/// again on a new session has to carry unchanged.
 	name: String,
 	init: Vec<u8>,
+	kind: moq_core::catalog::Kind,
 	/// Set when the track was taken up on a new session and nothing has
 	/// arrived on it yet: its first group says whether the publisher
 	/// carried on or started again.
@@ -315,12 +324,60 @@ async fn open_broadcast(params: &Params, wait: Duration) -> Result<Opened, Strin
 	})
 }
 
+/// One catalog data rendition as the track a source publishes: JSON
+/// messages in the timescale the catalog names, and nothing else to say.
+fn data_track(
+	index: usize,
+	rendition: &moq_core::catalog::Rendition,
+	timescale: u32,
+) -> Result<SourceTrack, String> {
+	if rendition.codec != "json" {
+		return Err(format!(
+			"rendition '{}' carries '{}' data, and this reads json, one JSON object a message",
+			rendition.name, rendition.codec
+		));
+	}
+	let time_base = Rational {
+		num: 1,
+		den: timescale as i32,
+	};
+	Ok(SourceTrack {
+		coded: CodedStream {
+			codec: rendition.codec.clone(),
+			time_base,
+			format: CodedFormat::Data,
+			extradata: Vec::new(),
+			profile: None,
+			level: None,
+		},
+		info: StreamInfo {
+			index: index as u32,
+			kind: "data".to_string(),
+			codec: rendition.codec.clone(),
+			duration: None,
+			tags: vec![],
+			time_base,
+		},
+		row: rendition.row,
+		rendition: RenditionMeta {
+			name: Some(rendition.name.clone()),
+			bandwidth: None,
+			codecs: Some(rendition.codec.clone()),
+			language: None,
+		},
+	})
+}
+
 /// One catalog rendition as the track a source publishes: its coded
-/// stream read off the init segment, its geometry off the catalog.
+/// stream read off the init segment, its geometry off the catalog. A
+/// data rendition has no init segment, and is [`data_track`]'s.
 fn source_track(
 	index: usize,
 	rendition: &moq_core::catalog::Rendition,
-) -> Result<(SourceTrack, ffrwd_bmff::track::Track), String> {
+) -> Result<(SourceTrack, Body), String> {
+	if let moq_core::catalog::Kind::Data { timescale } = rendition.kind {
+		return Ok((data_track(index, rendition, timescale)?, Body::Data { timescale }));
+	}
 	let track = ffrwd_bmff::track::Track::from_init(&rendition.init)
 		.map_err(|err| format!("rendition '{}': init segment: {err}", rendition.name))?;
 	let time_base = Rational {
@@ -410,7 +467,7 @@ fn source_track(
 				language: None,
 			},
 		},
-		track,
+		Body::Media(track),
 	))
 }
 
@@ -449,15 +506,15 @@ fn catalog_of(
 	let mut readers = Vec::with_capacity(order.len());
 	for &index in order {
 		let rendition = &renditions[index];
-		let (track, demux) = source_track(index, rendition)?;
+		let (track, body) = source_track(index, rendition)?;
 		let video = matches!(rendition.kind, moq_core::catalog::Kind::Video { .. });
-		let length_size = match video {
-			true => ffrwd_nal::config::avcc_length_size(&demux.entry.config),
-			false => 0,
+		let length_size = match (&body, video) {
+			(Body::Media(demux), true) => ffrwd_nal::config::avcc_length_size(&demux.entry.config),
+			_ => 0,
 		};
 		tracks.push(track);
 		readers.push(Rendition {
-			track: demux,
+			body,
 			video,
 			length_size,
 			join: match video {
@@ -467,6 +524,7 @@ fn catalog_of(
 			queue: Queue::new(rendition.name.clone(), start),
 			name: rendition.name.clone(),
 			init: rendition.init.to_vec(),
+			kind: rendition.kind,
 			resumed: false,
 		});
 	}
@@ -712,6 +770,16 @@ impl Reader {
 					rendition.name
 				)));
 			}
+			// A data track has no init segment; what it has to keep is
+			// what it is and the timescale its pts count in.
+			let data = matches!(rendition.kind, moq_core::catalog::Kind::Data { .. });
+			if data && (now.kind != rendition.kind || now.codec != "json") {
+				return Err(Resume::Refused(format!(
+					"the broadcast came back on a new session with track '{}' carrying another \
+					 kind of data or counting it in another timescale",
+					rendition.name
+				)));
+			}
 		}
 		let (sender, frames) = mpsc::unbounded_channel::<Wire>();
 		let mut opening = Vec::with_capacity(self.renditions.len());
@@ -764,8 +832,11 @@ impl Reader {
 		for (index, (rendition, pad)) in self.renditions.iter_mut().zip(pads.iter_mut()).enumerate()
 		{
 			while let Some((_, frames)) = rendition.queue.take(hold, last, &mut ask) {
-				for fragment in frames {
-					any |= take_fragment(rendition, index, &fragment, pad)?;
+				for frame in frames {
+					any |= match rendition.body {
+						Body::Data { timescale } => take_message(timescale, frame, pad),
+						Body::Media(_) => take_fragment(rendition, index, &frame.payload, pad)?,
+					};
 				}
 			}
 			asking.extend(ask.drain(..).map(|sequence| (index, sequence)));
@@ -784,10 +855,15 @@ impl Reader {
 /// Audio has no such gate, every AAC frame being one, so a group with
 /// any sample in it will do. A fragment carrying nothing for this track,
 /// a `moof` whose track fragments are all somebody else's, says nothing
-/// either way, and the next one is read.
-fn decodable(rendition: &Rendition, frames: &[Bytes]) -> bool {
+/// either way, and the next one is read. A message stands alone, so a
+/// data group is always one to start at.
+fn decodable(rendition: &Rendition, frames: &[Received]) -> bool {
+	let track = match &rendition.body {
+		Body::Media(track) => track,
+		Body::Data { .. } => return !frames.is_empty(),
+	};
 	for fragment in frames {
-		let Ok(samples) = rendition.track.fragment_samples(fragment) else {
+		let Ok(samples) = track.fragment_samples(&fragment.payload) else {
 			return false;
 		};
 		if let Some(sample) = samples.first() {
@@ -823,9 +899,12 @@ fn take_fragment(
 	fragment: &[u8],
 	pad: &mut Vec<Packet>,
 ) -> Result<bool, String> {
+	let Body::Media(track) = &rendition.body else {
+		unreachable!("a data track's frames are messages");
+	};
 	let samples = rendition
 		.join
-		.playable(&rendition.track, fragment)
+		.playable(track, fragment)
 		.map_err(|err| format!("track {index}: {err}"))?;
 	let mut any = false;
 	for sample in samples {
@@ -850,6 +929,25 @@ fn take_fragment(
 		any = true;
 	}
 	Ok(any)
+}
+
+/// One message onto a pad: its bytes as they arrived, its pts the frame's
+/// timestamp in the track's own ticks. Every message is a keyframe and
+/// is decoded when it is presented, so dts is the pts.
+fn take_message(timescale: u32, frame: Received, pad: &mut Vec<Packet>) -> bool {
+	let pts = ffrwd_bmff::time::rescale(
+		i64::try_from(frame.timestamp_us).unwrap_or(i64::MAX),
+		1_000_000,
+		u64::from(timescale),
+	);
+	pad.push(Packet {
+		pts,
+		dts: Some(pts),
+		duration: None,
+		keyframe: true,
+		data: frame.payload.to_vec(),
+	});
+	true
 }
 
 struct Subscribe;
@@ -1036,7 +1134,16 @@ async fn fetch_group(
 			.map_err(|err| err.to_string())?;
 		let mut frames = Vec::new();
 		while let Some(frame) = group.read_frame().await.map_err(|err| err.to_string())? {
-			frames.push(frame.payload);
+			frames.push(Received {
+				group: sequence,
+				frame_in_group: frames.len() as u64,
+				timestamp_us: frame
+					.timestamp
+					.convert(moq_net::Timescale::MICRO)
+					.map_err(|err| err.to_string())?
+					.value(),
+				payload: frame.payload,
+			});
 		}
 		Ok::<_, String>(frames)
 	};
@@ -1055,9 +1162,10 @@ async fn fetch_group(
 /// One track's groups onto the shared channel until it finishes, and
 /// the word that it has.
 ///
-/// Frames are gathered per group and the group goes out whole: the
-/// stream reads a group to completion before the next, so the first
-/// frame of another group is what says the one before it is done.
+/// Frames are gathered per group and the group goes out whole, the
+/// moment the stream says it has been read to its end. That matters most
+/// to a data track, whose next group may be a minute away: a message has
+/// to go on when its own group ends, not when the next one begins.
 /// The channel is unbounded on purpose - one track blocking on a full
 /// queue would stop it reading its subscription, and the relay would
 /// age its groups out while another track drained. Nothing accumulates
@@ -1090,22 +1198,29 @@ async fn read_groups(
 		// The group being gathered is dropped on a resubscribe: only a
 		// group read to its end goes out, and the sequence cursor
 		// downstream drops whatever the new subscription repeats.
-		let mut open: Option<(u64, Vec<Bytes>)> = None;
+		let mut open: Option<(u64, Vec<Received>)> = None;
 		let failure = loop {
-			match stream.next().await {
-				Ok(Some(frame)) => match &mut open {
-					Some((sequence, frames)) if *sequence == frame.group => {
-						frames.push(frame.payload)
-					}
+			match stream.step().await {
+				Ok(Some(Step::Frame(frame))) => match &mut open {
+					Some((sequence, frames)) if *sequence == frame.group => frames.push(frame),
 					_ => {
+						// A group whose end was never read, which only a
+						// stream that moved on without one can hand over.
 						if let Some((sequence, frames)) = open.take() {
 							if sender.send(Wire::Group(index, sequence, frames)).is_err() {
 								return;
 							}
 						}
-						open = Some((frame.group, vec![frame.payload]));
+						open = Some((frame.group, vec![frame]));
 					}
 				},
+				Ok(Some(Step::End(ended))) => {
+					if let Some((sequence, frames)) = open.take_if(|(sequence, _)| *sequence == ended) {
+						if sender.send(Wire::Group(index, sequence, frames)).is_err() {
+							return;
+						}
+					}
+				}
 				// The publisher finished the track: its last group goes
 				// out and this reader is done.
 				Ok(None) => {
