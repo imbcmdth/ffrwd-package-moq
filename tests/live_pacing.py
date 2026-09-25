@@ -1,8 +1,8 @@
 """The pacing oracle: what a call costs, and whether any track falls behind real time.
 
     python tests/live_pacing.py [--seconds N] [--rtt MS] [--audio-group-ms N]
-                                [--fixture F] [--drift-max S] [--work DIR]
-                                [--no-build] [--keep]
+                                [--fixture F] [--shape S] [--drift-max S]
+                                [--work DIR] [--no-build] [--keep]
 
 A relay built on moq-transport's `serve` model (Cloudflare's) keeps only a
 track's newest group, so a group overtaken by the next one on its track
@@ -33,8 +33,16 @@ What it reports:
     is the one compared, since a video packet waits for its group at the
     reader and the rest of a group rides that sawtooth.
 
+`--shape leaf` measures a LEAF instead: the paced publisher goes straight
+to the relay as a head, and a second query subscribes to it and publishes
+what it reads, re-encoded, through the round trip. That is what a node of
+a tree does, and its packets arrive the way the head's groups do, whole:
+a GOP of picture at a time and the sound beside it, lumps about a second
+apart. The measured publisher is the leaf's, and the reader reads the
+leaf's broadcast.
+
 The first two windows hold the wait for a first reader and the join, so
-the call figures are read over the windows after them. A package from
+the call and queue figures are read over the windows after them. A package from
 before 0.7.2 (a checkout at 0.7.1, say, run with this file copied in)
 reads the same, without the queue fields: that is the comparison the
 README's tables are.
@@ -105,6 +113,23 @@ COPY (
   WITH (video_bitrate '800k', gop 30, preset 'veryfast', tune 'zerolatency',
         audio_bitrate '128k')
 """
+
+# The leaf of `--shape leaf`: the head's broadcast read at the live edge and
+# published again, as a node of a tree does.
+LEAF_QUERY = """
+COPY (
+  SELECT s.video[1], s.audio[1], s.data[1]
+  FROM ffrwd.moq.subscribe(:'from_relay', :'from', COALESCE(:'cert', ''), '', 'live', 1000) s
+) TO ffrwd.moq.publish(:'relay', :'broadcast', COALESCE(:'cert', ''), '', :group_ms, 'summary')
+  WITH (video_bitrate '800k', gop 30, preset 'veryfast', tune 'zerolatency',
+        audio_bitrate '128k')
+"""
+
+# The head's broadcast under `--shape leaf`; the leaf publishes BROADCAST,
+# which is what the reader reads.
+HEAD_BROADCAST = "live/head"
+# How long the head has before the leaf compiles against its catalog.
+HEAD_START = 4.0
 
 
 class Delay:
@@ -186,17 +211,17 @@ class Delay:
         self.back.close()
 
 
-def start_publisher(query: Path, source: Path, port: int, cert_hex: str,
-                    fixture: str, group_ms: int) -> Tail:
+def start_publisher(query: Path, port: int, cert_hex: str, group_ms: int,
+                    broadcast: str, **values: object) -> Tail:
     env = dict(os.environ)
     env.setdefault("FFRWD_WASM", str(SIDECAR))
     argv = ffrwd_argv("run", "-f", str(query),
-                      "-v", f"source={source}",
-                      "-v", f"messages={DATA / f'{fixture}.nut'}",
                       "-v", f"relay=moqt://127.0.0.1:{port}",
-                      "-v", f"broadcast={BROADCAST}",
+                      "-v", f"broadcast={broadcast}",
                       "-v", f"cert={cert_hex}",
-                      "-v", f"group_ms={group_ms}", "-q")
+                      "-v", f"group_ms={group_ms}",
+                      *[arg for name, value in values.items()
+                        for arg in ("-v", f"{name}={value}")], "-q")
     print("+ publisher:", " ".join(argv[:6]), "...", flush=True)
     return Tail(spawn(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                       text=True, env=env, cwd=PACKAGE))
@@ -259,9 +284,10 @@ def drift(timed: list[tuple[float, float]]) -> dict | None:
 
 def one_run(args: argparse.Namespace) -> None:
     work = Path(tempfile.mkdtemp(prefix="moq-pacing-", dir=args.work))
-    relay = publisher = reader = None
+    relay = publisher = reader = head = None
     delay = None
     query = PACKAGE / ".live-pacing-publish.sql"
+    leaf_query = PACKAGE / ".live-pacing-leaf.sql"
     try:
         if args.build:
             certgen = build_guests(BUILD_DEADLINE)[2]
@@ -284,14 +310,30 @@ def one_run(args: argparse.Namespace) -> None:
         print(f"publisher's path: 127.0.0.1:{delay.port}, {args.rtt:.0f} ms round trip",
               flush=True)
 
-        publisher = start_publisher(query, source, delay.port, cert_hex, args.fixture,
-                                    args.audio_group_ms)
+        messages = DATA / f"{args.fixture}.nut"
+        if args.shape == "leaf":
+            head = start_publisher(query, port, cert_hex, args.audio_group_ms,
+                                   HEAD_BROADCAST, source=source, messages=messages)
+            time.sleep(HEAD_START)
+            leaf_query.write_text(LEAF_QUERY)
+            publisher = start_publisher(leaf_query, delay.port, cert_hex,
+                                        args.audio_group_ms, BROADCAST,
+                                        from_relay=f"moqt://127.0.0.1:{port}",
+                                        **{"from": HEAD_BROADCAST})
+        else:
+            publisher = start_publisher(query, delay.port, cert_hex, args.audio_group_ms,
+                                        BROADCAST, source=source, messages=messages)
         started = time.monotonic()
         pipes = {name: TimedPipe(f"pacing-{name}", work / f"{name}.nut")
                  for name in TRACKS}
         reader = start_reader(port, cert_hex,
                               [(TRACKS[name], pipes[name].spelling) for name in TRACKS])
 
+        if head is not None:
+            headed = head.finish(args.seconds + 240)
+            (work / "head.err").write_text(head.text()[1], encoding="utf-8")
+            if headed != 0:
+                print(f"the head exited {headed}:\n{head.text()[1][-1500:]}")
         published = publisher.finish(args.seconds + 240)
         read = reader.finish(120)
         for pipe in pipes.values():
@@ -329,17 +371,23 @@ def one_run(args: argparse.Namespace) -> None:
         for window in windows(rows):
             for row in window:
                 final[row["track"]] = row
+        gaps = [window[0].get("gap_max_ms") for window in windows(rows)][2:]
+        if gaps:
+            print(f"gap_max_ms over windows 2 to {len(calls) - 1}: min {min(gaps)}, "
+                  f"median {statistics.median(gaps)}, max {max(gaps)}")
         for name, row in final.items():
             if "queue_max" in row:
-                worst_q = max(r.get("queue_max", 0) for w in windows(rows) for r in w
-                              if r["track"] == name)
-                worst_w = max(r.get("wait_max_ms", 0) for w in windows(rows) for r in w
-                              if r["track"] == name)
-                unpaced = sum(r.get("unpaced", 0) for w in windows(rows) for r in w
-                              if r["track"] == name)
-                print(f"  {name}: queued at most {worst_q}, waited at most {worst_w} ms, "
-                      f"{unpaced} released unpaced; groups {row['groups']}, on the wire "
-                      f"{row['appended']} appended {row['closed']} closed")
+                every = [r for w in windows(rows) for r in w if r["track"] == name]
+                after = [r for w in windows(rows)[2:] for r in w if r["track"] == name]
+                print(f"  {name}: groups {row['groups']}, on the wire {row['appended']} "
+                      f"appended {row['closed']} closed")
+                for label, seen in (("whole run", every), ("after the join", after)):
+                    if not seen:
+                        continue
+                    waits = [r.get("wait_max_ms", 0) for r in seen]
+                    print(f"    {label:14}: queue_max {max(r.get('queue_max', 0) for r in seen)}, "
+                          f"wait_max_ms max {max(waits)} median {statistics.median(waits)}, "
+                          f"unpaced {sum(r.get('unpaced', 0) for r in seen)}")
         trailing = [row for row in rows if "tracks" in row]
         if trailing:
             print("trailing:", json.dumps(trailing[-1]))
@@ -382,7 +430,7 @@ def one_run(args: argparse.Namespace) -> None:
             sys.exit(1)
         print("=== PASS: every message arrived and no track fell behind ===")
     finally:
-        for child in (reader, publisher):
+        for child in (reader, publisher, head):
             if child is not None:
                 kill_tree(child.child)
         if relay is not None:
@@ -390,6 +438,7 @@ def one_run(args: argparse.Namespace) -> None:
         if delay is not None:
             delay.stop()
         query.unlink(missing_ok=True)
+        leaf_query.unlink(missing_ok=True)
         if not args.keep:
             shutil.rmtree(work, ignore_errors=True)
         else:
@@ -403,6 +452,8 @@ def main() -> None:
                         help="the round trip the forwarder adds between publisher and relay, ms")
     parser.add_argument("--audio-group-ms", type=int, default=200)
     parser.add_argument("--fixture", default="pairs", choices=("messages", "pairs"))
+    parser.add_argument("--shape", default="head", choices=("head", "leaf"),
+                        help="measure the paced publisher itself, or a leaf republishing it")
     parser.add_argument("--drift-max", type=float, default=DRIFT_MAX,
                         help="seconds a track may come out later at the end than at the start")
     parser.add_argument("--work", default=str(PACKAGE / "target"),
