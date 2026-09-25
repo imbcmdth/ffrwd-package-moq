@@ -234,12 +234,16 @@ impl Executor {
 enum Media {
 	Video { width: u32, height: u32 },
 	Audio { sample_rate: u32, channels: u32 },
+	/// JSON messages, their pts counted in `timescale` units per second
+	/// as the catalog says; see [`message_timescale`].
+	Data { timescale: u32 },
 }
 
 /// One stream packaged before the relay is dialed, waiting for the MoQ
 /// tracks it will publish on.
 struct Built {
-	muxer: ffrwd_bmff::mux::Muxer,
+	/// None for a data stream, whose messages travel as they are.
+	muxer: Option<ffrwd_bmff::mux::Muxer>,
 	codec: String,
 	media: Media,
 	time_base: (i32, i32),
@@ -249,7 +253,9 @@ struct Built {
 }
 
 /// One track: one encoded stream, its own fmp4 muxer, and the MoQ track
-/// carrying its fragments. The init segment rides inside the catalog.
+/// carrying its fragments. The init segment rides inside the catalog. A
+/// data track has no muxer: each message is one frame in a group of its
+/// own, its bytes as they arrived.
 struct Rendition {
 	name: String,
 	codec: String,
@@ -260,7 +266,7 @@ struct Rendition {
 	/// Which fragments open a group: this package's own convention, not
 	/// anything the muxer decides.
 	discipline: moq_core::group::Groups,
-	muxer: ffrwd_bmff::mux::Muxer,
+	muxer: Option<ffrwd_bmff::mux::Muxer>,
 	time_base: (i32, i32),
 	length_size: usize,
 	init_bytes: u64,
@@ -303,8 +309,14 @@ impl Rendition {
 				}
 				Ok(framed)
 			}
-			Media::Audio { .. } => Ok(data.to_vec()),
+			Media::Audio { .. } | Media::Data { .. } => Ok(data.to_vec()),
 		}
+	}
+
+	/// The fmp4 muxer a media track packages through; a data track has
+	/// none, and is never handed to one.
+	fn muxer(&mut self) -> &mut ffrwd_bmff::mux::Muxer {
+		self.muxer.as_mut().expect("a media track has a muxer")
 	}
 
 	/// Publishes one single-sample fragment as one MoQ frame in the
@@ -320,8 +332,22 @@ impl Rendition {
 		fragment: ffrwd_bmff::mux::Fragment,
 		emit: bool,
 	) -> Result<Vec<String>, String> {
+		self.publish_frame(fragment.pts, fragment.keyframe, fragment.bytes, emit)
+	}
+
+	/// One MoQ frame at `pts`, in the open group or one the discipline
+	/// opens for it: an fmp4 fragment for media, a message's own bytes
+	/// for data, whose discipline gives every message a group and closes
+	/// it at once.
+	fn publish_frame(
+		&mut self,
+		pts: i64,
+		keyframe: bool,
+		bytes: Vec<u8>,
+		emit: bool,
+	) -> Result<Vec<String>, String> {
 		let mut rows = Vec::new();
-		if self.discipline.starts_a_group(fragment.keyframe, fragment.pts) {
+		if self.discipline.starts_a_group(keyframe, pts) {
 			rows.extend(self.close_group(emit)?);
 			let track = self.track.as_mut().expect("track lives until last");
 			self.group = Some(
@@ -332,24 +358,23 @@ impl Rendition {
 			self.appended += 1;
 			self.group_packets = 0;
 			self.group_bytes = 0;
-			self.group_pts_min = fragment.pts;
-			self.group_pts_max = fragment.pts;
+			self.group_pts_min = pts;
+			self.group_pts_max = pts;
 		}
-		let timestamp_us =
-			ffrwd_bmff::time::ticks_to_micros(fragment.pts, self.time_base.0, self.time_base.1);
-		let bytes_len = fragment.bytes.len() as u64;
+		let timestamp_us = ffrwd_bmff::time::ticks_to_micros(pts, self.time_base.0, self.time_base.1);
+		let bytes_len = bytes.len() as u64;
 		let group = self.group.as_mut().expect("a group start opened one");
 		group
 			.write_frame(
 				moq_net::Timestamp::from_micros(timestamp_us)
 					.map_err(|err| format!("moq timestamp: {err}"))?,
-				Bytes::from(fragment.bytes),
+				Bytes::from(bytes),
 			)
 			.map_err(|err| format!("moq frame: {err}"))?;
 		self.group_packets += 1;
 		self.group_bytes += bytes_len;
-		self.group_pts_min = self.group_pts_min.min(fragment.pts);
-		self.group_pts_max = self.group_pts_max.max(fragment.pts);
+		self.group_pts_min = self.group_pts_min.min(pts);
+		self.group_pts_max = self.group_pts_max.max(pts);
 		self.bytes += bytes_len;
 		if self.discipline.one_fragment_each() {
 			rows.extend(self.close_group(emit)?);
@@ -406,13 +431,17 @@ impl Rendition {
 	/// The catalog entry naming this track: its decoder configuration
 	/// and its init segment inside.
 	fn catalog_entry(&mut self) -> moq_core::catalog::Track {
-		let init = self.muxer.init_segment();
+		if let Media::Data { timescale } = self.media {
+			return moq_core::catalog::Track::data(self.name.clone(), self.codec.clone(), timescale);
+		}
+		let init = self.muxer().init_segment();
 		self.init_bytes = init.len() as u64;
+		let muxer = self.muxer.as_ref().expect("a media track has a muxer");
 		match self.media {
 			Media::Video { width, height } => moq_core::catalog::Track::video(
 				self.name.clone(),
 				self.codec.clone(),
-				self.muxer.config(),
+				muxer.config(),
 				width,
 				height,
 				init,
@@ -423,12 +452,24 @@ impl Rendition {
 			} => moq_core::catalog::Track::audio(
 				self.name.clone(),
 				self.codec.clone(),
-				self.muxer.config(),
+				muxer.config(),
 				sample_rate,
 				channels,
 				init,
 			),
+			Media::Data { .. } => unreachable!("a data track returned above"),
 		}
+	}
+}
+
+/// The timescale a data track's catalog entry names: the stream's own
+/// ticks per second when its time base counts whole ticks (`1/n`), and
+/// microseconds otherwise, which is what the wire's timestamps count in
+/// anyway.
+fn message_timescale(num: i32, den: i32) -> u32 {
+	match (num, u32::try_from(den)) {
+		(1, Ok(den)) if den > 0 => den,
+		_ => 1_000_000,
 	}
 }
 
@@ -707,22 +748,56 @@ impl Session {
 			self.publish_catalog()?;
 		}
 
+		// Messages first, each one its own group, written and put on the
+		// socket before any media of the same call is touched. A message is
+		// an announcement - a break named seconds ahead of its cue - and
+		// what it announces is the media behind it, so it must not wait in
+		// this call behind a GOP's worth of fragments.
+		let mut messages = false;
 		for (index, pad) in pads.iter().enumerate() {
 			let Some(rendition) = self.renditions.get_mut(index) else {
 				continue;
 			};
+			if !matches!(rendition.media, Media::Data { .. }) {
+				continue;
+			}
+			for packet in &pad.packets {
+				rendition.packets += 1;
+				rows.extend(rendition.publish_frame(
+					packet.pts,
+					true,
+					packet.data.clone(),
+					per_group,
+				)?);
+				drive_once().await;
+				messages = true;
+			}
+		}
+		if messages {
+			for _ in 0..FLUSH_TURNS {
+				tokio::time::sleep(FLUSH_SLICE).await;
+			}
+		}
+
+		for (index, pad) in pads.iter().enumerate() {
+			let Some(rendition) = self.renditions.get_mut(index) else {
+				continue;
+			};
+			if matches!(rendition.media, Media::Data { .. }) {
+				continue;
+			}
 			for packet in &pad.packets {
 				let stored = rendition.stored(packet.pts, &packet.data)?;
+				// Every AAC frame can be decoded from, whatever the wire
+				// said about it.
+				let keyframe = packet.keyframe || matches!(rendition.media, Media::Audio { .. });
 				let fragments = rendition
-					.muxer
+					.muxer()
 					.push(ffrwd_bmff::mux::Packet {
 						pts: packet.pts,
 						dts: packet.dts,
 						duration: packet.duration,
-						// Every AAC frame can be decoded from, whatever
-						// the wire said about it.
-						keyframe: packet.keyframe
-							|| matches!(rendition.media, Media::Audio { .. }),
+						keyframe,
 						data: &stored,
 					})
 					.map_err(|err| {
@@ -794,9 +869,14 @@ impl Session {
 			// it is over while its own tail is still queued loses that
 			// tail. The yield is what lets the driver move them.
 			for index in 0..self.renditions.len() {
-				let flushed = self.renditions[index].muxer.finish().map_err(|err| {
-					format!("track '{}': {err}", self.renditions[index].name)
-				})?;
+				// A data track's groups are closed as they are written, and
+				// it has no muxer holding anything back.
+				let flushed = match self.renditions[index].muxer.as_mut() {
+					Some(muxer) => muxer.finish().map_err(|err| {
+						format!("track '{}': {err}", self.renditions[index].name)
+					})?,
+					None => Vec::new(),
+				};
 				for fragment in flushed {
 					rows.extend(self.renditions[index].publish_fragment(fragment, per_group)?);
 				}
@@ -868,11 +948,11 @@ impl Guest for Publish {
 			video_codecs: vec!["h264".to_string()],
 			audio_codecs: vec!["aac".to_string()],
 			// One broadcast carries as many renditions as the query names,
-			// and the audio it names beside them - or none, for a query
-			// that has none.
+			// and the audio and the data streams it names beside them - or
+			// none, for a query that has none.
 			video: Arity::Many,
 			audio: Arity::Any,
-			data: Arity::Zero,
+			data: Arity::Any,
 			// Every packet is published, so every packet is wanted.
 			wants: Wants::All,
 		}
@@ -935,7 +1015,7 @@ impl Guest for Publish {
 						)
 					})?;
 					Built {
-						muxer,
+						muxer: Some(muxer),
 						codec,
 						media: Media::Video {
 							width: video.width,
@@ -968,7 +1048,7 @@ impl Guest for Publish {
 						)
 					})?;
 					Built {
-						muxer,
+						muxer: Some(muxer),
 						// The AudioSpecificConfig crosses as extradata,
 						// and is what names the codec.
 						codec: moq_core::catalog::aac_codec(&coded.extradata),
@@ -981,10 +1061,25 @@ impl Guest for Publish {
 					}
 				}
 				CodedFormat::Data => {
-					return Err(format!(
-						"publish packages h264 video and aac audio, and this stream is {} data",
-						coded.codec
-					))
+					if coded.codec != "json" {
+						return Err(format!(
+							"publish carries json data, one JSON object a message, and this data \
+							 stream is {}",
+							coded.codec
+						));
+					}
+					Built {
+						muxer: None,
+						codec: coded.codec.clone(),
+						media: Media::Data {
+							timescale: message_timescale(
+								coded.time_base.num,
+								coded.time_base.den,
+							),
+						},
+						time_base: (coded.time_base.num, coded.time_base.den),
+						length_size: 0,
+					}
 				}
 			});
 		}
@@ -1003,6 +1098,7 @@ impl Guest for Publish {
 				kind: match b.media {
 					Media::Video { height, .. } => moq_core::catalog::RowKind::Video { height },
 					Media::Audio { .. } => moq_core::catalog::RowKind::Audio,
+					Media::Data { .. } => moq_core::catalog::RowKind::Data,
 				},
 				name: stream.rendition.name.clone(),
 			})
@@ -1016,12 +1112,14 @@ impl Guest for Publish {
 		// What each track is worth when the session has more to send than
 		// the wire takes. A relay reads every track of a broadcast on one
 		// session and asks for them alike, so this tie-break is what keeps
-		// a video keyframe from sitting in front of a sound.
-		let priorities: Vec<u8> = built
+		// a video keyframe from sitting in front of a sound, and either of
+		// them in front of a message announcing what comes next.
+		let kinds: Vec<(u8, bool)> = built
 			.iter()
 			.map(|b| match b.media {
-				Media::Video { .. } => moq_core::catalog::PRIORITY_VIDEO,
-				Media::Audio { .. } => moq_core::catalog::PRIORITY_AUDIO,
+				Media::Video { .. } => (moq_core::catalog::PRIORITY_VIDEO, false),
+				Media::Audio { .. } => (moq_core::catalog::PRIORITY_AUDIO, true),
+				Media::Data { .. } => (moq_core::catalog::PRIORITY_DATA, true),
 			})
 			.collect();
 
@@ -1056,7 +1154,7 @@ impl Guest for Publish {
 				)
 				.map_err(|err| format!("track '{catalog_name}': {err}"))?;
 			let mut tracks = Vec::with_capacity(names.len());
-			for (name, priority) in names.iter().zip(&priorities) {
+			for (name, &(priority, ordered)) in names.iter().zip(&kinds) {
 				// Audio also asks to be served in sequence order. A track's
 				// groups are otherwise newest-first, which is right for
 				// video - a late picture is worth less than the next one -
@@ -1064,12 +1162,12 @@ impl Guest for Publish {
 				// the one behind it cannot stand in. moq-net carries this in
 				// TRACK_INFO and a subscriber takes it as the default for
 				// its own subscription, so it reaches the relay's re-serve
-				// rather than only our own queue.
-				let ordered = *priority == moq_core::catalog::PRIORITY_AUDIO;
+				// rather than only our own queue. Data asks the same: every
+				// message counts, and a newer one does not stand in for it.
 				let track = broadcast
 					.create_track(
 						name.as_str(),
-						info.clone().with_priority(*priority).with_ordered(ordered),
+						info.clone().with_priority(priority).with_ordered(ordered),
 					)
 					.map_err(|err| format!("track '{name}': {err}"))?;
 				tracks.push(track);
@@ -1096,6 +1194,7 @@ impl Guest for Publish {
 				group: None,
 				discipline: match built.media {
 					Media::Video { .. } => moq_core::group::Groups::video(),
+					Media::Data { .. } => moq_core::group::Groups::messages(),
 					Media::Audio { .. } => moq_core::group::Groups::audio(
 						built.time_base.0,
 						built.time_base.1,
