@@ -27,6 +27,14 @@ const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"s
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How many sessions a probe opens before a broadcast that was not
+/// announced on any of them is refused. A fresh session's announce can
+/// arrive late, or not at all, from a public relay that has the broadcast:
+/// Cloudflare's refused three probes of one that a live reader joined
+/// meanwhile, and a second try took. A broadcast that is not there is
+/// still refused, within twice [`PROBE_TIMEOUT`].
+const PROBE_DIALS: u32 = 2;
+
 /// How long one wait for the wire lasts before the hold's own clocks
 /// are looked at again. The hold releases on a deadline as well as on
 /// an arrival, so a call that parked on the channel alone would sleep
@@ -281,28 +289,52 @@ struct Opened {
 
 /// Connects, waits for the broadcast to be announced and reads its
 /// catalog. The session driver is spawned here and runs whenever a
-/// call blocks on the executor.
-async fn open_broadcast(params: &Params, wait: Duration) -> Result<Opened, String> {
-	let origin = moq_net::Origin::random().produce();
-	let connected = moq_core::relay::dial(
-		&params.relay,
-		&params.cert,
-		&params.token,
-		moq_net::Client::new().with_subscriber(origin.clone()),
-	)
-	.await?;
-	let driver = tokio::task::spawn_local(connected.driver);
-
+/// call blocks on the executor. A broadcast not announced within `wait`
+/// is asked for again on a new session, up to `dials` sessions in all.
+async fn open_broadcast(params: &Params, wait: Duration, dials: u32) -> Result<Opened, String> {
 	let path = params.broadcast.as_str();
-	let broadcast = tokio::time::timeout(wait, origin.consume().announced_broadcast(path))
-		.await
-		.map_err(|_| {
-			format!(
-				"broadcast '{path}' was not announced within {}s",
-				wait.as_secs()
-			)
-		})?
-		.ok_or_else(|| format!("broadcast '{path}' is not on the relay"))?;
+	let mut dialed = 0;
+	let (endpoint, session, driver, broadcast) = loop {
+		dialed += 1;
+		let origin = moq_net::Origin::random().produce();
+		let moq_core::wasi::Connected {
+			endpoint,
+			session,
+			driver,
+		} = moq_core::relay::dial(
+			&params.relay,
+			&params.cert,
+			&params.token,
+			moq_net::Client::new().with_subscriber(origin.clone()),
+		)
+		.await?;
+		let driver = tokio::task::spawn_local(driver);
+		match tokio::time::timeout(wait, origin.consume().announced_broadcast(path)).await {
+			Ok(Some(broadcast)) => break (endpoint, session, driver, broadcast),
+			Ok(None) => return Err(format!("broadcast '{path}' is not on the relay")),
+			Err(_) if dialed < dials => {
+				eprintln!(
+					"subscribe: broadcast '{path}' was not announced within {}s; asking on a \
+					 new session",
+					wait.as_secs()
+				);
+				driver.abort();
+				drop(session);
+				endpoint.wait_idle().await;
+			}
+			Err(_) => {
+				return Err(format!(
+					"broadcast '{path}' was not announced within {}s{}",
+					wait.as_secs(),
+					if dials > 1 {
+						format!(", on each of {dials} sessions")
+					} else {
+						String::new()
+					}
+				))
+			}
+		}
+	};
 
 	let document = tokio::time::timeout(wait, moq_core::subscribe::read_catalog(&broadcast))
 		.await
@@ -315,8 +347,8 @@ async fn open_broadcast(params: &Params, wait: Duration) -> Result<Opened, Strin
 		.map_err(|err| format!("broadcast '{path}': {err}"))?;
 
 	Ok(Opened {
-		endpoint: connected.endpoint,
-		session: connected.session,
+		endpoint,
+		session,
 		driver,
 		broadcast,
 		renditions: moq_core::catalog::parse(&document)
@@ -718,7 +750,7 @@ impl Reader {
 		loop {
 			attempts += 1;
 			let left = window.saturating_sub(began.elapsed());
-			let failure = match open_broadcast(&self.params, left.max(RECONNECT_FIRST)).await {
+			let failure = match open_broadcast(&self.params, left.max(RECONNECT_FIRST), 1).await {
 				Ok(opened) => match self.resume(opened).await {
 					Ok(()) => {
 						moq_core::order::report_reconnect(
@@ -984,7 +1016,7 @@ impl Guest for Subscribe {
 		let (params, start) = parse_params(&params)?;
 		let executor = Executor::new()?;
 		executor.enter(async {
-			let opened = open_broadcast(&params, PROBE_TIMEOUT).await?;
+			let opened = open_broadcast(&params, PROBE_TIMEOUT, PROBE_DIALS).await?;
 			// The whole catalog, which is what makes the rows known at
 			// compile time. It is built before the session closes, so a
 			// rendition this module cannot read is named here rather
@@ -1002,7 +1034,7 @@ impl Guest for Subscribe {
 		let (params, start) = parse_params(&params)?;
 		let executor = Executor::new()?;
 		let (catalog, reader) = executor.enter(async {
-			let opened = open_broadcast(&params, OPEN_TIMEOUT).await?;
+			let opened = open_broadcast(&params, OPEN_TIMEOUT, 1).await?;
 			let order = chosen(&opened.renditions, &tracks)?;
 			// One line per run naming what this source pulls, so a run can
 			// be read back against the catalog it narrowed.

@@ -242,7 +242,11 @@ COPY (
 ```
 
 The catalog is read at compile time, the way ffprobe reads a file, so
-the broadcast must be on the relay before the query compiles.
+the broadcast must be on the relay before the query compiles. A probe
+that sees no announce within 15 seconds asks again on a new session
+before it refuses the query: Cloudflare's relay has been seen not to
+announce a broadcast that was up to a fresh session, and a second one
+took. A broadcast that is not there is refused within 30 seconds.
 
 What a broadcast carries decides the shape of a query over it. A
 demuxed ladder puts a rung's video and the broadcast's audio on
