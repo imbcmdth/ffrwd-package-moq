@@ -6,9 +6,11 @@ encoded on the way out. `subscribe` is a FROM relation: a broadcast
 arrives as rows, one per rendition, and the query does what it likes
 with them.
 
-Needs ffrwd 0.18.1 or later. Before it, sound that passed through a
-module left the sidecar seconds at a time, and a live broadcast
-published from such a query lost most of its audio.
+Needs ffrwd 0.19.0 or later: the modules are built on the world
+`ffrwd:av@0.17.0`, which no sidecar before it hosts. Before 0.18.1,
+sound that passed through a module left the sidecar seconds at a time,
+and a live broadcast published from such a query lost most of its
+audio.
 
 ## Publish
 

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use exports::ffrwd::av::packet_sink::{
-	Arity, Guest, InputStream, Meta, PacketSinkMeta, PadPackets, Processed,
+	Arity, Guest, InputStream, Meta, PacketSinkMeta, PadPackets, Processed, Wants,
 };
 use ffrwd::av::types::CodedFormat;
 use serde::{Deserialize, Serialize};
@@ -868,6 +868,9 @@ impl Guest for Publish {
 			// that has none.
 			video: Arity::Many,
 			audio: Arity::Any,
+			data: Arity::Zero,
+			// Every packet is published, so every packet is wanted.
+			wants: Wants::All,
 		}
 	}
 
@@ -972,6 +975,12 @@ impl Guest for Publish {
 						time_base: (coded.time_base.num, coded.time_base.den),
 						length_size: 0,
 					}
+				}
+				CodedFormat::Data => {
+					return Err(format!(
+						"publish packages h264 video and aac audio, and this stream is {} data",
+						coded.codec
+					))
 				}
 			});
 		}
