@@ -1,6 +1,6 @@
 {
  "name": "ffrwd/moq",
- "version": "0.7.4",
+ "version": "0.8.0",
  "description": "Media over QUIC - publish a query's streams TO a relay broadcast, and subscribe to one as a FROM relation. Publishing packages each encoded stream as fragmented MP4 and a hang catalog naming the renditions with their init segments.",
  "license": "Apache-2.0",
  "homepage": "https://github.com/imbcmdth/ffrwd-package-moq",
