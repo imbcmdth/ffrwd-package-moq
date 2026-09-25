@@ -10,6 +10,12 @@
 //! `moof`+`mdat` fragment - whose init segment (`ftyp`+`moov`) rides
 //! INSIDE the catalog entry as base64, not on a track of its own.
 //!
+//! A `data` section beside the two is this package's own, for tracks of
+//! messages rather than media: each rendition names its codec (`json`)
+//! and the timescale its pts count in, and its frames are the messages
+//! themselves, one to a group, with no container around them. hang's
+//! catalog does not deny unknown fields, so a player reads past it.
+//!
 //! Built by hand against hang 0.20.7's `catalog` module rather than by
 //! depending on the crate: this side compiles to wasm32-wasip2 inside
 //! the publish module, and the document is plain serde. The live test's
@@ -37,6 +43,14 @@ pub const PRIORITY_CATALOG: u8 = 100;
 pub const PRIORITY_AUDIO: u8 = 80;
 /// Video's delivery priority; see [`PRIORITY_CATALOG`].
 pub const PRIORITY_VIDEO: u8 = 60;
+/// A data track's delivery priority, above audio as well as video. A
+/// message is a few hundred bytes a few times a minute, so putting it
+/// first costs the sound nothing a listener could hear, and it is an
+/// announcement: a break announced ahead of its cue has to reach the
+/// node that acts on it before the media it refers to, which a message
+/// waiting behind a queue of audio groups may not. hang has no number
+/// for it, and a player never asks for the track.
+pub const PRIORITY_DATA: u8 = 90;
 
 /// The buffer depth recommended to AUDIO readers, in milliseconds.
 /// Live capture hands the pipeline audio in bursts hundreds of
@@ -80,6 +94,18 @@ pub struct AudioRendition {
 	pub container: Container,
 }
 
+/// One data rendition's entry, this package's own: a track of messages,
+/// each one MoQ group of one frame, the frame the message's bytes.
+#[derive(Debug, PartialEq, Serialize)]
+pub struct DataRendition {
+	/// What a message is: `json`, one UTF-8 JSON object.
+	pub codec: String,
+	/// The units per second the messages' pts count in, which is the
+	/// time base a reader hands them on in. A frame's timestamp on the
+	/// wire is microseconds whatever this says.
+	pub timescale: u32,
+}
+
 /// The container a rendition's frames travel in: `cmaf`, the init
 /// segment carried inside the entry.
 #[derive(Debug, PartialEq)]
@@ -108,6 +134,7 @@ impl Serialize for Container {
 pub enum Track {
 	Video(String, VideoRendition),
 	Audio(String, AudioRendition),
+	Data(String, DataRendition),
 }
 
 impl Track {
@@ -156,10 +183,16 @@ impl Track {
 		)
 	}
 
+	/// A data track: its codec and the timescale its messages' pts count
+	/// in. It has no decoder configuration and no init segment.
+	pub fn data(name: String, codec: String, timescale: u32) -> Self {
+		Track::Data(name, DataRendition { codec, timescale })
+	}
+
 	/// The track's name, whichever kind it is.
 	pub fn name(&self) -> &str {
 		match self {
-			Track::Video(name, _) | Track::Audio(name, _) => name,
+			Track::Video(name, _) | Track::Audio(name, _) | Track::Data(name, _) => name,
 		}
 	}
 }
@@ -169,6 +202,10 @@ impl Track {
 pub struct Catalog {
 	video: Renditions<VideoRendition>,
 	audio: Renditions<AudioRendition>,
+	// Left out when there is none, so a broadcast of media alone writes
+	// the document it always wrote.
+	#[serde(skip_serializing_if = "Renditions::is_empty")]
+	data: Renditions<DataRendition>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -178,10 +215,17 @@ struct Renditions<T> {
 	renditions: std::collections::BTreeMap<String, T>,
 }
 
+impl<T> Renditions<T> {
+	fn is_empty(&self) -> bool {
+		self.renditions.is_empty()
+	}
+}
+
 impl Catalog {
 	pub fn new(tracks: Vec<Track>) -> Self {
 		let mut video = std::collections::BTreeMap::new();
 		let mut audio = std::collections::BTreeMap::new();
+		let mut data = std::collections::BTreeMap::new();
 		for track in tracks {
 			match track {
 				Track::Video(name, entry) => {
@@ -190,11 +234,15 @@ impl Catalog {
 				Track::Audio(name, entry) => {
 					audio.insert(name, entry);
 				}
+				Track::Data(name, entry) => {
+					data.insert(name, entry);
+				}
 			}
 		}
 		Catalog {
 			video: Renditions { renditions: video },
 			audio: Renditions { renditions: audio },
+			data: Renditions { renditions: data },
 		}
 	}
 
@@ -234,12 +282,13 @@ fn base64(bytes: &[u8]) -> String {
 pub struct Rendition {
 	/// The MoQ track its fragments arrive on.
 	pub name: String,
-	/// The RFC 6381 string the catalog spelled.
+	/// The RFC 6381 string the catalog spelled; `json` for data.
 	pub codec: String,
 	/// The decoder configuration, hex-decoded: the `avcC` record for
-	/// video, the AudioSpecificConfig for audio.
+	/// video, the AudioSpecificConfig for audio, nothing for data.
 	pub config: Vec<u8>,
-	/// The `ftyp`+`moov` out of the `cmaf` container, base64-decoded.
+	/// The `ftyp`+`moov` out of the `cmaf` container, base64-decoded;
+	/// nothing for data, which has no container.
 	pub init: Vec<u8>,
 	pub kind: Kind,
 	/// Which relation row it belongs to; see [`rows`].
@@ -251,6 +300,8 @@ pub struct Rendition {
 pub enum Kind {
 	Video { width: u32, height: u32 },
 	Audio { sample_rate: u32, channels: u32 },
+	/// Messages, their pts counted in `timescale` units per second.
+	Data { timescale: u32 },
 }
 
 /// The suffix a muxed row's audio track is qualified with, since MoQ
@@ -259,8 +310,10 @@ pub enum Kind {
 const AUDIO_SUFFIX: &str = ".audio";
 
 /// Reads a catalog document into its renditions, in the document's own
-/// order: the video section then the audio one, each alphabetical -
-/// the order [`Catalog`] writes and the order a reader counts them in.
+/// order: the video section, the audio one, then the data one, each
+/// alphabetical - the order [`Catalog`] writes and the order a reader
+/// counts them in. A catalog without a data section, which is every
+/// catalog hang writes, reads exactly as it did.
 ///
 /// Rows are assigned by [`rows`] on the way out, so a broadcast this
 /// package published reads back as the relation it was published from.
@@ -268,7 +321,7 @@ pub fn parse(document: &str) -> Result<Vec<Rendition>, String> {
 	let parsed: serde_json::Value =
 		serde_json::from_str(document).map_err(|err| format!("catalog: {err}"))?;
 	let mut found = Vec::new();
-	for section in ["video", "audio"] {
+	for section in ["video", "audio", "data"] {
 		let Some(renditions) = parsed
 			.get(section)
 			.and_then(|found| found.get("renditions"))
@@ -277,6 +330,10 @@ pub fn parse(document: &str) -> Result<Vec<Rendition>, String> {
 			continue;
 		};
 		for (name, entry) in renditions {
+			if section == "data" {
+				found.push(data_rendition(name, entry)?);
+				continue;
+			}
 			let kind = if section == "video" {
 				Kind::Video {
 					width: number(entry, "codedWidth", name)? as u32,
@@ -319,24 +376,58 @@ pub fn parse(document: &str) -> Result<Vec<Rendition>, String> {
 	Ok(found)
 }
 
+/// One entry of the data section: its codec and its timescale, which
+/// a time base's denominator has to hold.
+fn data_rendition(name: &str, entry: &serde_json::Value) -> Result<Rendition, String> {
+	let timescale = number(entry, "timescale", name)?;
+	if timescale == 0 || timescale > i32::MAX as u64 {
+		return Err(format!(
+			"rendition '{name}' counts its pts in a timescale of {timescale}, which no time base \
+			 holds"
+		));
+	}
+	Ok(Rendition {
+		name: name.to_string(),
+		codec: text(entry, "codec", name)?,
+		config: Vec::new(),
+		init: Vec::new(),
+		kind: Kind::Data {
+			timescale: timescale as u32,
+		},
+		row: 0,
+	})
+}
+
 /// The relation row each rendition belongs to, in the order they were
 /// read.
 ///
 /// A video rendition and the audio rendition named for it - its own
 /// name and `.audio`, which is how [`track_names_for_rows`] writes a
-/// muxed row's audio track - are ONE row. Every other rendition is a
-/// row of its own. Rows are numbered in reading order, so the first
-/// video rendition is row 0.
+/// muxed row's audio track - are ONE row. Every other media rendition
+/// is a row of its own. Rows are numbered in reading order, so the
+/// first video rendition is row 0.
+///
+/// A data rendition is no rendition's own: it rides beside the rows,
+/// as a publisher's data column does. It is put on row 0, so a query
+/// reading a broadcast's messages beside its picture and sound reads
+/// them off the one row (`s.video[1], s.audio[1], s.data[1]`).
 pub fn rows(renditions: &[Rendition]) -> Vec<u32> {
 	let mut row_of: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
 	let mut next = 0u32;
 	let mut out = Vec::with_capacity(renditions.len());
 	for rendition in renditions {
-		if let Kind::Video { .. } = rendition.kind {
-			row_of.insert(rendition.name.as_str(), next);
-			out.push(next);
-			next += 1;
-			continue;
+		match rendition.kind {
+			Kind::Video { .. } => {
+				row_of.insert(rendition.name.as_str(), next);
+				out.push(next);
+				next += 1;
+				continue;
+			}
+			Kind::Data { .. } => {
+				out.push(0);
+				continue;
+			}
+			Kind::Audio { .. } => {}
 		}
 		let paired = rendition
 			.name
@@ -451,6 +542,8 @@ pub fn track_names(base: &str, heights: &[u32]) -> Vec<String> {
 pub enum RowKind {
 	Video { height: u32 },
 	Audio,
+	/// A data pad, which rides beside the rows rather than on one.
+	Data,
 }
 
 /// One pad, in the order a packet sink's `init` receives it: which
@@ -477,7 +570,15 @@ pub struct RowPad {
 /// numbered past the first. MoQ track names are one flat namespace
 /// per broadcast, so a muxed row's audio pad cannot repeat its video
 /// pad's explicit name - it qualifies it with ".audio" instead.
-pub fn track_names_for_rows(pads: &[RowPad], video_base: &str, audio_base: &str) -> Vec<String> {
+///
+/// A data pad belongs to no row, so its name is its own or, without
+/// one, `data_base` numbered past the first exactly as audio is.
+pub fn track_names_for_rows(
+	pads: &[RowPad],
+	video_base: &str,
+	audio_base: &str,
+	data_base: &str,
+) -> Vec<String> {
 	let mut row_has_video: std::collections::HashMap<u32, bool> = std::collections::HashMap::new();
 	for pad in pads {
 		if let RowKind::Video { .. } = pad.kind {
@@ -495,6 +596,7 @@ pub fn track_names_for_rows(pads: &[RowPad], video_base: &str, audio_base: &str)
 	let mut fallback_video_names = track_names(video_base, &unnamed_heights).into_iter();
 
 	let mut unnamed_audio_ordinal = 0u32;
+	let mut unnamed_data_ordinal = 0u32;
 	pads
 		.iter()
 		.map(|pad| match pad.kind {
@@ -511,14 +613,27 @@ pub fn track_names_for_rows(pads: &[RowPad], video_base: &str, audio_base: &str)
 				Some(name) => name.clone(),
 				None => {
 					unnamed_audio_ordinal += 1;
-					match unnamed_audio_ordinal {
-						1 => audio_base.to_string(),
-						nth => format!("{audio_base}.{}", nth - 1),
-					}
+					numbered(audio_base, unnamed_audio_ordinal)
+				}
+			},
+			RowKind::Data => match &pad.name {
+				Some(name) => name.clone(),
+				None => {
+					unnamed_data_ordinal += 1;
+					numbered(data_base, unnamed_data_ordinal)
 				}
 			},
 		})
 		.collect()
+}
+
+/// The `nth` unnamed pad of a kind, counting from 1: the base alone,
+/// then the base numbered past the first.
+fn numbered(base: &str, nth: u32) -> String {
+	match nth {
+		1 => base.to_string(),
+		nth => format!("{base}.{}", nth - 1),
+	}
 }
 
 /// The RFC 6381 codec string an AudioSpecificConfig spells: `mp4a.40`,
@@ -592,7 +707,7 @@ mod tests {
 			},
 		];
 		assert_eq!(
-			track_names_for_rows(&pads, "video", "audio"),
+			track_names_for_rows(&pads, "video", "audio", "data"),
 			vec!["video", "audio", "audio.1"]
 		);
 	}
@@ -606,7 +721,7 @@ mod tests {
 			kind: RowKind::Audio,
 			name: Some("commentary".to_string()),
 		}];
-		assert_eq!(track_names_for_rows(&pads, "video", "audio"), vec!["commentary"]);
+		assert_eq!(track_names_for_rows(&pads, "video", "audio", "data"), vec!["commentary"]);
 	}
 
 	#[test]
@@ -627,7 +742,7 @@ mod tests {
 			},
 		];
 		assert_eq!(
-			track_names_for_rows(&pads, "video", "audio"),
+			track_names_for_rows(&pads, "video", "audio", "data"),
 			vec!["1080p", "1080p.audio"]
 		);
 	}
@@ -655,7 +770,7 @@ mod tests {
 			},
 		];
 		assert_eq!(
-			track_names_for_rows(&pads, "video", "audio"),
+			track_names_for_rows(&pads, "video", "audio", "data"),
 			vec!["video.480p", "hd", "video.240p"]
 		);
 	}
@@ -849,7 +964,7 @@ mod tests {
 				name: Some("720p".to_string()),
 			},
 		];
-		let names = track_names_for_rows(&pads, "video", "audio");
+		let names = track_names_for_rows(&pads, "video", "audio", "data");
 		let catalog = Catalog::new(vec![
 			Track::video(names[0].clone(), "avc1".into(), &[], 1920, 1080, vec![1]),
 			Track::audio(names[1].clone(), "mp4a.40.2".into(), &[], 48000, 2, vec![2]),
@@ -863,6 +978,152 @@ mod tests {
 		// Two rows, and the pads that shared one still share one.
 		assert_eq!(by_name[0].1, by_name[1].1, "{by_name:?}");
 		assert_ne!(by_name[0].1, by_name[2].1, "{by_name:?}");
+	}
+
+	#[test]
+	fn a_data_track_is_a_section_of_its_own() {
+		// Beside hang's two sections, keyed by name like them, and with
+		// no container: a message is its own frame.
+		let catalog = Catalog::new(vec![
+			Track::audio(
+				"audio".into(),
+				"mp4a.40.2".into(),
+				&[0x11, 0x90],
+				48000,
+				2,
+				vec![0, 1, 2],
+			),
+			Track::data("data".into(), "json".into(), 1_000_000),
+		]);
+		let document = String::from_utf8(catalog.document().expect("serializes")).unwrap();
+		assert_eq!(
+			document,
+			r#"{"video":{"renditions":{}},"audio":{"renditions":{"audio":{"codec":"mp4a.40.2","description":"1190","sampleRate":48000,"numberOfChannels":2,"jitter":600,"container":{"kind":"cmaf","init":"AAEC"}}}},"data":{"renditions":{"data":{"codec":"json","timescale":1000000}}}}"#
+		);
+	}
+
+	#[test]
+	fn a_data_track_reads_back_as_a_data_rendition_on_the_first_row() {
+		let tracks = vec![
+			Track::video(
+				"1080p".into(),
+				"avc1.64002a".into(),
+				&[1, 0x64, 0x00, 0x2a],
+				1920,
+				1080,
+				vec![9, 8, 7],
+			),
+			Track::audio(
+				"1080p.audio".into(),
+				"mp4a.40.2".into(),
+				&[0x11, 0x90],
+				48000,
+				2,
+				vec![6, 5],
+			),
+			Track::video(
+				"720p".into(),
+				"avc1.64001f".into(),
+				&[1, 0x64, 0x00, 0x1f],
+				1280,
+				720,
+				vec![4, 3],
+			),
+			Track::data("data".into(), "json".into(), 1_000_000),
+			Track::data("cues".into(), "json".into(), 90_000),
+		];
+		let document =
+			String::from_utf8(Catalog::new(tracks).document().expect("serializes")).unwrap();
+		let read = parse(&document).expect("the document parses");
+		// The data section last, alphabetical like the others, and every
+		// data track on the first row: it rides beside the renditions, so
+		// the rungs keep the rows they had.
+		assert_eq!(
+			read.iter().map(|r| (r.name.as_str(), r.row)).collect::<Vec<_>>(),
+			vec![
+				("1080p", 0),
+				("720p", 1),
+				("1080p.audio", 0),
+				("cues", 0),
+				("data", 0)
+			]
+		);
+		let cues = &read[3];
+		assert_eq!(cues.codec, "json");
+		assert_eq!(cues.kind, Kind::Data { timescale: 90_000 });
+		assert!(cues.config.is_empty() && cues.init.is_empty());
+		assert_eq!(read[4].kind, Kind::Data { timescale: 1_000_000 });
+	}
+
+	#[test]
+	fn a_catalog_with_no_data_section_reads_as_before() {
+		// What every version before this wrote, and what hang writes: the
+		// same renditions on the same rows, and no data among them.
+		let document = String::from_utf8(ladder().document().expect("serializes")).unwrap();
+		assert!(!document.contains("\"data\""), "{document}");
+		let read = parse(&document).expect("the document parses");
+		assert!(read.iter().all(|r| !matches!(r.kind, Kind::Data { .. })));
+		assert_eq!(
+			read.iter().map(|r| (r.name.as_str(), r.row)).collect::<Vec<_>>(),
+			vec![("1080p", 0), ("720p", 1), ("1080p.audio", 0), ("commentary", 2)]
+		);
+	}
+
+	#[test]
+	fn a_data_section_alone_is_a_catalog() {
+		let read = parse(r#"{"data":{"renditions":{"d":{"codec":"json","timescale":1000}}}}"#)
+			.expect("the document parses");
+		assert_eq!(read.len(), 1);
+		assert_eq!(read[0].row, 0);
+		assert_eq!(read[0].kind, Kind::Data { timescale: 1000 });
+	}
+
+	#[test]
+	fn a_data_rendition_without_a_timescale_is_refused_by_name() {
+		let err = parse(r#"{"data":{"renditions":{"cues":{"codec":"json"}}}}"#)
+			.expect_err("a refusal");
+		assert!(err.contains("'cues'") && err.contains("timescale"), "{err}");
+		let err = parse(r#"{"data":{"renditions":{"cues":{"codec":"json","timescale":0}}}}"#)
+			.expect_err("a refusal");
+		assert!(err.contains("'cues'"), "{err}");
+	}
+
+	#[test]
+	fn data_pads_are_named_data_numbered_past_the_first() {
+		// A video, an audio, and three data pads the query gave no names,
+		// one of them named: the data pads count among themselves, apart
+		// from the audio ones, and whatever row the host gave them.
+		let pads = vec![
+			RowPad {
+				row: 0,
+				kind: RowKind::Video { height: 720 },
+				name: None,
+			},
+			RowPad {
+				row: 0,
+				kind: RowKind::Audio,
+				name: None,
+			},
+			RowPad {
+				row: 2,
+				kind: RowKind::Data,
+				name: None,
+			},
+			RowPad {
+				row: 3,
+				kind: RowKind::Data,
+				name: Some("cues".to_string()),
+			},
+			RowPad {
+				row: 4,
+				kind: RowKind::Data,
+				name: None,
+			},
+		];
+		assert_eq!(
+			track_names_for_rows(&pads, "video", "audio", "data"),
+			vec!["video", "audio", "data", "cues", "data.1"]
+		);
 	}
 
 	#[test]

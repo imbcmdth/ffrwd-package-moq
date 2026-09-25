@@ -20,6 +20,8 @@
 //! decoder needs, and does not align with any video group, which is a
 //! later concern.
 //!
+//! A data track's messages are a group apiece: see [`Groups::messages`].
+//!
 //! The stream's first fragment always opens the first group.
 
 /// How long an audio group runs before it closes, in milliseconds; 0
@@ -90,6 +92,17 @@ impl Groups {
 		};
 		Self {
 			rule,
+			start_pts: None,
+		}
+	}
+
+	/// The discipline for a data track: every message a group of its
+	/// own. A message stands alone, so any group is one a reader can
+	/// start at, and a group is forwarded only once it is whole, so a
+	/// message sharing one with the next would wait for it.
+	pub fn messages() -> Self {
+		Self {
+			rule: Rule::Fragment,
 			start_pts: None,
 		}
 	}
@@ -297,6 +310,17 @@ mod tests {
 			.map(|index| index as usize)
 			.collect();
 		assert_eq!(starts, [0, 10, 20, 30]);
+	}
+
+	#[test]
+	fn every_message_is_a_group_of_its_own() {
+		// Sparse and irregular, two at one pts: each opens a group, and
+		// the group holds that one message alone.
+		let mut groups = Groups::messages();
+		assert!([0i64, 400_000, 400_000, 1_200_000]
+			.iter()
+			.all(|pts| groups.starts_a_group(true, *pts)));
+		assert!(groups.one_fragment_each());
 	}
 
 	#[test]

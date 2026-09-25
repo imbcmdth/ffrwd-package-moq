@@ -22,6 +22,10 @@ const DEFAULT_VIDEO_TRACK: &str = "video";
 /// The base name an audio track falls back to under the same rule.
 const DEFAULT_AUDIO_TRACK: &str = "audio";
 
+/// The base name a data track falls back to, numbered past the first as
+/// audio is.
+const DEFAULT_DATA_TRACK: &str = "data";
+
 /// One schema covers the three row shapes, each leaving the others'
 /// fields out. A GROUP row (`rows => 'groups'`) carries `track` and
 /// `group`; a TRACK row (`rows => 'summary'`, every [`SUMMARY_EVERY`])
@@ -1007,6 +1011,7 @@ impl Guest for Publish {
 			&pads,
 			DEFAULT_VIDEO_TRACK,
 			DEFAULT_AUDIO_TRACK,
+			DEFAULT_DATA_TRACK,
 		);
 		// What each track is worth when the session has more to send than
 		// the wire takes. A relay reads every track of a broadcast on one
