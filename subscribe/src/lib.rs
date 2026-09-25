@@ -23,9 +23,10 @@
 //! rather than passed on as a group no decoder can start at.
 //!
 //! A data rendition in the catalog's `data` section is a track too, of
-//! JSON messages: each group's one frame is a message, handed on as it
-//! arrived with the frame's timestamp as its pts, in the timescale the
-//! catalog names. It rides on the first relation row, beside the media.
+//! JSON messages: each group's one frame is a message in hang's `legacy`
+//! framing, handed on as it arrived at the pts the frame carries, in the
+//! timescale the catalog names. It rides on the first relation row,
+//! beside the media.
 //!
 //! The QUIC session makes progress only inside `probe`, `open` and
 //! `next` calls: the host's pull cadence is the driver's clock.

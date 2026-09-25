@@ -183,8 +183,8 @@ enum Wire {
 enum Body {
 	/// fmp4 fragments, read by the track the init segment describes.
 	Media(ffrwd_bmff::track::Track),
-	/// One message per group: the frame is the message's bytes, and its
-	/// timestamp is the pts, handed on in `1/timescale` ticks.
+	/// One message per group: the frame is the message's pts in
+	/// microseconds, then its bytes, handed on in `1/timescale` ticks.
 	Data { timescale: u32 },
 }
 
@@ -834,7 +834,7 @@ impl Reader {
 			while let Some((_, frames)) = rendition.queue.take(hold, last, &mut ask) {
 				for frame in frames {
 					any |= match rendition.body {
-						Body::Data { timescale } => take_message(timescale, frame, pad),
+						Body::Data { timescale } => take_message(timescale, index, frame, pad)?,
 						Body::Media(_) => take_fragment(rendition, index, &frame.payload, pad)?,
 					};
 				}
@@ -931,12 +931,21 @@ fn take_fragment(
 	Ok(any)
 }
 
-/// One message onto a pad: its bytes as they arrived, its pts the frame's
-/// timestamp in the track's own ticks. Every message is a keyframe and
-/// is decoded when it is presented, so dts is the pts.
-fn take_message(timescale: u32, frame: Received, pad: &mut Vec<Packet>) -> bool {
+/// One message onto a pad: the bytes after the frame's pts as they
+/// arrived, and that pts in the track's own ticks. The pts is read out of
+/// the frame and never off the frame's timestamp, which over an IETF draft
+/// is the time the frame ARRIVED; see [`moq_core::message`]. Every message
+/// is a keyframe and is decoded when it is presented, so dts is the pts.
+fn take_message(
+	timescale: u32,
+	index: usize,
+	frame: Received,
+	pad: &mut Vec<Packet>,
+) -> Result<bool, String> {
+	let (pts_us, message) = moq_core::message::decode(&frame.payload)
+		.map_err(|err| format!("track {index}, group {}: {err}", frame.group))?;
 	let pts = ffrwd_bmff::time::rescale(
-		i64::try_from(frame.timestamp_us).unwrap_or(i64::MAX),
+		i64::try_from(pts_us).unwrap_or(i64::MAX),
 		1_000_000,
 		u64::from(timescale),
 	);
@@ -945,9 +954,9 @@ fn take_message(timescale: u32, frame: Received, pad: &mut Vec<Packet>) -> bool 
 		dts: Some(pts),
 		duration: None,
 		keyframe: true,
-		data: frame.payload.to_vec(),
+		data: message.to_vec(),
 	});
-	true
+	Ok(true)
 }
 
 struct Subscribe;

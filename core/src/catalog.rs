@@ -11,10 +11,13 @@
 //! INSIDE the catalog entry as base64, not on a track of its own.
 //!
 //! A `data` section beside the two is this package's own, for tracks of
-//! messages rather than media: each rendition names its codec (`json`)
-//! and the timescale its pts count in, and its frames are the messages
-//! themselves, one to a group, with no container around them. hang's
-//! catalog does not deny unknown fields, so a player reads past it.
+//! messages rather than media: each rendition names its codec (`json`),
+//! its container and the timescale its pts count in. The container is
+//! hang's `legacy`, every frame a varint pts ahead of the message's bytes
+//! (see [`crate::message`]), one frame to a group. hang's catalog does
+//! not deny unknown fields, so a player reads past the section; a data
+//! track filed under `video` or `audio` would fail hang's validation and
+//! take the whole broadcast off the player.
 //!
 //! Built by hand against hang 0.20.7's `catalog` module rather than by
 //! depending on the crate: this side compiles to wasm32-wasip2 inside
@@ -95,15 +98,35 @@ pub struct AudioRendition {
 }
 
 /// One data rendition's entry, this package's own: a track of messages,
-/// each one MoQ group of one frame, the frame the message's bytes.
+/// each one MoQ group of one frame, the frame the message's pts and bytes.
 #[derive(Debug, PartialEq, Serialize)]
 pub struct DataRendition {
 	/// What a message is: `json`, one UTF-8 JSON object.
 	pub codec: String,
+	/// How a frame carries its message: hang's `legacy`, always.
+	pub container: Legacy,
 	/// The units per second the messages' pts count in, which is the
-	/// time base a reader hands them on in. A frame's timestamp on the
-	/// wire is microseconds whatever this says.
+	/// time base a reader hands them on in. The pts in the frame is
+	/// microseconds whatever this says.
 	pub timescale: u32,
+}
+
+/// hang's `legacy` container: a varint pts in microseconds ahead of the
+/// payload, with nothing to carry in the catalog but its name.
+#[derive(Debug, PartialEq)]
+pub struct Legacy;
+
+/// The name [`Legacy`] is spelled with.
+const LEGACY: &str = "legacy";
+
+impl Serialize for Legacy {
+	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		#[derive(Serialize)]
+		struct Kind {
+			kind: &'static str,
+		}
+		Kind { kind: LEGACY }.serialize(serializer)
+	}
 }
 
 /// The container a rendition's frames travel in: `cmaf`, the init
@@ -186,7 +209,14 @@ impl Track {
 	/// A data track: its codec and the timescale its messages' pts count
 	/// in. It has no decoder configuration and no init segment.
 	pub fn data(name: String, codec: String, timescale: u32) -> Self {
-		Track::Data(name, DataRendition { codec, timescale })
+		Track::Data(
+			name,
+			DataRendition {
+				codec,
+				container: Legacy,
+				timescale,
+			},
+		)
 	}
 
 	/// The track's name, whichever kind it is.
@@ -376,9 +406,19 @@ pub fn parse(document: &str) -> Result<Vec<Rendition>, String> {
 	Ok(found)
 }
 
-/// One entry of the data section: its codec and its timescale, which
-/// a time base's denominator has to hold.
+/// One entry of the data section: its codec, its container, which has
+/// to be `legacy` since that is where a message's pts is, and its
+/// timescale, which a time base's denominator has to hold.
 fn data_rendition(name: &str, entry: &serde_json::Value) -> Result<Rendition, String> {
+	let container = entry
+		.get("container")
+		.ok_or_else(|| format!("rendition '{name}' names no container"))?;
+	let spelled = text(container, "kind", name)?;
+	if spelled != LEGACY {
+		return Err(format!(
+			"rendition '{name}' travels in '{spelled}', and a data track reads {LEGACY}"
+		));
+	}
 	let timescale = number(entry, "timescale", name)?;
 	if timescale == 0 || timescale > i32::MAX as u64 {
 		return Err(format!(
@@ -998,7 +1038,7 @@ mod tests {
 		let document = String::from_utf8(catalog.document().expect("serializes")).unwrap();
 		assert_eq!(
 			document,
-			r#"{"video":{"renditions":{}},"audio":{"renditions":{"audio":{"codec":"mp4a.40.2","description":"1190","sampleRate":48000,"numberOfChannels":2,"jitter":600,"container":{"kind":"cmaf","init":"AAEC"}}}},"data":{"renditions":{"data":{"codec":"json","timescale":1000000}}}}"#
+			r#"{"video":{"renditions":{}},"audio":{"renditions":{"audio":{"codec":"mp4a.40.2","description":"1190","sampleRate":48000,"numberOfChannels":2,"jitter":600,"container":{"kind":"cmaf","init":"AAEC"}}}},"data":{"renditions":{"data":{"codec":"json","container":{"kind":"legacy"},"timescale":1000000}}}}"#
 		);
 	}
 
@@ -1071,7 +1111,9 @@ mod tests {
 
 	#[test]
 	fn a_data_section_alone_is_a_catalog() {
-		let read = parse(r#"{"data":{"renditions":{"d":{"codec":"json","timescale":1000}}}}"#)
+		let read = parse(
+			r#"{"data":{"renditions":{"d":{"codec":"json","container":{"kind":"legacy"},"timescale":1000}}}}"#,
+		)
 			.expect("the document parses");
 		assert_eq!(read.len(), 1);
 		assert_eq!(read[0].row, 0);
@@ -1080,12 +1122,29 @@ mod tests {
 
 	#[test]
 	fn a_data_rendition_without_a_timescale_is_refused_by_name() {
-		let err = parse(r#"{"data":{"renditions":{"cues":{"codec":"json"}}}}"#)
-			.expect_err("a refusal");
+		let err =
+			parse(r#"{"data":{"renditions":{"cues":{"codec":"json","container":{"kind":"legacy"}}}}}"#)
+				.expect_err("a refusal");
 		assert!(err.contains("'cues'") && err.contains("timescale"), "{err}");
-		let err = parse(r#"{"data":{"renditions":{"cues":{"codec":"json","timescale":0}}}}"#)
-			.expect_err("a refusal");
+		let err = parse(
+			r#"{"data":{"renditions":{"cues":{"codec":"json","container":{"kind":"legacy"},"timescale":0}}}}"#,
+		)
+		.expect_err("a refusal");
 		assert!(err.contains("'cues'"), "{err}");
+	}
+
+	#[test]
+	fn a_data_rendition_in_another_container_is_refused_by_name() {
+		// Its pts is inside a legacy frame, so a data track read out of any
+		// other container would be read at the wrong time.
+		let err = parse(r#"{"data":{"renditions":{"cues":{"codec":"json","timescale":1000}}}}"#)
+			.expect_err("a refusal");
+		assert!(err.contains("'cues'") && err.contains("container"), "{err}");
+		let err = parse(
+			r#"{"data":{"renditions":{"cues":{"codec":"json","container":{"kind":"loc"},"timescale":1000}}}}"#,
+		)
+		.expect_err("a refusal");
+		assert!(err.contains("'loc'"), "{err}");
 	}
 
 	#[test]

@@ -15,8 +15,9 @@
 //! subscriberless broadcast would be gone before it could be watched.
 //!
 //! A data stream beside the media, JSON messages, is a track of its own:
-//! each message one MoQ group of one frame, its bytes as they arrived and
-//! its pts the frame's timestamp, named in the catalog's `data` section.
+//! each message one MoQ group of one frame, hang's `legacy` framing - its
+//! pts in microseconds as a varint, then its bytes as they arrived - named
+//! in the catalog's `data` section.
 //! A call writes its messages and puts them on the socket before it
 //! touches any media, since a message announces what comes after it.
 //!

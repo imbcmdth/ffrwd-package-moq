@@ -17,6 +17,8 @@
 //! - [`catalog`] is the document a broadcast describes itself with - in
 //!   the hang media layer's shape, each rendition's init segment inside
 //!   - and the names its renditions publish under.
+//! - [`message`] is a data track's frame: a message's pts ahead of its
+//!   bytes, the way hang's `legacy` container frames a sample.
 //! - [`subscribe`] is the receiving side before the media: the
 //!   subscription shape, the catalog read, and [`subscribe::FrameStream`]
 //!   pulling groups and frames off a track in arrival order.
@@ -30,6 +32,7 @@
 pub mod catalog;
 pub mod dns;
 pub mod group;
+pub mod message;
 pub mod order;
 pub mod relay;
 pub mod subscribe;

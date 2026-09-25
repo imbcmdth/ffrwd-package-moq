@@ -255,7 +255,7 @@ struct Built {
 /// One track: one encoded stream, its own fmp4 muxer, and the MoQ track
 /// carrying its fragments. The init segment rides inside the catalog. A
 /// data track has no muxer: each message is one frame in a group of its
-/// own, its bytes as they arrived.
+/// own, its pts ahead of its bytes as they arrived.
 struct Rendition {
 	name: String,
 	codec: String,
@@ -336,9 +336,9 @@ impl Rendition {
 	}
 
 	/// One MoQ frame at `pts`, in the open group or one the discipline
-	/// opens for it: an fmp4 fragment for media, a message's own bytes
-	/// for data, whose discipline gives every message a group and closes
-	/// it at once.
+	/// opens for it: an fmp4 fragment for media, a framed message for
+	/// data, whose discipline gives every message a group and closes it
+	/// at once.
 	fn publish_frame(
 		&mut self,
 		pts: i64,
@@ -763,12 +763,18 @@ impl Session {
 			}
 			for packet in &pad.packets {
 				rendition.packets += 1;
-				rows.extend(rendition.publish_frame(
+				// The pts rides in the frame, ahead of the message: the
+				// frame's own timestamp does not survive every draft of the
+				// wire. See [`moq_core::message`].
+				let pts_us = ffrwd_bmff::time::ticks_to_micros(
 					packet.pts,
-					true,
-					packet.data.clone(),
-					per_group,
-				)?);
+					rendition.time_base.0,
+					rendition.time_base.1,
+				);
+				let framed = moq_core::message::encode(pts_us, &packet.data).map_err(|err| {
+					format!("track '{}': the message at pts {}: {err}", rendition.name, packet.pts)
+				})?;
+				rows.extend(rendition.publish_frame(packet.pts, true, framed, per_group)?);
 				drive_once().await;
 				messages = true;
 			}
