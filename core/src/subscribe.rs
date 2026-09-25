@@ -3,7 +3,9 @@
 //! [`FrameStream`] wraps a track subscriber and yields one
 //! `(timestamp, payload)` frame at a time. Groups are taken in arrival
 //! order and read to completion; the stream ends when the publisher
-//! finishes the track.
+//! finishes the track. [`FrameStream::step`] also says when a group
+//! has been read to its end, which is when a reader can hand it on
+//! rather than when the next group's first frame arrives.
 //!
 //! Beside it, what any subscriber does before the media: where a
 //! reader joins a broadcast already running ([`Start`]) and the one
@@ -146,6 +148,22 @@ pub struct Received {
 	pub payload: Bytes,
 }
 
+impl crate::order::Weigh for Received {
+	fn weight(&self) -> u64 {
+		self.payload.len() as u64
+	}
+}
+
+/// What a subscription hands over next: one frame, or word that the
+/// group being read is whole.
+#[derive(Clone, Debug)]
+pub enum Step {
+	Frame(Received),
+	/// The group of this sequence has been read to its end: the
+	/// publisher finished it, and no frame of it is still to come.
+	End(u64),
+}
+
 /// Yields frames from a track subscription, group by group.
 pub struct FrameStream {
 	subscriber: moq_net::track::Subscriber,
@@ -173,6 +191,18 @@ impl FrameStream {
 	/// The next frame, or `None` once the track is finished.
 	pub async fn next(&mut self) -> Result<Option<Received>, Error> {
 		loop {
+			match self.step().await? {
+				Some(Step::Frame(received)) => return Ok(Some(received)),
+				Some(Step::End(_)) => {}
+				None => return Ok(None),
+			}
+		}
+	}
+
+	/// The next frame, or the end of the group it would have belonged
+	/// to, or `None` once the track is finished.
+	pub async fn step(&mut self) -> Result<Option<Step>, Error> {
+		loop {
 			if let Some((group, index)) = self.current.as_mut() {
 				if let Some(frame) = group.read_frame().await? {
 					let timestamp_us = frame
@@ -186,12 +216,13 @@ impl FrameStream {
 						payload: frame.payload,
 					};
 					*index += 1;
-					return Ok(Some(received));
+					return Ok(Some(Step::Frame(received)));
 				}
 				let (group, frames) = self.current.take().expect("current group");
 				if let Some(on_group) = self.on_group.as_mut() {
 					on_group(group.sequence, frames);
 				}
+				return Ok(Some(Step::End(group.sequence)));
 			}
 
 			match self.subscriber.recv_group().await? {

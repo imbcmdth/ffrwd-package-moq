@@ -200,13 +200,26 @@ pub struct Counters {
 	last: Option<u64>,
 }
 
+/// What a held frame weighs against the hold's budget ([`HOLD_BYTES`]):
+/// its payload's bytes. A frame is whatever the reader keeps of one, a
+/// payload alone or a payload with its timestamp beside it.
+pub trait Weigh {
+	fn weight(&self) -> u64;
+}
+
+impl Weigh for Bytes {
+	fn weight(&self) -> u64 {
+		self.len() as u64
+	}
+}
+
 /// One track's group sequence: what has arrived, what is held for the
 /// group before it, and what goes out next.
 ///
 /// This is the part of a reader the backlog is about, and it is kept
 /// apart from the demuxing so it can be driven on its own; see the
 /// tests at the foot of this file.
-pub struct Queue {
+pub struct Queue<F: Weigh = Bytes> {
 	/// The track's name in the broadcast's catalog, which is what its
 	/// rows are read back against.
 	pub name: String,
@@ -216,7 +229,7 @@ pub struct Queue {
 	start: crate::subscribe::Start,
 	/// Completed groups waiting for the one before them, and what they
 	/// weigh; see [`HOLD_BYTES`].
-	pending: BTreeMap<u64, Vec<Bytes>>,
+	pending: BTreeMap<u64, Vec<F>>,
 	pending_bytes: u64,
 	/// The next group in sequence; None until the cursor is fixed.
 	cursor: Option<u64>,
@@ -314,7 +327,7 @@ fn row(body: &impl Serialize) {
 	);
 }
 
-impl Queue {
+impl<F: Weigh> Queue<F> {
 	pub fn new(name: String, start: crate::subscribe::Start) -> Self {
 		Self {
 			name,
@@ -356,8 +369,8 @@ impl Queue {
 	/// group at all - which is the only thing about media this queue is
 	/// told, and it is told it because a live join has to land on such a
 	/// group. It is read at the join and ignored afterwards.
-	pub fn push(&mut self, sequence: u64, frames: Vec<Bytes>, decodable: bool) {
-		let bytes: u64 = frames.iter().map(|frame| frame.len() as u64).sum();
+	pub fn push(&mut self, sequence: u64, frames: Vec<F>, decodable: bool) {
+		let bytes: u64 = frames.iter().map(Weigh::weight).sum();
 		self.counters.received += 1;
 		self.counters.bytes += bytes;
 		if let Some(next) = self.cursor {
@@ -431,7 +444,7 @@ impl Queue {
 	/// more is coming. A sequence pushed onto `ask` is one the relay is
 	/// to be asked for outright, the hole having stood open for the
 	/// whole window.
-	pub fn take(&mut self, hold: Hold, last: bool, ask: &mut Vec<u64>) -> Option<(u64, Vec<Bytes>)> {
+	pub fn take(&mut self, hold: Hold, last: bool, ask: &mut Vec<u64>) -> Option<(u64, Vec<F>)> {
 		if self.cursor.is_none() && self.start == crate::subscribe::Start::Live {
 			// A live join starts at the first group a decoder can start
 			// at, and lets go of whatever is held below it: those groups
@@ -530,7 +543,7 @@ impl Queue {
 			return None;
 		}
 		let frames = self.pending.remove(&oldest).expect("just found");
-		self.pending_bytes -= frames.iter().map(|frame| frame.len() as u64).sum::<u64>();
+		self.pending_bytes -= frames.iter().map(Weigh::weight).sum::<u64>();
 		self.cursor = Some(oldest + 1);
 		self.join_low = None;
 		self.join_ready = None;
@@ -548,7 +561,7 @@ impl Queue {
 				break;
 			}
 			let frames = self.pending.remove(&oldest).expect("just found");
-			self.pending_bytes -= frames.iter().map(|frame| frame.len() as u64).sum::<u64>();
+			self.pending_bytes -= frames.iter().map(Weigh::weight).sum::<u64>();
 			self.counters.skipped_join += 1;
 			self.report_skipped(oldest, low);
 		}
