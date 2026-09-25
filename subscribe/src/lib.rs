@@ -22,6 +22,12 @@
 //! track's first packets may sit past a keyframe: those are absorbed
 //! rather than passed on as a group no decoder can start at.
 //!
+//! A rendition in hang's `legacy` container, which is what libmoq and
+//! the moq-dev OBS plugin publish, has no init segment: each frame is a
+//! varint pts in microseconds and then the sample, an Annex B access
+//! unit or a raw AAC frame, handed on in microsecond ticks with its dts
+//! at its pts. See `moq_core::legacy`.
+//!
 //! A data rendition in the catalog's `data` section is a track too, of
 //! JSON messages: each group's one frame is a message in hang's `legacy`
 //! framing, handed on as it arrived at the pts the frame carries, in the

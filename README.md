@@ -289,6 +289,49 @@ What a broadcast carries decides the shape of a query over it. A
 demuxed ladder puts a rung's video and the broadcast's audio on
 different rows; a muxed broadcast carries both on one row.
 
+### A broadcast from OBS
+
+The moq-dev OBS plugin publishes through libmoq, in hang's `legacy`
+container rather than CMAF: every frame is a QUIC varint of the
+sample's pts in microseconds and then the sample itself, an H.264
+access unit in Annex B (`avc3`, its parameter sets in the keyframes) or
+a raw AAC frame. Its catalog names the tracks `1.avc3` and `0.aac`, and
+carries no init segment. Since 0.8.0 `subscribe` reads that, and takes
+a legacy broadcast as one programme: its audio sits on its video's row,
+so OBS reads as one row.
+
+```pgsql
+COPY (
+  SELECT s.video[1], s.audio[1]
+  FROM ffrwd.moq.subscribe(:'relay', 'live/obs', '', :'token') s
+) TO 'obs.mkv'
+```
+
+Legacy video is H.264, HEVC in Annex B (`hev1`) or AV1, and legacy
+audio is AAC. Opus and FLAC, which the plugin can also pick, are
+refused by name: ffrwd's packet wire does not carry them yet. An `avc1`
+or `avc3` entry that carries an `avcC` description frames its pictures
+length-prefixed, as WebCodecs reads it, and is reframed into Annex B on
+the way through. The container carries no decode time, so a packet's
+dts is its pts, and an encoder that reorders pictures (B-frames) is
+refused at its first reordered picture: set the encoder's B-frames to 0.
+A keyframe is read off the picture's own units: an IDR slice for H.264,
+an IRAP picture for HEVC, a sequence header for AV1. A video frame that
+carries a pts and no sample, which libmoq sends now and then, is passed
+over.
+
+libmoq writes its catalog once, when it makes its tracks. Cloudflare's
+draft-16 relay keeps no history and answers FETCH with "not supported",
+and a subscription used to start at the object after the relay's newest
+one, so a reader that joined after OBS started never saw the catalog at
+all ("sent no catalog within 15s"). This package's moq-net now asks a
+draft-15 or later relay for everything from `{0, 0}`. Cloudflare answers
+with the newest group it has, from its first object: the catalog, and a
+video group from its keyframe. A relay holding a backlog would answer
+with all of it, so a live join drops every group older than the newest
+one SUBSCRIBE_OK names. `tests/live_obs.py` reads a broadcast someone is
+publishing and checks every track decodes.
+
 ### Where a reader joins
 
 `start` says which end of a running broadcast to join at. It is `'live'`
@@ -653,6 +696,18 @@ which reaches no relay at all. Nothing else in the URL is dropped on
 the way.
 
 ## What the shared crates changed
+
+**moq-net is a branch of upstream 0.2.15.** Since 0.8.0 this package
+builds on
+[`ffrwd/moq-net-0.2.15`](https://github.com/imbcmdth/moq/tree/ffrwd/moq-net-0.2.15),
+the `moq-net-v0.2.15` release of moq-dev/moq with our commits on top,
+pinned by revision in `Cargo.toml`. What it changes: an IETF live join
+asks for an absolute start of `{0, 0}` and drops the groups older than
+the newest SUBSCRIBE_OK names (see "A broadcast from OBS"), a join at a
+named group asks for that group, SUBSCRIBE decodes an absolute start's
+location instead of refusing it as trailing bytes, and SUBSCRIBE_OK
+carries LARGEST_OBJECT through draft-16. Draft-14 and moq-lite sessions
+are as they were.
 
 The fmp4 and h264 layers under this package are
 [ffrwd-bmff](https://github.com/imbcmdth/ffrwd-bmff) and

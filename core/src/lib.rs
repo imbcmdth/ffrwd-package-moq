@@ -19,6 +19,9 @@
 //!   - and the names its renditions publish under.
 //! - [`message`] is a data track's frame: a message's pts ahead of its
 //!   bytes, the way hang's `legacy` container frames a sample.
+//! - [`legacy`] is media in that container, which is what libmoq (the
+//!   moq-dev OBS plugin) publishes: the codec, the keyframes and the
+//!   decode times a frame does not spell out.
 //! - [`delivery`] is how every track's groups leave: one at a time,
 //!   the next held in the track's queue until the relay has the one
 //!   before it, and never in the host's call.
@@ -36,6 +39,7 @@ pub mod catalog;
 pub mod delivery;
 pub mod dns;
 pub mod group;
+pub mod legacy;
 pub mod message;
 pub mod order;
 pub mod relay;

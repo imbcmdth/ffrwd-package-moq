@@ -191,6 +191,9 @@ enum Wire {
 enum Body {
 	/// fmp4 fragments, read by the track the init segment describes.
 	Media(ffrwd_bmff::track::Track),
+	/// hang's `legacy` container: a varint pts in microseconds, then one
+	/// sample of this codec. See [`moq_core::legacy`].
+	Legacy(moq_core::legacy::Codec),
 	/// One message per group: the frame is the message's pts in
 	/// microseconds, then its bytes, handed on in `1/timescale` ticks.
 	Data { timescale: u32 },
@@ -202,8 +205,11 @@ struct Rendition {
 	body: Body,
 	video: bool,
 	/// The NAL length prefix this track's `avcC` declares; 0 for audio
-	/// and data, whose frames carry no framing of their own.
+	/// and data, whose frames carry no framing of their own, and for a
+	/// legacy picture already in Annex B.
 	length_size: usize,
+	/// A legacy track's decode times, which its frames do not carry.
+	order: moq_core::legacy::Order,
 	/// Where this reader may start, and what a fragment carrying
 	/// nothing for the track means.
 	join: moq_core::group::Join,
@@ -214,6 +220,10 @@ struct Rendition {
 	name: String,
 	init: Vec<u8>,
 	kind: moq_core::catalog::Kind,
+	/// Its codec string and decoder configuration: all a legacy
+	/// rendition has in place of an init segment to be the same track by.
+	codec: String,
+	config: Vec<u8>,
 	/// Set when the track was taken up on a new session and nothing has
 	/// arrived on it yet: its first group says whether the publisher
 	/// carried on or started again.
@@ -227,6 +237,7 @@ impl Rendition {
 	/// back to went with the groups in between.
 	fn restart(&mut self) {
 		self.queue.restarted = true;
+		self.order.restart();
 		if self.video {
 			self.join = moq_core::group::Join::video();
 		}
@@ -410,6 +421,9 @@ fn source_track(
 	if let moq_core::catalog::Kind::Data { timescale } = rendition.kind {
 		return Ok((data_track(index, rendition, timescale)?, Body::Data { timescale }));
 	}
+	if rendition.packaging == moq_core::catalog::Packaging::Legacy {
+		return legacy_track(index, rendition);
+	}
 	let track = ffrwd_bmff::track::Track::from_init(&rendition.init)
 		.map_err(|err| format!("rendition '{}': init segment: {err}", rendition.name))?;
 	let time_base = Rational {
@@ -503,6 +517,129 @@ fn source_track(
 	))
 }
 
+/// One `legacy` rendition as the track a source publishes: what libmoq's
+/// OBS output sends. There is no init segment, so everything comes off the
+/// catalog entry: the codec off its string, the geometry off its fields,
+/// the decoder configuration off its description where it has one. Its
+/// pts are microseconds, so that is the time base.
+///
+/// A description is what says how a picture is framed, as it does for
+/// WebCodecs: an `avc1` or `avc3` entry with an `avcC` carries its NAL
+/// units length-prefixed, and is reframed into Annex B on the way through;
+/// one without carries Annex B with its parameter sets in the keyframes.
+/// An HEVC entry with an `hvcC` would be length-prefixed as well, and is
+/// refused until something publishes one.
+fn legacy_track(
+	index: usize,
+	rendition: &moq_core::catalog::Rendition,
+) -> Result<(SourceTrack, Body), String> {
+	use moq_core::catalog::Kind;
+	use moq_core::legacy::Codec;
+	let name = &rendition.name;
+	let codec = Codec::of(&rendition.codec).map_err(|err| format!("rendition '{name}': {err}"))?;
+	let time_base = Rational {
+		num: 1,
+		den: 1_000_000,
+	};
+	let (kind, format, extradata, profile, level) = match (rendition.kind, codec) {
+		(Kind::Video { width, height }, Codec::H264 | Codec::Hevc | Codec::Av1) => {
+			let extradata = match (codec, rendition.config.is_empty()) {
+				(_, true) => Vec::new(),
+				(Codec::H264, false) => ffrwd_nal::config::avcc_to_annexb_extradata(&rendition.config)
+					.map_err(|err| format!("rendition '{name}': its avcC: {err}"))?,
+				(Codec::Hevc, false) => {
+					return Err(format!(
+						"rendition '{name}' describes its HEVC with an hvcC, which frames its \
+						 pictures length-prefixed, and this reads legacy HEVC in Annex B \
+						 ('hev1' without a description)"
+					))
+				}
+				// An av1C: the OBUs are the same with or without it.
+				_ => rendition.config.clone(),
+			};
+			let (profile, level) = match codec {
+				Codec::H264 => match moq_core::legacy::avc_profile_level(&rendition.codec) {
+					Some((profile, level)) => (Some(profile), Some(level)),
+					None => (None, None),
+				},
+				_ => (None, None),
+			};
+			(
+				"video",
+				CodedFormat::Video(CodedVideo {
+					width,
+					height,
+					sample_aspect_ratio: None,
+					color: None,
+				}),
+				extradata,
+				profile,
+				level,
+			)
+		}
+		(
+			Kind::Audio {
+				sample_rate,
+				channels,
+			},
+			Codec::Aac,
+		) => {
+			if rendition.config.is_empty() {
+				return Err(format!(
+					"rendition '{name}' is raw AAC with no description, and a decoder needs \
+					 the AudioSpecificConfig the description carries"
+				));
+			}
+			(
+				"audio",
+				CodedFormat::Audio(CodedAudio {
+					sample_rate,
+					channels,
+					channel_layout: None,
+				}),
+				rendition.config.clone(),
+				None,
+				None,
+			)
+		}
+		(_, codec) => {
+			return Err(format!(
+				"rendition '{name}' is {} but filed in the catalog's other section",
+				codec.name()
+			))
+		}
+	};
+	Ok((
+		SourceTrack {
+			coded: CodedStream {
+				codec: codec.name().to_string(),
+				time_base,
+				format,
+				extradata,
+				profile,
+				level,
+			},
+			info: StreamInfo {
+				index: index as u32,
+				kind: kind.to_string(),
+				codec: codec.name().to_string(),
+				// A broadcast runs as long as its publisher does.
+				duration: None,
+				tags: vec![],
+				time_base,
+			},
+			row: rendition.row,
+			rendition: RenditionMeta {
+				name: Some(rendition.name.clone()),
+				bandwidth: None,
+				codecs: Some(rendition.codec.clone()),
+				language: None,
+			},
+		},
+		Body::Legacy(codec),
+	))
+}
+
 /// The renditions `order` names, as catalog indices: what `open` was told
 /// to pull. An index the broadcast's catalog does not carry is refused by
 /// name, before anything is subscribed to.
@@ -542,6 +679,10 @@ fn catalog_of(
 		let video = matches!(rendition.kind, moq_core::catalog::Kind::Video { .. });
 		let length_size = match (&body, video) {
 			(Body::Media(demux), true) => ffrwd_nal::config::avcc_length_size(&demux.entry.config),
+			// A legacy H.264 entry that describes itself is length-prefixed.
+			(Body::Legacy(moq_core::legacy::Codec::H264), true) if !rendition.config.is_empty() => {
+				ffrwd_nal::config::avcc_length_size(&rendition.config)
+			}
 			_ => 0,
 		};
 		tracks.push(track);
@@ -557,6 +698,9 @@ fn catalog_of(
 			name: rendition.name.clone(),
 			init: rendition.init.to_vec(),
 			kind: rendition.kind,
+			codec: rendition.codec.clone(),
+			config: rendition.config.clone(),
+			order: moq_core::legacy::Order::default(),
 			resumed: false,
 		});
 	}
@@ -802,6 +946,19 @@ impl Reader {
 					rendition.name
 				)));
 			}
+			// Nor has a legacy one: it is the same track while its codec,
+			// its decoder configuration and its geometry are.
+			if matches!(rendition.body, Body::Legacy(_))
+				&& (now.codec != rendition.codec
+					|| now.config != rendition.config
+					|| now.kind != rendition.kind)
+			{
+				return Err(Resume::Refused(format!(
+					"the broadcast came back on a new session with track '{}' in another codec \
+					 or at another size: its publisher started again with other settings",
+					rendition.name
+				)));
+			}
 			// A data track has no init segment; what it has to keep is
 			// what it is and the timescale its pts count in.
 			let data = matches!(rendition.kind, moq_core::catalog::Kind::Data { .. });
@@ -868,6 +1025,7 @@ impl Reader {
 					any |= match rendition.body {
 						Body::Data { timescale } => take_message(timescale, index, frame, pad)?,
 						Body::Media(_) => take_fragment(rendition, index, &frame.payload, pad)?,
+						Body::Legacy(codec) => take_legacy(rendition, codec, index, frame, pad)?,
 					};
 				}
 			}
@@ -893,6 +1051,17 @@ fn decodable(rendition: &Rendition, frames: &[Received]) -> bool {
 	let track = match &rendition.body {
 		Body::Media(track) => track,
 		Body::Data { .. } => return !frames.is_empty(),
+		Body::Legacy(codec) => {
+			// The first frame with a sample in it decides, as the first
+			// sample of a fragment does.
+			return frames.iter().find_map(|frame| {
+				match legacy_sample(rendition, *codec, &frame.payload) {
+					Ok(Some((_, _, keyframe))) => Some(!rendition.video || keyframe),
+					Ok(None) => None,
+					Err(_) => Some(false),
+				}
+			}) == Some(true);
+		}
 	};
 	for fragment in frames {
 		let Ok(samples) = track.fragment_samples(&fragment.payload) else {
@@ -961,6 +1130,68 @@ fn take_fragment(
 		any = true;
 	}
 	Ok(any)
+}
+
+/// A legacy frame taken apart: its pts in microseconds, the sample as an
+/// encoded edge wants it (Annex B for a picture, reframed if the entry's
+/// avcC said it was length-prefixed), and whether a decoder can start at
+/// it. `None` for a frame that is a pts and nothing else, which libmoq
+/// sends now and then on a video track and which has nothing to hand on.
+fn legacy_sample(
+	rendition: &Rendition,
+	codec: moq_core::legacy::Codec,
+	frame: &[u8],
+) -> Result<Option<(u64, Vec<u8>, bool)>, String> {
+	let (pts_us, sample) = moq_core::message::decode(frame)?;
+	if sample.is_empty() {
+		return Ok(None);
+	}
+	let data = match rendition.length_size {
+		0 => sample.to_vec(),
+		size => ffrwd_nal::annexb::length_prefixed_to_annexb(sample, size)
+			.map_err(|err| err.to_string())?,
+	};
+	let keyframe = moq_core::legacy::keyframe(codec, &data);
+	Ok(Some((pts_us, data, keyframe)))
+}
+
+/// One legacy frame onto a pad, at the pts the frame carries (never the
+/// frame's own timestamp, which over an IETF draft is when it arrived).
+/// A picture waits for its track's first keyframe, as a fragment's
+/// samples do in [`take_fragment`]; its dts is its pts, and a picture
+/// that goes back in time is refused by [`moq_core::legacy::Order`]. An
+/// AAC frame lasts 1024 samples.
+fn take_legacy(
+	rendition: &mut Rendition,
+	codec: moq_core::legacy::Codec,
+	index: usize,
+	frame: Received,
+	pad: &mut Vec<Packet>,
+) -> Result<bool, String> {
+	let Some((pts_us, data, keyframe)) = legacy_sample(rendition, codec, &frame.payload)
+		.map_err(|err| format!("track {index}, group {}: {err}", frame.group))?
+	else {
+		return Ok(false);
+	};
+	if rendition.video && !rendition.join.admit(keyframe) {
+		return Ok(false);
+	}
+	let pts = i64::try_from(pts_us).map_err(|_| format!("track {index}: a pts of {pts_us}us"))?;
+	let dts = rendition.order.dts(&rendition.name, pts_us)? as i64;
+	let duration = match rendition.kind {
+		moq_core::catalog::Kind::Audio { sample_rate, .. } if sample_rate > 0 => {
+			Some(1024 * 1_000_000 / i64::from(sample_rate))
+		}
+		_ => None,
+	};
+	pad.push(Packet {
+		pts,
+		dts: Some(dts),
+		duration,
+		keyframe,
+		data,
+	});
+	Ok(true)
 }
 
 /// One message onto a pad: the bytes after the frame's pts as they

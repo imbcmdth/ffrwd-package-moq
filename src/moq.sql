@@ -109,6 +109,15 @@ RETURNS sink
 -- AudioSpecificConfig - and its fragments are demuxed back to the
 -- packets they were built from, so a rung crosses the graph encoded.
 --
+-- A rendition in hang's legacy container - what libmoq, the moq-dev OBS
+-- plugin, publishes - has no init segment: each frame is a varint pts in
+-- microseconds and then the sample, h264, hevc or av1 in Annex B, or a
+-- raw aac frame, and the decoder configuration is the catalog entry's
+-- description where it has one. Its packets count in microseconds, and
+-- their dts is their pts, so an encoder with B-frames is refused. A
+-- legacy broadcast is one programme: its first audio is on its first
+-- video's row, s.video[1] and s.audio[1] of one row.
+--
 -- relay, cert and token read exactly as publish's do.
 --
 -- start is where a reader joins a broadcast that is already running.

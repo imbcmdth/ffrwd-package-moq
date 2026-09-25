@@ -167,6 +167,14 @@ impl Join {
 		Self { started: true }
 	}
 
+	/// Whether a sample goes on, for a track whose samples come one at a
+	/// time rather than a fragment's worth: a video track's first one has
+	/// to be a keyframe, and everything after it goes.
+	pub fn admit(&mut self, keyframe: bool) -> bool {
+		self.started |= keyframe;
+		self.started
+	}
+
 	/// The samples of one fragment that this package will hand on, in
 	/// decode order.
 	///

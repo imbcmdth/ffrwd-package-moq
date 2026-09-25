@@ -318,11 +318,26 @@ pub struct Rendition {
 	/// video, the AudioSpecificConfig for audio, nothing for data.
 	pub config: Vec<u8>,
 	/// The `ftyp`+`moov` out of the `cmaf` container, base64-decoded;
-	/// nothing for data, which has no container.
+	/// nothing for data or for a `legacy` rendition, which carry none.
 	pub init: Vec<u8>,
+	/// How its frames carry their samples.
+	pub packaging: Packaging,
 	pub kind: Kind,
 	/// Which relation row it belongs to; see [`rows`].
 	pub row: u32,
+}
+
+/// How a rendition's frames carry what they carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Packaging {
+	/// One fmp4 fragment a frame, read by the init segment the catalog
+	/// entry carries. What this package publishes.
+	Cmaf,
+	/// hang's `legacy`: a varint pts in microseconds, then the sample
+	/// itself - an access unit in Annex B for video, a raw frame for
+	/// audio, a message for data. What libmoq (the moq-dev OBS plugin)
+	/// and hang's own publishers write.
+	Legacy,
 }
 
 /// What a rendition carries, and the geometry its kind states.
@@ -379,18 +394,33 @@ pub fn parse(document: &str) -> Result<Vec<Rendition>, String> {
 				.get("container")
 				.ok_or_else(|| format!("rendition '{name}' names no container"))?;
 			let spelled = text(container, "kind", name)?;
-			if spelled != "cmaf" {
-				return Err(format!(
-					"rendition '{name}' travels in '{spelled}', and this reads cmaf"
-				));
-			}
+			let (packaging, init) = match spelled.as_str() {
+				"cmaf" => (
+					Packaging::Cmaf,
+					unbase64(&text(container, "init", name)?)
+						.map_err(|err| format!("rendition '{name}': {err}"))?,
+				),
+				LEGACY => (Packaging::Legacy, Vec::new()),
+				_ => {
+					return Err(format!(
+						"rendition '{name}' travels in '{spelled}', and this reads cmaf and 						 {LEGACY}"
+					))
+				}
+			};
+			// A cmaf entry always says what its decoder takes. A legacy one
+			// may say nothing: `avc3` and `hev1` carry their parameter sets
+			// in the stream, and libmoq writes no description for them.
+			let config = match (packaging, entry.get("description")) {
+				(Packaging::Legacy, None) => Vec::new(),
+				_ => unhex(&text(entry, "description", name)?)
+					.map_err(|err| format!("rendition '{name}': {err}"))?,
+			};
 			found.push(Rendition {
 				name: name.clone(),
 				codec: text(entry, "codec", name)?,
-				config: unhex(&text(entry, "description", name)?)
-					.map_err(|err| format!("rendition '{name}': {err}"))?,
-				init: unbase64(&text(container, "init", name)?)
-					.map_err(|err| format!("rendition '{name}': {err}"))?,
+				config,
+				init,
+				packaging,
 				kind,
 				row: 0,
 			});
@@ -431,6 +461,7 @@ fn data_rendition(name: &str, entry: &serde_json::Value) -> Result<Rendition, St
 		codec: text(entry, "codec", name)?,
 		config: Vec::new(),
 		init: Vec::new(),
+		packaging: Packaging::Legacy,
 		kind: Kind::Data {
 			timescale: timescale as u32,
 		},
@@ -447,6 +478,14 @@ fn data_rendition(name: &str, entry: &serde_json::Value) -> Result<Rendition, St
 /// is a row of its own. Rows are numbered in reading order, so the
 /// first video rendition is row 0.
 ///
+/// A broadcast in the `legacy` container is one programme, not a
+/// relation this package published: libmoq names its tracks `0.aac` and
+/// `1.avc3`, not by this pairing. So a legacy audio rendition that no
+/// video names joins the first legacy video row that has no audio yet,
+/// and a query reads the OBS feed as one row (`s.video[1], s.audio[1]`).
+/// A cmaf audio rendition without a name to pair by stays a row of its
+/// own, as a ladder's separate audio does.
+///
 /// A data rendition is no rendition's own: it rides beside the rows,
 /// as a publisher's data column does. It is put on row 0, so a query
 /// reading a broadcast's messages beside its picture and sound reads
@@ -455,6 +494,7 @@ pub fn rows(renditions: &[Rendition]) -> Vec<u32> {
 	let mut row_of: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
 	let mut next = 0u32;
 	let mut out = Vec::with_capacity(renditions.len());
+	let mut audio_rows = std::collections::HashSet::new();
 	for rendition in renditions {
 		match rendition.kind {
 			Kind::Video { .. } => {
@@ -473,9 +513,24 @@ pub fn rows(renditions: &[Rendition]) -> Vec<u32> {
 			.name
 			.strip_suffix(AUDIO_SUFFIX)
 			.and_then(|video| row_of.get(video).copied());
-		match paired {
-			Some(row) => out.push(row),
+		let programme = || {
+			(rendition.packaging == Packaging::Legacy)
+				.then(|| {
+					renditions.iter().zip(&out).find_map(|(earlier, &row)| {
+						let video = matches!(earlier.kind, Kind::Video { .. })
+							&& earlier.packaging == Packaging::Legacy;
+						(video && !audio_rows.contains(&row)).then_some(row)
+					})
+				})
+				.flatten()
+		};
+		match paired.or_else(programme) {
+			Some(row) => {
+				audio_rows.insert(row);
+				out.push(row);
+			}
 			None => {
+				audio_rows.insert(next);
 				out.push(next);
 				next += 1;
 			}
@@ -1209,5 +1264,51 @@ mod tests {
 		}
 		assert!(unhex("abc").is_err(), "an odd hex length is refused");
 		assert!(unbase64("A").is_err(), "a truncated group is refused");
+	}
+
+	/// The catalog libmoq's OBS output wrote on Cloudflare's draft-16 relay,
+	/// as a subscriber read it: `1.avc3` with its parameter sets in the
+	/// stream and no description, `0.aac` with its AudioSpecificConfig, both
+	/// in hang's legacy container, plus hang's own `archive` and `clock`.
+	const OBS: &str = r#"{"video":{"renditions":{"1.avc3":{"codec":"avc3.64001f","codedWidth":1280,"codedHeight":720,"bitrate":2500000,"optimizeForLatency":true,"container":{"kind":"legacy"},"jitter":34}}},"audio":{"renditions":{"0.aac":{"codec":"mp4a.40.2","sampleRate":48000,"numberOfChannels":2,"bitrate":182912,"description":"119056e500","container":{"kind":"legacy"},"jitter":22}}},"archive":{"track":"timeline.z","timescale":1000},"clock":{"wall":212518817368342,"timescale":1000000}}"#;
+
+	#[test]
+	fn an_obs_broadcast_reads_as_one_row_of_legacy_renditions() {
+		let renditions = parse(OBS).expect("libmoq's catalog reads");
+		assert_eq!(renditions.len(), 2);
+		let (video, audio) = (&renditions[0], &renditions[1]);
+		assert_eq!(video.name, "1.avc3");
+		assert_eq!(video.codec, "avc3.64001f");
+		assert_eq!(video.kind, Kind::Video { width: 1280, height: 720 });
+		assert_eq!(video.packaging, Packaging::Legacy);
+		assert!(video.config.is_empty() && video.init.is_empty());
+		assert_eq!(audio.name, "0.aac");
+		assert_eq!(audio.kind, Kind::Audio { sample_rate: 48000, channels: 2 });
+		assert_eq!(audio.config, vec![0x11, 0x90, 0x56, 0xe5, 0x00]);
+		// One programme: the audio joins the video's row.
+		assert_eq!((video.row, audio.row), (0, 0));
+	}
+
+	#[test]
+	fn a_legacy_programme_pairs_one_audio_with_each_video_row_at_most() {
+		let two_audios = r#"{"video":{"renditions":{"v":{"codec":"avc3.64001f","codedWidth":8,"codedHeight":8,"container":{"kind":"legacy"}}}},"audio":{"renditions":{"a":{"codec":"mp4a.40.2","sampleRate":48000,"numberOfChannels":2,"description":"1190","container":{"kind":"legacy"}},"b":{"codec":"mp4a.40.2","sampleRate":48000,"numberOfChannels":2,"description":"1190","container":{"kind":"legacy"}}}}}"#;
+		let rows: Vec<u32> = parse(two_audios).unwrap().iter().map(|r| r.row).collect();
+		assert_eq!(rows, vec![0, 0, 1], "the second audio is a row of its own");
+	}
+
+	#[test]
+	fn a_cmaf_audio_without_a_video_name_stays_its_own_row() {
+		// A ladder's separate audio: what this package publishes, read back
+		// as it was published.
+		let ladder = r#"{"video":{"renditions":{"video":{"codec":"avc1.64001f","description":"01","codedWidth":8,"codedHeight":8,"container":{"kind":"cmaf","init":"AA=="}}}},"audio":{"renditions":{"audio":{"codec":"mp4a.40.2","description":"1190","sampleRate":48000,"numberOfChannels":2,"container":{"kind":"cmaf","init":"AA=="}}}}}"#;
+		let rows: Vec<u32> = parse(ladder).unwrap().iter().map(|r| r.row).collect();
+		assert_eq!(rows, vec![0, 1]);
+	}
+
+	#[test]
+	fn a_cmaf_rendition_still_needs_its_description() {
+		let err = parse(r#"{"video":{"renditions":{"v":{"codec":"avc1","codedWidth":8,"codedHeight":8,"container":{"kind":"cmaf","init":"AA=="}}}}}"#)
+			.expect_err("a refusal");
+		assert!(err.contains("description"), "{err}");
 	}
 }
