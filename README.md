@@ -64,7 +64,8 @@ ahead of them was known delivered; see "One group at a time"),
 for on that track, `-1` when nobody is subscribed), and `gap_max_ms`
 and `call_max_ms` (the longest the QUIC session lay undriven, and the
 longest one call held it: the session runs only while a host call is
-on the executor, so the first is what a loaded machine costs).
+on the executor, so the first is what a loaded machine costs, or on a
+host that calls only as packets arrive, how far apart they do).
 
 A session the relay dropped is replaced rather than the run ended; see
 "A dropped session" below. The publisher says so in a row of its own,
@@ -197,10 +198,39 @@ sends the oldest on at once. Either way the group went without the
 protection, and the rows count it in `unpaced`.
 
 The session runs only inside a host call, so a held group goes out from
-a later call. While media flows that is a frame away. Once the media
-has been quiet for 250 ms, a call waits for its own queue instead, as
-every call did before 0.7.2, since it has no media to hold up. A group
-held in the last call before the media stops waits for the next call.
+a later call. Since 0.7.3 a call with no packets in it is a TURN: the
+session runs, what the queues may let go goes onto the socket, and the
+call returns. From ffrwd 0.21.1 the sidecar makes one whenever nothing
+has reached the sink for 20 ms, so a held group goes out within a turn
+of the acknowledgement it waits on, however its packets arrive.
+
+That matters on a LEAF, a query reading a broadcast and publishing it
+again. Its packets arrive the way the upstream groups do, whole: a GOP of
+picture and the sound beside it, about a second apart. A host that calls
+only as packets arrive leaves the session still for that second, and on
+0.7.2 every group queued behind an unacknowledged one waited for it, well
+past the cap, and went unpaced. Measured with `tests/live_pacing.py
+--shape leaf` (a head publishing to a local relay, and a leaf reading it
+and publishing again through a 40 ms round trip), over the windows after
+the join:
+
+| | 0.7.2, ffrwd 0.21.0 | 0.7.3, calls with no packets |
+| --- | --- | --- |
+| longest the session lay still | 1045 to 1164 ms | 33 to 36 ms |
+| longest call | 377 to 505 ms | 41 to 48 ms |
+| audio: held at once, longest held | 8, 2281 ms | 5 to 6, 378 ms |
+| audio: unpaced | 164 | 0 |
+| video: longest held, unpaced | 1171 ms, 87 | 160 ms, 0 |
+| data: longest held, unpaced | 184 ms, 0 | 125 ms, 0 |
+
+A second of sound is five groups cut at once, so on a leaf they still
+queue behind each other: each goes one round trip, the 10 ms and at most
+one turn after the one before it, about 65 ms apart here. The last of a
+lump is held about a third of a second, and none goes unpaced.
+
+With a host that makes no turns, once the media has been quiet for
+250 ms a call waits for its own queue instead, as every call did before
+0.7.2, since it has no media to hold up.
 
 Before 0.7.2 only a data track was paced, and the wait sat in the call:
 a pair of messages held the whole call, media included, for a round
