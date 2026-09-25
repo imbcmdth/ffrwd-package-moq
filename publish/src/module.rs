@@ -13,7 +13,7 @@ use exports::ffrwd::av::packet_sink::{
 use ffrwd::av::types::CodedFormat;
 use serde::{Deserialize, Serialize};
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"rows":{"type":"string","enum":["summary","groups","none"],"default":"summary","description":"what the sink reports: 'summary' is one row per track every 5s and a final total, 'groups' a row per published group, 'none' the final total alone"},"reconnect_s":{"type":"integer","minimum":0,"default":60,"description":"how long a publisher whose session the relay dropped keeps trying to open a new one and announce the broadcast again, in seconds; groups are still written meanwhile, and 0 ends the run on the first drop"},"audio_group_ms":{"type":"integer","minimum":0,"default":200,"description":"how long an audio group runs, in milliseconds; a fifth of a second is ten AAC frames at 48kHz, and shorter groups have been seen losing whole groups through a public relay under load. 0 is one frame per group, which is what upstream hang writes and is experimental here"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"rows":{"type":"string","enum":["summary","groups","none"],"default":"summary","description":"what the sink reports: 'summary' is one row per track every 5s and a final total, 'groups' a row per published group, 'none' the final total alone"},"hold_s":{"type":"number","minimum":0,"default":10,"description":"how long the first media waits for a first subscriber before it goes out anyway, in seconds; a subscription starts at the latest group, so holding keeps a file's opening from being lost, and 0 publishes at once, which suits a live source nobody watches yet"},"reconnect_s":{"type":"integer","minimum":0,"default":60,"description":"how long a publisher whose session the relay dropped keeps trying to open a new one and announce the broadcast again, in seconds; groups are still written meanwhile, and 0 ends the run on the first drop"},"audio_group_ms":{"type":"integer","minimum":0,"default":200,"description":"how long an audio group runs, in milliseconds; a fifth of a second is ten AAC frames at 48kHz, and shorter groups have been seen losing whole groups through a public relay under load. 0 is one frame per group, which is what upstream hang writes and is experimental here"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
 
 /// The base name a video track falls back to when its row's rendition
 /// carries none, and the ladder holds only the one stream.
@@ -50,12 +50,13 @@ const KEEP: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(20);
 
 /// How long the first media is held for that first subscriber before it
-/// goes out regardless. The hold keeps a file's start from being lost
-/// to the latest-group rule, and the harness readers arrive within a
-/// second - but an unwatched live publish must still flow: the pipes
-/// feeding the module are bounded, and a stalled stage is killed. First
-/// reader or this, whichever comes first.
-const HOLD_MAX: Duration = Duration::from_secs(10);
+/// goes out regardless, unless `hold_s` says otherwise. The hold keeps a
+/// file's start from being lost to the latest-group rule, and the harness
+/// readers arrive within a second - but an unwatched live publish must
+/// still flow: the pipes feeding the module are bounded, and a stalled
+/// stage is killed. First reader or this, whichever comes first. A live
+/// source loses nothing by starting at once, and `hold_s => 0` does.
+const HOLD_MAX: f64 = 10.0;
 
 /// How often a summary row per track goes out while a run lasts.
 const SUMMARY_EVERY: Duration = Duration::from_secs(5);
@@ -137,10 +138,18 @@ struct Params {
 	/// [`Session::mend`].
 	#[serde(default = "default_reconnect_s")]
 	reconnect_s: u64,
+	/// How long the first media waits for a first subscriber, in seconds;
+	/// see [`HOLD_MAX`].
+	#[serde(default = "default_hold_s")]
+	hold_s: f64,
 }
 
 fn default_reconnect_s() -> u64 {
 	60
+}
+
+fn default_hold_s() -> f64 {
+	HOLD_MAX
 }
 
 /// What a run says about itself. A group a second is nothing; ten a
@@ -667,6 +676,12 @@ fn parse_params(params: &str) -> Result<Params, String> {
 	// scoped to the token can find.
 	moq_core::relay::session_path(&params.relay, &params.token)?;
 	Rows::parse(&params.rows)?;
+	if !(params.hold_s.is_finite() && params.hold_s >= 0.0) {
+		return Err(format!(
+			"params: hold_s is how long to wait, in seconds, and {} is no such time",
+			params.hold_s
+		));
+	}
 	Ok(params)
 }
 
@@ -894,7 +909,7 @@ impl Session {
 			// The catalog goes out to the first reader of anything: it is
 			// what a subscriber needs before it can name a rendition, so
 			// holding it until a rendition is named would hold it forever.
-			let deadline = tokio::time::Instant::now() + HOLD_MAX;
+			let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(self.params.hold_s);
 			while !self.wanted() && tokio::time::Instant::now() < deadline {
 				tokio::time::sleep(POLL).await;
 			}

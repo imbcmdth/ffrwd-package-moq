@@ -39,6 +39,13 @@ fragmented MP4: one `moof`+`mdat` fragment per each frame, a new MoQ
 group at every keyframe. Audio rides beside the video as AAC, cut on
 frame edges.
 
+A subscription starts at the latest group, so the first media is held
+for a first subscriber, up to `hold_s` seconds (10 by default), to keep
+a file's opening from being lost to a reader that arrives a moment
+late. A live source loses nothing by starting at once: `hold_s => 0`
+publishes the first media straight away, which saves a head nobody
+watches yet those ten seconds on every start.
+
 ### What a run says
 
 `rows` decides. `'summary'`, the default, is one row per track every
@@ -708,7 +715,7 @@ carried for wasm32-wasip2 fixes upstream does not ship yet).
 
 - `publish(relay, broadcast, cert DEFAULT '', token DEFAULT '',
   audio_group_ms DEFAULT 200, rows DEFAULT 'summary',
-  reconnect_s DEFAULT 60)` returns `sink`: a COPY destination,
+  reconnect_s DEFAULT 60, hold_s DEFAULT 10)` returns `sink`: a COPY destination,
   nothing comes back. It reads the whole relation - a video cell, an
   audio cell, either NULL - one rendition per row, and any data columns
   beside it, a track of messages apiece.

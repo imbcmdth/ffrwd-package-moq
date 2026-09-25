@@ -72,11 +72,18 @@
 -- written meanwhile and the new session announces the same broadcast,
 -- its group numbers carrying on; a row with event 'reconnect' says when
 -- it is back. 0 ends the run on the first drop.
+-- hold_s is how long the first media waits for a first subscriber
+-- before it goes out anyway, in seconds, 10 by default. A subscription
+-- starts at the latest group, so the hold keeps a file's opening from
+-- being lost to a reader that arrives a moment late. A live source loses
+-- nothing by starting at once: 0 publishes the first media straight
+-- away, which saves a head nobody watches yet those ten seconds.
 CREATE FUNCTION publish(relay text, broadcast text,
                         cert text DEFAULT '', token text DEFAULT '',
                         audio_group_ms number DEFAULT 200,
                         rows text DEFAULT 'summary',
-                        reconnect_s number DEFAULT 60)
+                        reconnect_s number DEFAULT 60,
+                        hold_s number DEFAULT 10)
 RETURNS sink
   AS 'target/wasm32-wasip2/release/publish.wasm', 'publish' LANGUAGE wasm;
 
