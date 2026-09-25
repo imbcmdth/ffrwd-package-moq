@@ -117,7 +117,8 @@ published and 939 received, at `0` as at `100`. So `0` is offered,
 documented and not recommended until that is understood.
 
 Tracks carry hang's own delivery priorities, higher sent first:
-`catalog.json` at 100, audio at 80, video at 60. They break the tie on
+`catalog.json` at 100, audio at 80, video at 60, and a data track, which
+hang has no number for, at 90 (see "Data tracks"). They break the tie on
 a session whose subscriber - a relay reading the whole broadcast -
 asks for every track alike, so a video keyframe cannot sit in the send
 queue in front of a sound.
@@ -383,6 +384,90 @@ them is ever silent, so a run that lost something says which groups by
 sequence. The first 256
 of each per track are spelled out and the rest are only counted.
 
+## Data tracks
+
+A data stream is a sequence of messages, each one JSON object at its
+own pts. `publish` takes one as a column beside the rows, and each
+becomes a MoQ track of its own:
+
+```pgsql
+COPY (
+  SELECT f.video[1], f.audio[1], d.data[1]
+  FROM input(:'source', realtime => true) f, input('deal.nut', realtime => true) d
+) TO ffrwd.moq.publish(:'relay', :'broadcast')
+```
+
+A data pad is named by the rendition name the host hands it, when it
+hands one, and otherwise `data`, `data.1`, ... in the order the query
+names the columns. ffrwd 0.19.0 hands a data pad no name, so a column
+alias (`awards.d AS deal`) does not reach the module yet, and the track
+is `data`.
+
+**One message is one group.** Each message is the one frame of a group
+of its own, in hang's `legacy` framing: a QUIC varint of the pts in
+microseconds, then the message's bytes exactly as they arrived. The
+frame's own timestamp is set to the same pts, but a reader cannot
+count on it: over an IETF draft of the wire (moq-transport 16, which
+Cloudflare's relay speaks) neither end sends a track's timescale, and a
+subscriber stamps every frame with the time it ARRIVED. Media survives
+that, its time being inside its fragments. A message would not, so its
+pts rides inside the frame.
+
+**The pts is when the message was emitted.** A break announced five
+seconds ahead is a message at the moment of the announcement, with the
+cue as a field of its own inside the JSON (`start_pts`). What matters
+about such a message is that it arrives BEFORE the media it refers to,
+so a call writes its messages first, each group finished and driven
+onto the socket before any media handed over in the same call is
+touched. A data track's delivery priority is 90, above audio's 80: a
+message is a few hundred bytes now and then, which costs the sound
+nothing, and it must not wait in a send queue behind it. It asks for
+ordered delivery, as audio does, since a newer message does not stand
+in for an older one.
+
+The catalog names the tracks in a `data` section of this package's
+own, beside hang's two:
+
+```json
+"data": {"renditions": {"data": {"codec": "json", "container": {"kind": "legacy"}, "timescale": 1000000}}}
+```
+
+`timescale` is what the messages' pts count in: the stream's own ticks
+per second when its time base is `1/n`, microseconds otherwise. A
+player reads past the section, since hang's catalog denies no unknown
+field, and nothing it plays changes. A data track filed under `video`
+or `audio` instead would fail hang's validation and take the whole
+broadcast off the player, which is why it has a section of its own.
+
+`subscribe` lists every track of that section as a data cell of the
+FIRST row, beside that row's picture and sound, so `s.data[1]` reads
+the broadcast's first data track:
+
+```pgsql
+COPY (
+  SELECT s.video[1], s.audio[1], s.data[1]
+  FROM ffrwd.moq.subscribe(:'relay', :'from') s
+) TO ffrwd.moq.publish(:'relay', :'into')
+```
+
+Each group becomes one packet: the message's bytes, at the pts its
+frame carries, in the track's time base (`1/timescale`), a keyframe
+with its dts at its pts. A group is handed on the moment it has been
+read to its end, not when the next one begins: the next message may be
+a minute away. A live join starts at the newest message, and a dropped
+session takes the data tracks up again with the rest.
+
+`tests/live_data.py` is the loop that holds this: a paced publisher
+with video, audio and 43 messages over 98.5 seconds, and a reader
+under the sidecar timing each packet as it leaves. Every message
+arrives byte for byte, at the publisher's pts to the microsecond, and
+ahead of the first picture at or past its pts. The margin is a second
+to two and a half against a local relay, since a picture waits for its
+group to end and a message does not. Held to moq-transport 16
+(`--relay-version`), the same holds, the pts coming out of the frame;
+with the relay taken away mid-run (`--reconnect`), what is lost is only
+what went out while the reader had no session.
+
 ## Relay
 
 Both directions in one query is a relay, and whatever the query does
@@ -489,12 +574,14 @@ carried for wasm32-wasip2 fixes upstream does not ship yet).
   audio_group_ms DEFAULT 200, rows DEFAULT 'summary',
   reconnect_s DEFAULT 60)` returns `sink`: a COPY destination,
   nothing comes back. It reads the whole relation - a video cell, an
-  audio cell, either NULL - one rendition per row.
+  audio cell, either NULL - one rendition per row, and any data columns
+  beside it, a track of messages apiece.
 - `subscribe(relay, broadcast, cert DEFAULT '', token DEFAULT '',
   start DEFAULT 'live', hold_ms DEFAULT NULL, hold_mib DEFAULT 64,
   join_ms DEFAULT 2000, reconnect_s DEFAULT 60)`
   returns `source`: a FROM relation, one row per rendition of the
-  broadcast's catalog, a video cell and an audio cell, either NULL.
+  broadcast's catalog, a video cell and an audio cell, either NULL,
+  and the catalog's data tracks as data cells of the first row.
   Unbounded. `start` is which end of a running broadcast to join at,
   `'live'` or `'backlog'`; the three numbers after it are the hold the
   groups are put back in order in, and `reconnect_s` how long a dropped

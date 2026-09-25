@@ -12,6 +12,19 @@
 -- (github.com/kixelated/moq): each entry carries its codec, its
 -- geometry and its fmp4 init segment.
 --
+-- A data column (a data_stream of JSON messages: a JSON NUT's d.data[1],
+-- a data filter's output, another broadcast's s.data[1]) rides beside
+-- the rows and publishes as a track of its own, named by the rendition
+-- name the host hands its pad, or data, data.1, ... in the order the
+-- query names them (ffrwd 0.19.0 hands none, so an alias does not reach
+-- the module yet). Each message is one MoQ group of one frame in hang's
+-- legacy framing, its pts as a varint of microseconds and then its
+-- bytes as they arrived, and it goes out the moment it arrives, ahead
+-- of any media handed over with it. A message's pts is when it was
+-- emitted; a cue it announces is a field inside the JSON. The catalog
+-- names these tracks in a data section of its own, which players read
+-- past.
+--
 -- relay names the relay by URL, its host a name or an IP literal - a
 -- name is resolved over DNS-over-HTTPS (1.1.1.1, then 8.8.8.8), since
 -- the runner links no name lookup. cert is a private relay's own
@@ -70,6 +83,13 @@ RETURNS sink
 -- s.codecs, s.name. A broadcast never ends of itself, so the relation
 -- is unbounded - a live input, and the run lasts as long as the
 -- publisher does.
+--
+-- Each track of the catalog's data section is a data cell on the FIRST
+-- row, beside that row's picture and sound: s.data[1] is the first data
+-- track, a data_stream of JSON messages (codec json, time base
+-- 1/timescale as the catalog names it). Each message is handed over at
+-- the pts its frame carries, never at the frame's own timestamp, which
+-- over an IETF draft of the wire is only the time it arrived.
 --
 -- The catalog is read at compile time, so the broadcast must be on
 -- the relay before the query compiles. Each rendition's init segment
