@@ -277,6 +277,9 @@ struct Rendition {
 	media_seconds: f64,
 	/// Groups opened on the MoQ track; see [`TrackRow`].
 	appended: u64,
+	/// A data track's last group, until the next message has waited for
+	/// it to be delivered; see [`moq_core::delivery`].
+	in_flight: Option<moq_core::delivery::InFlight>,
 	/// The open group's accumulators, for its row when it closes.
 	group_packets: u64,
 	group_bytes: u64,
@@ -389,6 +392,9 @@ impl Rendition {
 			return Ok(None);
 		};
 		group.finish().map_err(|err| format!("moq group: {err}"))?;
+		if matches!(self.media, Media::Data { .. }) {
+			self.in_flight = Some(moq_core::delivery::InFlight::new(group));
+		}
 		let row = emit.then(|| GroupRow {
 			track: self.name.clone(),
 			group: self.groups,
@@ -400,6 +406,27 @@ impl Rendition {
 		self.groups += 1;
 		self.media_seconds = self.seconds(self.group_pts_max);
 		Ok(row.map(|row| serde_json::to_string(&row).expect("a group row serializes")))
+	}
+
+	/// Until the last message's group on this track has been delivered,
+	/// before the next one opens; at once on a track with none in flight,
+	/// or nobody subscribed.
+	async fn settle(&mut self) {
+		if let Some(flight) = self.in_flight.take() {
+			let subscribed = self
+				.track
+				.as_ref()
+				.is_some_and(|track| track.subscription().is_some());
+			flight.settle(subscribed).await;
+		}
+	}
+
+	/// Notes whether the session has taken the last message's group yet,
+	/// so a later [`Self::settle`] knows a group that has already gone.
+	fn watch(&mut self) {
+		if let Some(flight) = self.in_flight.as_mut() {
+			flight.watch();
+		}
 	}
 
 	/// This track's totals so far, as a row, with what the session and
@@ -753,6 +780,11 @@ impl Session {
 		// an announcement - a break named seconds ahead of its cue - and
 		// what it announces is the media behind it, so it must not wait in
 		// this call behind a GOP's worth of fragments.
+		//
+		// And one at a time on a track: each waits for the group before it,
+		// this call's or the last call's, to be delivered, since a relay
+		// that keeps only a track's latest group drops one that a newer
+		// group overtakes on its way through. See [`moq_core::delivery`].
 		let mut messages = false;
 		for (index, pad) in pads.iter().enumerate() {
 			let Some(rendition) = self.renditions.get_mut(index) else {
@@ -774,14 +806,19 @@ impl Session {
 				let framed = moq_core::message::encode(pts_us, &packet.data).map_err(|err| {
 					format!("track '{}': the message at pts {}: {err}", rendition.name, packet.pts)
 				})?;
+				rendition.settle().await;
 				rows.extend(rendition.publish_frame(packet.pts, true, framed, per_group)?);
 				drive_once().await;
+				rendition.watch();
 				messages = true;
 			}
 		}
 		if messages {
 			for _ in 0..FLUSH_TURNS {
 				tokio::time::sleep(FLUSH_SLICE).await;
+				for rendition in &mut self.renditions {
+					rendition.watch();
+				}
 			}
 		}
 
@@ -1237,6 +1274,7 @@ impl Guest for Publish {
 				bytes: 0,
 				media_seconds: 0.0,
 				appended: 0,
+				in_flight: None,
 				group_packets: 0,
 				group_bytes: 0,
 				group_pts_min: 0,
