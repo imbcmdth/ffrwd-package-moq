@@ -200,7 +200,7 @@ protection, and the rows count it in `unpaced`.
 The session runs only inside a host call, so a held group goes out from
 a later call. Since 0.7.3 a call with no packets in it is a TURN: the
 session runs, what the queues may let go goes onto the socket, and the
-call returns. From ffrwd 0.21.1 the sidecar makes one whenever nothing
+call returns. From ffrwd 0.21.2 the sidecar makes one whenever nothing
 has reached the sink for 20 ms, so a held group goes out within a turn
 of the acknowledgement it waits on, however its packets arrive.
 
