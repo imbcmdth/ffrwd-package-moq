@@ -33,7 +33,7 @@ const DEFAULT_DATA_TRACK: &str = "data";
 /// the seconds of media published on it; the TRAILING row, which every
 /// run ends with, carries `tracks`. `pts_start`/`pts_end` are seconds
 /// of media time.
-const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"track":{"type":"string"},"group":{"type":"integer"},"packets":{"type":"integer"},"bytes":{"type":"integer"},"pts_start":{"type":"number"},"pts_end":{"type":"number"},"groups":{"type":"integer"},"media":{"type":"number"},"tracks":{"type":"integer"},"init_bytes":{"type":"integer"},"appended":{"type":"integer"},"closed":{"type":"integer"},"sub_latency_ms":{"type":"integer"},"sub_priority":{"type":"integer"},"sub_ordered":{"type":"boolean"},"gap_max_ms":{"type":"integer"},"call_max_ms":{"type":"integer"},"event":{"type":"string","enum":["reconnect"]},"attempts":{"type":"integer"},"down_ms":{"type":"integer"},"error":{"type":"string"}},"additionalProperties":false}"#;
+const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"track":{"type":"string"},"group":{"type":"integer"},"packets":{"type":"integer"},"bytes":{"type":"integer"},"pts_start":{"type":"number"},"pts_end":{"type":"number"},"groups":{"type":"integer"},"media":{"type":"number"},"tracks":{"type":"integer"},"init_bytes":{"type":"integer"},"appended":{"type":"integer"},"closed":{"type":"integer"},"sub_latency_ms":{"type":"integer"},"sub_priority":{"type":"integer"},"sub_ordered":{"type":"boolean"},"gap_max_ms":{"type":"integer"},"call_max_ms":{"type":"integer"},"queued":{"type":"integer"},"queue_max":{"type":"integer"},"wait_max_ms":{"type":"integer"},"unpaced":{"type":"integer"},"event":{"type":"string","enum":["reconnect"]},"attempts":{"type":"integer"},"down_ms":{"type":"integer"},"error":{"type":"string"}},"additionalProperties":false}"#;
 
 /// How long the session stays open after the last fragment, for the
 /// wire to drain: there is no delivered signal for a subscription.
@@ -77,6 +77,25 @@ async fn drive_once() {
 /// call that wrote nothing.
 const FLUSH_SLICE: Duration = Duration::from_millis(1);
 const FLUSH_TURNS: usize = 3;
+
+/// How many turns of the session a call gives an acknowledgement that
+/// arrived between calls before it first looks at what is held back; see
+/// [`Session::catch_up`].
+const CATCH_UP_TURNS: usize = 8;
+
+/// How long a broadcast's media may go without a packet before a call
+/// stops counting on the next one to let a held group go.
+///
+/// A group held back behind one the relay has not acknowledged goes out
+/// from a later call, and while media flows the next call is a frame
+/// away. Once it stops - a source that ended before its data, a stalled
+/// upstream - calls come only as messages do, seconds apart, and a
+/// message held to the next one would wait that long. So a call made
+/// with the media this quiet waits for its own queue, as every call did
+/// before 0.7.2: there is no media left in it to hold up. The same span
+/// as [`moq_core::delivery::DELIVER_MAX`], the longest the queue waits
+/// behind any one group.
+const MEDIA_QUIET: Duration = moq_core::delivery::DELIVER_MAX;
 
 /// How often the catalog goes out again, the same snapshot in a fresh
 /// group, while the broadcast lives. A relay that does not retain a
@@ -176,11 +195,22 @@ struct TrackRow {
 	packets: u64,
 	bytes: u64,
 	media: f64,
-	/// Groups opened on the MoQ track and groups finished: they differ
-	/// only by the one still open, so anything else is a group this
-	/// module failed to close.
+	/// Groups put on the MoQ track and groups finished there: they
+	/// differ only by the one still open, so anything else is a group
+	/// this module failed to close. `groups` runs ahead of both by what
+	/// the track is holding back; see [`moq_core::delivery`].
 	appended: u64,
 	closed: u64,
+	/// Groups held back right now, behind one the relay has not yet
+	/// acknowledged, and over the window the most held at once, the
+	/// longest one was held in milliseconds, and how many went before
+	/// the one ahead of them was known delivered (at the cap or the
+	/// bound), each one a group a relay that keeps only a track's newest
+	/// could have lost.
+	queued: u64,
+	queue_max: u64,
+	wait_max_ms: u64,
+	unpaced: u64,
 	/// What the relay is asking for on this track, which is what
 	/// decides what a group of ours is worth to it: its latency window
 	/// in milliseconds, its priority, and whether it wants groups in
@@ -212,6 +242,12 @@ struct SummaryRow {
 	packets: u64,
 	bytes: u64,
 	init_bytes: u64,
+	/// Over the whole run and every track: the most groups one track
+	/// held back at once, the longest one was held, and how many went
+	/// unpaced. See [`TrackRow`].
+	queue_max: u64,
+	wait_max_ms: u64,
+	unpaced: u64,
 }
 
 /// The tokio floor the session runs on. Split from [`Session`] so a
@@ -261,8 +297,12 @@ struct Rendition {
 	codec: String,
 	media: Media,
 	track: Option<moq_net::track::Producer>,
-	/// The open MoQ group, rotated where the group discipline says.
-	group: Option<moq_net::group::Producer>,
+	/// Where the track's groups are cut and how they go onto the wire:
+	/// each once the relay has the one before it. See
+	/// [`moq_core::delivery`].
+	pacer: moq_core::delivery::Pacer,
+	/// Whether a group is open, on the wire or held in the pacer.
+	group_open: bool,
 	/// Which fragments open a group: this package's own convention, not
 	/// anything the muxer decides.
 	discipline: moq_core::group::Groups,
@@ -275,11 +315,6 @@ struct Rendition {
 	bytes: u64,
 	/// The last group's end in seconds of media time, for the track row.
 	media_seconds: f64,
-	/// Groups opened on the MoQ track; see [`TrackRow`].
-	appended: u64,
-	/// A data track's last group, until the next message has waited for
-	/// it to be delivered; see [`moq_core::delivery`].
-	in_flight: Option<moq_core::delivery::InFlight>,
 	/// The open group's accumulators, for its row when it closes.
 	group_packets: u64,
 	group_bytes: u64,
@@ -352,13 +387,12 @@ impl Rendition {
 		let mut rows = Vec::new();
 		if self.discipline.starts_a_group(keyframe, pts) {
 			rows.extend(self.close_group(emit)?);
+			let subscribed = self.subscribed();
 			let track = self.track.as_mut().expect("track lives until last");
-			self.group = Some(
-				track
-					.append_group()
-					.map_err(|err| format!("moq group: {err}"))?,
-			);
-			self.appended += 1;
+			self.pacer
+				.open(track, subscribed, tokio::time::Instant::now())
+				.map_err(|err| format!("moq group: {err}"))?;
+			self.group_open = true;
 			self.group_packets = 0;
 			self.group_bytes = 0;
 			self.group_pts_min = pts;
@@ -366,9 +400,8 @@ impl Rendition {
 		}
 		let timestamp_us = ffrwd_bmff::time::ticks_to_micros(pts, self.time_base.0, self.time_base.1);
 		let bytes_len = bytes.len() as u64;
-		let group = self.group.as_mut().expect("a group start opened one");
-		group
-			.write_frame(
+		self.pacer
+			.write(
 				moq_net::Timestamp::from_micros(timestamp_us)
 					.map_err(|err| format!("moq timestamp: {err}"))?,
 				Bytes::from(bytes),
@@ -388,13 +421,13 @@ impl Rendition {
 	/// Closes the open group, if any. `emit` asks for its row; a run
 	/// reporting totals counts the group and says nothing.
 	fn close_group(&mut self, emit: bool) -> Result<Option<String>, String> {
-		let Some(mut group) = self.group.take() else {
+		if !self.group_open {
 			return Ok(None);
-		};
-		group.finish().map_err(|err| format!("moq group: {err}"))?;
-		if matches!(self.media, Media::Data { .. }) {
-			self.in_flight = Some(moq_core::delivery::InFlight::new(group));
 		}
+		self.group_open = false;
+		self.pacer
+			.close(tokio::time::Instant::now())
+			.map_err(|err| format!("moq group: {err}"))?;
 		let row = emit.then(|| GroupRow {
 			track: self.name.clone(),
 			group: self.groups,
@@ -408,25 +441,31 @@ impl Rendition {
 		Ok(row.map(|row| serde_json::to_string(&row).expect("a group row serializes")))
 	}
 
-	/// Until the last message's group on this track has been delivered,
-	/// before the next one opens; at once on a track with none in flight,
-	/// or nobody subscribed.
-	async fn settle(&mut self) {
-		if let Some(flight) = self.in_flight.take() {
-			let subscribed = self
-				.track
-				.as_ref()
-				.is_some_and(|track| track.subscription().is_some());
-			flight.settle(subscribed).await;
-		}
+	/// Whether anybody is subscribed to this track. A track nobody reads
+	/// sends nothing, and holds nothing back.
+	fn subscribed(&self) -> bool {
+		self.track
+			.as_ref()
+			.is_some_and(|track| track.subscription().is_some())
 	}
 
-	/// Notes whether the session has taken the last message's group yet,
-	/// so a later [`Self::settle`] knows a group that has already gone.
+	/// Puts on the wire whatever this track's queue may let go now, and
+	/// says how many groups went. Never waits.
+	fn release(&mut self) -> Result<usize, String> {
+		let subscribed = self.subscribed();
+		let Some(track) = self.track.as_mut() else {
+			return Ok(0);
+		};
+		self.pacer
+			.release(track, subscribed, tokio::time::Instant::now())
+			.map_err(|err| format!("track '{}': moq group: {err}", self.name))
+	}
+
+	/// Notes whether the session has taken the track's last group yet,
+	/// so a later look knows a group that has already gone from one
+	/// nobody took.
 	fn watch(&mut self) {
-		if let Some(flight) = self.in_flight.as_mut() {
-			flight.watch();
-		}
+		self.pacer.watch();
 	}
 
 	/// This track's totals so far, as a row, with what the session and
@@ -436,14 +475,19 @@ impl Rendition {
 			.track
 			.as_ref()
 			.and_then(moq_net::track::Producer::subscription);
+		let held = self.pacer.window();
 		serde_json::to_string(&TrackRow {
 			track: self.name.clone(),
 			groups: self.groups,
 			packets: self.packets,
 			bytes: self.bytes,
 			media: self.media_seconds,
-			appended: self.appended,
-			closed: self.groups,
+			appended: self.pacer.appended(),
+			closed: self.pacer.closed(),
+			queued: self.pacer.queued() as u64,
+			queue_max: held.queue_max as u64,
+			wait_max_ms: held.wait_max.as_millis() as u64,
+			unpaced: held.unpaced,
 			sub_latency_ms: asked
 				.as_ref()
 				.map_or(-1, |sub| sub.latency_max.as_millis() as i64),
@@ -546,6 +590,8 @@ struct Session {
 	left_at: Option<std::time::Instant>,
 	gap_max: Duration,
 	call_max: Duration,
+	/// When a call last carried a media packet; see [`MEDIA_QUIET`].
+	media_at: Option<std::time::Instant>,
 }
 
 /// A new session being opened in the background while groups go on
@@ -730,6 +776,84 @@ impl Session {
 		Ok(())
 	}
 
+	/// Every track's queue given a turn; see [`Rendition::release`].
+	fn release(&mut self) -> Result<(), String> {
+		for rendition in &mut self.renditions {
+			rendition.release()?;
+		}
+		Ok(())
+	}
+
+	/// Whether any track is holding a group back.
+	fn queued(&self) -> bool {
+		self.renditions
+			.iter()
+			.any(|rendition| rendition.pacer.queued() > 0)
+	}
+
+	/// A few short turns of the session, looking at every track's queue
+	/// after each: what was written goes onto the socket, and a group the
+	/// relay acknowledged meanwhile lets the next one go. See
+	/// [`FLUSH_TURNS`].
+	async fn flush(&mut self) -> Result<(), String> {
+		for _ in 0..FLUSH_TURNS {
+			tokio::time::sleep(FLUSH_SLICE).await;
+			for rendition in &mut self.renditions {
+				rendition.watch();
+			}
+			self.release()?;
+		}
+		Ok(())
+	}
+
+	/// A call's first look at its queues, given the session enough turns
+	/// to have read what arrived since the last call. An acknowledgement
+	/// that landed between calls is a datagram in the socket, and it
+	/// reaches the serving task that lets the group go only through
+	/// several tasks in turn - the socket's reactor, the endpoint, the
+	/// connection, the stream - each woken by the one before. Until it
+	/// does, a group delivered long ago still looks held, and the next
+	/// one cut behind it would wait on it or, past the cap, go counted as
+	/// unpaced. Yields and no sleeps: a few microseconds a turn, and none
+	/// when no track is waiting on anything.
+	async fn catch_up(&mut self) -> Result<(), String> {
+		drive_once().await;
+		for _ in 0..CATCH_UP_TURNS {
+			let waiting = self
+				.renditions
+				.iter()
+				.any(|rendition| rendition.pacer.queued() > 0 || rendition.pacer.unsettled());
+			if !waiting {
+				break;
+			}
+			for rendition in &mut self.renditions {
+				rendition.watch();
+			}
+			self.release()?;
+			drive_once().await;
+		}
+		self.release()
+	}
+
+	/// Until no track holds a group back, each going in its turn and none
+	/// later than the cap behind the one before it. Only for a call that
+	/// no later call will follow soon enough to let them go.
+	async fn empty_queues(&mut self) -> Result<(), String> {
+		if !self.queued() {
+			return Ok(());
+		}
+		while self.queued() {
+			tokio::time::sleep(FLUSH_SLICE).await;
+			for rendition in &mut self.renditions {
+				rendition.watch();
+			}
+			self.release()?;
+		}
+		// The last of them went into the session, not onto the socket: a
+		// call that returned now would leave it there until the next one.
+		self.flush().await
+	}
+
 	/// One host call's work: hold for the first subscriber, feed each
 	/// pad's muxer, publish what closed, and on the final call drain and
 	/// close the session.
@@ -775,16 +899,27 @@ impl Session {
 			self.publish_catalog()?;
 		}
 
+		// Every track's groups leave one at a time: a group cut while the
+		// one before it on its track is still on its way is held in that
+		// track's queue, since a relay that keeps only a track's latest
+		// group drops one that a newer group overtakes on its way through.
+		// Nothing here waits for one. What the relay has acknowledged since
+		// the last call lets the groups behind it go now, before anything
+		// new is cut, and every turn of the session below looks again. See
+		// [`moq_core::delivery`].
+		self.catch_up().await?;
+		let media = pads.iter().zip(&self.renditions).any(|(pad, rendition)| {
+			!pad.packets.is_empty() && !matches!(rendition.media, Media::Data { .. })
+		});
+		if media {
+			self.media_at = Some(std::time::Instant::now());
+		}
+
 		// Messages first, each one its own group, written and put on the
 		// socket before any media of the same call is touched. A message is
 		// an announcement - a break named seconds ahead of its cue - and
 		// what it announces is the media behind it, so it must not wait in
 		// this call behind a GOP's worth of fragments.
-		//
-		// And one at a time on a track: each waits for the group before it,
-		// this call's or the last call's, to be delivered, since a relay
-		// that keeps only a track's latest group drops one that a newer
-		// group overtakes on its way through. See [`moq_core::delivery`].
 		let mut messages = false;
 		for (index, pad) in pads.iter().enumerate() {
 			let Some(rendition) = self.renditions.get_mut(index) else {
@@ -806,7 +941,6 @@ impl Session {
 				let framed = moq_core::message::encode(pts_us, &packet.data).map_err(|err| {
 					format!("track '{}': the message at pts {}: {err}", rendition.name, packet.pts)
 				})?;
-				rendition.settle().await;
 				rows.extend(rendition.publish_frame(packet.pts, true, framed, per_group)?);
 				drive_once().await;
 				rendition.watch();
@@ -814,12 +948,7 @@ impl Session {
 			}
 		}
 		if messages {
-			for _ in 0..FLUSH_TURNS {
-				tokio::time::sleep(FLUSH_SLICE).await;
-				for rendition in &mut self.renditions {
-					rendition.watch();
-				}
-			}
+			self.flush().await?;
 		}
 
 		for (index, pad) in pads.iter().enumerate() {
@@ -851,20 +980,21 @@ impl Session {
 					})?;
 				rendition.packets += 1;
 				for fragment in fragments {
-					let closed = rendition.publish_fragment(fragment, per_group)?;
+					let before = rendition.groups;
+					rows.extend(rendition.publish_fragment(fragment, per_group)?);
 					// A closed group is one the session has not been
 					// given a chance to take. The session runs only while
 					// this call is on the executor, so a call that closes
 					// several groups in a row - a batch spanning several
 					// boundaries, which is what a stalled upstream hands
-					// over when it catches up - would append them all
+					// over when it catches up - would finish them all
 					// before the session saw any. Drive it here, per
-					// group: a burst then leaves as a burst of groups
-					// rather than as one.
-					if !closed.is_empty() {
+					// group, and look at once whether it has taken it:
+					// the next group on the track waits for that one.
+					if rendition.groups != before {
 						drive_once().await;
+						rendition.watch();
 					}
-					rows.extend(closed);
 				}
 			}
 			// Let the driver move the frames onto the wire now, not
@@ -880,10 +1010,23 @@ impl Session {
 		// between a reader that plays it and a reader that gives up on
 		// it. One yield lets the driver poll; the slices let its timers
 		// and the socket's readiness catch up.
+		//
+		// Not for a group held back: its predecessor's acknowledgement is
+		// a round trip away, further than these turns reach, and the next
+		// call looks for it first thing. Waiting here for it is the call
+		// blocked on delivery again.
 		if !rows.is_empty() {
-			for _ in 0..FLUSH_TURNS {
-				tokio::time::sleep(FLUSH_SLICE).await;
-			}
+			self.flush().await?;
+		}
+		// Unless no call is coming soon to do it: with the media quiet, the
+		// next call is the next message, and what this one holds back waits
+		// here instead. See [`MEDIA_QUIET`].
+		if !last
+			&& self
+				.media_at
+				.is_none_or(|at| at.elapsed() >= MEDIA_QUIET)
+		{
+			self.empty_queues().await?;
 		}
 
 		// The periodic word from a run that says nothing per group: what
@@ -904,6 +1047,9 @@ impl Session {
 			// Each window's own worst, not the run's.
 			self.gap_max = Duration::ZERO;
 			self.call_max = Duration::ZERO;
+			for rendition in &mut self.renditions {
+				rendition.pacer.next_window();
+			}
 		}
 
 		if last {
@@ -927,6 +1073,9 @@ impl Session {
 					rows.push(row);
 				}
 			}
+			// And what the tracks still hold back goes in its turn. This
+			// call is the last, so nothing after it would let them go.
+			self.empty_queues().await?;
 			tokio::time::sleep(DRAIN).await;
 			for rendition in &mut self.renditions {
 				if let Some(mut track) = rendition.track.take() {
@@ -950,6 +1099,8 @@ impl Session {
 				let _ = driver.await;
 			}
 			self.endpoint.wait_idle().await;
+			let held: Vec<moq_core::delivery::Stats> =
+				self.renditions.iter().map(|r| r.pacer.run()).collect();
 			trailing.push(
 				serde_json::to_string(&SummaryRow {
 					tracks: self.renditions.len() as u64,
@@ -957,6 +1108,13 @@ impl Session {
 					packets: self.renditions.iter().map(|r| r.packets).sum(),
 					bytes: self.renditions.iter().map(|r| r.bytes).sum(),
 					init_bytes: self.renditions.iter().map(|r| r.init_bytes).sum(),
+					queue_max: held.iter().map(|s| s.queue_max as u64).max().unwrap_or(0),
+					wait_max_ms: held
+						.iter()
+						.map(|s| s.wait_max.as_millis() as u64)
+						.max()
+						.unwrap_or(0),
+					unpaced: held.iter().map(|s| s.unpaced).sum(),
 				})
 				.expect("a summary row serializes"),
 			);
@@ -1255,7 +1413,8 @@ impl Guest for Publish {
 				codec: built.codec,
 				media: built.media,
 				track: Some(track),
-				group: None,
+				pacer: moq_core::delivery::Pacer::new(),
+				group_open: false,
 				discipline: match built.media {
 					Media::Video { .. } => moq_core::group::Groups::video(),
 					Media::Data { .. } => moq_core::group::Groups::messages(),
@@ -1273,8 +1432,6 @@ impl Guest for Publish {
 				packets: 0,
 				bytes: 0,
 				media_seconds: 0.0,
-				appended: 0,
-				in_flight: None,
 				group_packets: 0,
 				group_bytes: 0,
 				group_pts_min: 0,
@@ -1304,6 +1461,7 @@ impl Guest for Publish {
 					left_at: None,
 					gap_max: Duration::ZERO,
 					call_max: Duration::ZERO,
+					media_at: None,
 				},
 			});
 		});
