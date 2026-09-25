@@ -1,8 +1,8 @@
 """The data-track oracle: every message arrives whole, on time, and ahead of its picture.
 
     python tests/live_data.py [--seconds N] [--relay-version V] [--reconnect]
-                              [--warmup N] [--down N] [--work DIR] [--no-build]
-                              [--keep]
+                              [--fixture F] [--warmup N] [--down N] [--work DIR]
+                              [--no-build] [--keep]
 
 A data stream is a sequence of messages, each one JSON object at the pts it
 was emitted at (a break's own cue is a `start_pts` field inside it, seconds
@@ -31,6 +31,16 @@ What it owes:
     which), with no hole, late group or skip on the reader's data track;
   - every message leaves the subscriber no later than the first video
     packet whose pts is at or past the message's own.
+
+`--fixture pairs` publishes `tests/data/pairs.nut` instead (its source is
+`pairs.txt`): 81 messages of about 1.2 KB, in pairs at one pts every 2.5
+seconds and one triple, which is what a node forwarding an upstream award
+beside its own writes. About half of the pairs reach publish in one call,
+which then has two groups of one track to write at once. A relay that keeps
+only a track's latest group (Cloudflare's) lost the first of such a pair
+more often than not; moq-relay keeps every group and loses nothing either
+way, so here the case holds the rest: every message of a pair arrives, in
+order, at its pts, with no hole.
 
 `--relay-version moq-transport-16` holds the relay to that one IETF draft,
 which sends no timescale: a subscriber there stamps every frame with the
@@ -87,8 +97,7 @@ DOWN = 4.0
 MEND_DEADLINE = 90.0
 BUILD_DEADLINE = 1800
 TOOL_DEADLINE = 120
-MESSAGES = PACKAGE / "tests" / "data" / "messages.nut"
-MESSAGES_TEXT = PACKAGE / "tests" / "data" / "messages.txt"
+DATA = PACKAGE / "tests" / "data"
 
 PUBLISH_QUERY = """
 COPY (
@@ -121,10 +130,10 @@ def make_source(path: Path, seconds: int) -> None:
         sys.exit(f"building the source failed:\n{done.stderr[-800:]}")
 
 
-def expected_messages() -> list[tuple[int, bytes]]:
+def expected_messages(fixture: str) -> list[tuple[int, bytes]]:
     """The fixture's messages, in order: pts in microseconds, and bytes."""
     out = []
-    for line in MESSAGES_TEXT.read_text(encoding="utf-8").splitlines():
+    for line in (DATA / f"{fixture}.txt").read_text(encoding="utf-8").splitlines():
         if line.strip():
             pts, message = line.split("\t", 1)
             out.append((int(pts), message.encode("utf-8")))
@@ -227,12 +236,13 @@ class TimedTail(Tail):
                     self.stamped.append((at, row))
 
 
-def start_publisher(query: Path, source: Path, port: int, cert_hex: str) -> Tail:
+def start_publisher(query: Path, source: Path, port: int, cert_hex: str,
+                    fixture: str) -> Tail:
     env = dict(os.environ)
     env.setdefault("FFRWD_WASM", str(SIDECAR))
     argv = ffrwd_argv("run", "-f", str(query),
                       "-v", f"source={source}",
-                      "-v", f"messages={MESSAGES}",
+                      "-v", f"messages={DATA / f'{fixture}.nut'}",
                       "-v", f"relay=moqt://127.0.0.1:{port}",
                       "-v", f"broadcast={BROADCAST}",
                       "-v", f"cert={cert_hex}", "-q")
@@ -430,7 +440,7 @@ def one_run(args: argparse.Namespace) -> None:
                                   work / "relay.log", relay_args(args)))
         print(f"moq-relay pid {relays[0].pid} on 127.0.0.1:{port}", flush=True)
 
-        publisher = start_publisher(query, source, port, cert_hex)
+        publisher = start_publisher(query, source, port, cert_hex, args.fixture)
         started = time.monotonic()
         # The reader goes up beside the publisher, as a node of a tree
         # does: it waits for the broadcast, and it has to be subscribed
@@ -480,6 +490,8 @@ def one_run(args: argparse.Namespace) -> None:
         print(err[-1500:])
         print("--- reader stderr (tail) ---")
         print(reader.module_stderr()[-2500:])
+        (work / "reader.err").write_text(reader.module_stderr(), encoding="utf-8")
+        (work / "publisher.err").write_text(err, encoding="utf-8")
         if published != 0:
             problems.append(f"the publisher exited {published}")
         notes: list[str] = []
@@ -496,7 +508,7 @@ def one_run(args: argparse.Namespace) -> None:
         with publisher.lock:
             rows = list(publisher.rows)
         sent = [row for row in rows if row.get("track") == "data" and "group" in row]
-        expected = expected_messages()
+        expected = expected_messages(args.fixture)
         got = packets(work / "data.nut", True)
         print(f"data: {len(expected)} messages in the fixture, {len(sent)} published, "
               f"{len(got)} received", flush=True)
@@ -665,6 +677,9 @@ def main() -> None:
                         help="the one MoQ draft the relay speaks, e.g. moq-transport-16, "
                         "where no frame timestamp crosses and a message's pts has to "
                         "come out of its frame")
+    parser.add_argument("--fixture", default="messages", choices=("messages", "pairs"),
+                        help="the messages published: tests/data/<fixture>.nut, whose "
+                        "source is <fixture>.txt")
     parser.add_argument("--warmup", type=float, default=WARMUP)
     parser.add_argument("--down", type=float, default=DOWN)
     parser.add_argument("--work", default=str(PACKAGE / "target"),
