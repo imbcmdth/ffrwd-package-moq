@@ -84,17 +84,21 @@ const FLUSH_TURNS: usize = 3;
 const CATCH_UP_TURNS: usize = 8;
 
 /// How long a broadcast's media may go without a packet before a call
-/// stops counting on the next one to let a held group go.
+/// stops counting on the next one to let a held group go, on a host that
+/// calls only when packets arrive.
 ///
 /// A group held back behind one the relay has not acknowledged goes out
-/// from a later call, and while media flows the next call is a frame
-/// away. Once it stops - a source that ended before its data, a stalled
-/// upstream - calls come only as messages do, seconds apart, and a
-/// message held to the next one would wait that long. So a call made
-/// with the media this quiet waits for its own queue, as every call did
-/// before 0.7.2: there is no media left in it to hold up. The same span
-/// as [`moq_core::delivery::DELIVER_MAX`], the longest the queue waits
-/// behind any one group.
+/// from a later call. A host that also calls with no packets when nothing
+/// has arrived for a while (see [`Session::turns`]) makes that call a few
+/// tens of milliseconds away at most. An older host calls only as packets
+/// arrive: while media flows the next call is a frame away, but once it
+/// stops - a source that ended before its data, a stalled upstream - calls
+/// come only as messages do, seconds apart, and a message held to the next
+/// one would wait that long. So on such a host a call made with the media
+/// this quiet waits for its own queue, as every call did before 0.7.2:
+/// there is no media left in it to hold up. The same span as
+/// [`moq_core::delivery::DELIVER_MAX`], the longest the queue waits behind
+/// any one group.
 const MEDIA_QUIET: Duration = moq_core::delivery::DELIVER_MAX;
 
 /// How often the catalog goes out again, the same snapshot in a fresh
@@ -592,6 +596,11 @@ struct Session {
 	call_max: Duration,
 	/// When a call last carried a media packet; see [`MEDIA_QUIET`].
 	media_at: Option<std::time::Instant>,
+	/// Whether the host has called with no packets at all: one that does
+	/// gives the session a turn whenever nothing has arrived for a while,
+	/// so a held group goes out from that turn rather than from the next
+	/// packet's call, and no call has to wait for a queue.
+	turns: bool,
 }
 
 /// A new session being opened in the background while groups go on
@@ -776,12 +785,14 @@ impl Session {
 		Ok(())
 	}
 
-	/// Every track's queue given a turn; see [`Rendition::release`].
-	fn release(&mut self) -> Result<(), String> {
+	/// Every track's queue given a turn, and how many groups went; see
+	/// [`Rendition::release`].
+	fn release(&mut self) -> Result<usize, String> {
+		let mut released = 0;
 		for rendition in &mut self.renditions {
-			rendition.release()?;
+			released += rendition.release()?;
 		}
-		Ok(())
+		Ok(released)
 	}
 
 	/// Whether any track is holding a group back.
@@ -815,9 +826,10 @@ impl Session {
 	/// does, a group delivered long ago still looks held, and the next
 	/// one cut behind it would wait on it or, past the cap, go counted as
 	/// unpaced. Yields and no sleeps: a few microseconds a turn, and none
-	/// when no track is waiting on anything.
-	async fn catch_up(&mut self) -> Result<(), String> {
+	/// when no track is waiting on anything. Says how many groups went.
+	async fn catch_up(&mut self) -> Result<usize, String> {
 		drive_once().await;
+		let mut released = 0;
 		for _ in 0..CATCH_UP_TURNS {
 			let waiting = self
 				.renditions
@@ -829,10 +841,10 @@ impl Session {
 			for rendition in &mut self.renditions {
 				rendition.watch();
 			}
-			self.release()?;
+			released += self.release()?;
 			drive_once().await;
 		}
-		self.release()
+		Ok(released + self.release()?)
 	}
 
 	/// Until no track holds a group back, each going in its turn and none
@@ -857,10 +869,19 @@ impl Session {
 	/// One host call's work: hold for the first subscriber, feed each
 	/// pad's muxer, publish what closed, and on the final call drain and
 	/// close the session.
+	///
+	/// A call with no packets and no close asked is a TURN: the session
+	/// runs, what the queues may let go goes, and the call returns. Before
+	/// the first subscriber there is nothing to let go, and a turn does not
+	/// wait for one: the first packet does.
 	async fn drive(&mut self, pads: &[PadPackets], last: bool) -> Result<Processed, String> {
 		let mut rows = Vec::new();
 		let mut trailing = Vec::new();
 		let per_group = self.rows == Rows::Groups;
+		let turn = !last && pads.iter().all(|pad| pad.packets.is_empty());
+		if turn && !self.started {
+			return Ok(Processed { rows, trailing });
+		}
 		let entered = std::time::Instant::now();
 		if let Some(left) = self.left_at {
 			self.gap_max = self.gap_max.max(entered.duration_since(left));
@@ -907,7 +928,7 @@ impl Session {
 		// the last call lets the groups behind it go now, before anything
 		// new is cut, and every turn of the session below looks again. See
 		// [`moq_core::delivery`].
-		self.catch_up().await?;
+		let released = self.catch_up().await?;
 		let media = pads.iter().zip(&self.renditions).any(|(pad, rendition)| {
 			!pad.packets.is_empty() && !matches!(rendition.media, Media::Data { .. })
 		});
@@ -1015,13 +1036,18 @@ impl Session {
 		// a round trip away, further than these turns reach, and the next
 		// call looks for it first thing. Waiting here for it is the call
 		// blocked on delivery again.
-		if !rows.is_empty() {
+		//
+		// A turn that let a held group go puts it on the socket the same way:
+		// the next turn is further off than these few milliseconds.
+		if !rows.is_empty() || (turn && released > 0) {
 			self.flush().await?;
 		}
-		// Unless no call is coming soon to do it: with the media quiet, the
-		// next call is the next message, and what this one holds back waits
-		// here instead. See [`MEDIA_QUIET`].
+		// Unless no call is coming soon to do it: on a host that calls only
+		// as packets arrive, with the media quiet, the next call is the next
+		// message, and what this one holds back waits here instead. See
+		// [`MEDIA_QUIET`].
 		if !last
+			&& !self.turns
 			&& self
 				.media_at
 				.is_none_or(|at| at.elapsed() >= MEDIA_QUIET)
@@ -1462,6 +1488,7 @@ impl Guest for Publish {
 					gap_max: Duration::ZERO,
 					call_max: Duration::ZERO,
 					media_at: None,
+					turns: false,
 				},
 			});
 		});
@@ -1487,15 +1514,12 @@ impl Guest for Publish {
 			let mut holder = s.borrow_mut();
 			let state = holder.as_mut().expect("process called before init");
 
-			// Nothing to publish and no close asked: stay off the network.
-			if pads.iter().all(|pad| pad.packets.is_empty()) && !last {
-				return Processed {
-					rows: vec![],
-					trailing: vec![],
-				};
-			}
-
+			// Nothing to publish and no close asked: a turn for the session,
+			// which lets go what the queues may. See [`Session::drive`].
 			let State { executor, session } = state;
+			if !last && pads.iter().all(|pad| pad.packets.is_empty()) {
+				session.turns = true;
+			}
 			match executor.enter(session.drive(&pads, last)) {
 				Ok(processed) => {
 					if last {
