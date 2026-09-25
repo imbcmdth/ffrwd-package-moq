@@ -425,6 +425,21 @@ nothing, and it must not wait in a send queue behind it. It asks for
 ordered delivery, as audio does, since a newer message does not stand
 in for an older one.
 
+**Messages leave one at a time.** A track's next group opens only once
+the one before it has been delivered: read to its end by the session
+and acknowledged by the relay, and 10 ms past its finish, or 250 ms at
+most. A relay built on moq-transport's `serve` model (the IETF stack in
+cloudflare/moq-rs) keeps only a track's LATEST group and forwards
+whichever group is latest when a subscriber's task next wakes, so a
+group overtaken before then is gone, and a fetch for it answers `not
+found`. On Cloudflare's draft-16 relay that lost the first of two
+messages written in one call five times in seven. The cost is a round
+trip to the relay for a message that follows the one before it closer
+than that, and nothing for one that does not. `tests/live_data.py
+--fixture pairs` publishes such pairs: moq-relay keeps every group and
+loses nothing either way, and the loop holds that every message of a
+pair arrives, whole and in order.
+
 The catalog names the tracks in a `data` section of this package's
 own, beside hang's two:
 
