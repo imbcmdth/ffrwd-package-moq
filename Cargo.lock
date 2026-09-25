@@ -520,6 +520,15 @@ checksum = "36d64d03bab237df643a5013adcf07764e4bd3265117e4c4f69e856d37928e69"
 dependencies = [
  "loom",
  "smallvec",
+]
+
+[[package]]
+name = "kio"
+version = "0.5.6"
+source = "git+https://github.com/imbcmdth/moq?rev=2a5f1dcfeef0bbfdce0553af9d46a9581fabf1de#2a5f1dcfeef0bbfdce0553af9d46a9581fabf1de"
+dependencies = [
+ "loom",
+ "smallvec",
  "web-async",
 ]
 
@@ -647,12 +656,11 @@ dependencies = [
 [[package]]
 name = "moq-net"
 version = "0.2.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c314d601eaf27d02fb7c5362dfe2da492696c5f795645b622e11fd45ae914fb"
+source = "git+https://github.com/imbcmdth/moq?rev=2a5f1dcfeef0bbfdce0553af9d46a9581fabf1de#2a5f1dcfeef0bbfdce0553af9d46a9581fabf1de"
 dependencies = [
  "bytes",
  "futures",
- "kio",
+ "kio 0.5.6 (git+https://github.com/imbcmdth/moq?rev=2a5f1dcfeef0bbfdce0553af9d46a9581fabf1de)",
  "num_enum",
  "rand",
  "serde",
@@ -1703,7 +1711,7 @@ dependencies = [
  "bytes",
  "futures",
  "http",
- "kio",
+ "kio 0.5.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "quinn",
  "rustls",
  "rustls-native-certs",

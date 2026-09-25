@@ -30,3 +30,6 @@ strip = true
 # there.
 [patch.crates-io]
 quinn-udp = { path = "vendor/quinn-udp" }
+# ffrwd/moq-net-0.2.15 on github.com/imbcmdth/moq: an IETF live join starts
+# at the newest group's start. See that branch's commits.
+moq-net = { git = "https://github.com/imbcmdth/moq", rev = "2a5f1dcfeef0bbfdce0553af9d46a9581fabf1de" }
