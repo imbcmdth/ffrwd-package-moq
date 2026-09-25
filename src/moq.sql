@@ -20,7 +20,10 @@
 -- the module yet). Each message is one MoQ group of one frame in hang's
 -- legacy framing, its pts as a varint of microseconds and then its
 -- bytes as they arrived, and it goes out the moment it arrives, ahead
--- of any media handed over with it. A message's pts is when it was
+-- of any media handed over with it; a message that follows the one
+-- before it on its track closer than a round trip to the relay waits
+-- that round trip in the track's queue, as every track's groups do
+-- (see the README, "One group at a time"). A message's pts is when it was
 -- emitted; a cue it announces is a field inside the JSON. The catalog
 -- names these tracks in a data section of its own, which players read
 -- past.
@@ -52,8 +55,10 @@
 -- a second, and through a public relay under load 100 lost whole
 -- groups where 200 lost none; see the README. 0 gives every frame a group of its
 -- own, which is what upstream hang publishes and is EXPERIMENTAL here
--- - a player skips about one such group in four on a real relay - and
--- a larger value trades delay for fewer streams. Video groups follow
+-- - a player skips about one such group in four on a real relay, and a
+-- group has to last longer than the round trip to the relay plus a few
+-- tens of milliseconds, since each waits for the relay to acknowledge
+-- the one before it - and a larger value trades delay for fewer streams. Video groups follow
 -- the keyframes, and this does not touch them.
 -- rows is what the sink reports: 'summary', the default, is one row
 -- per track every 5 seconds - its groups, packets, bytes and how many

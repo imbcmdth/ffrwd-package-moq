@@ -19,8 +19,9 @@
 //!   - and the names its renditions publish under.
 //! - [`message`] is a data track's frame: a message's pts ahead of its
 //!   bytes, the way hang's `legacy` container frames a sample.
-//! - [`delivery`] is how those frames leave: one group at a time on a
-//!   track, the next held until the relay has the one before it.
+//! - [`delivery`] is how every track's groups leave: one at a time,
+//!   the next held in the track's queue until the relay has the one
+//!   before it, and never in the host's call.
 //! - [`subscribe`] is the receiving side before the media: the
 //!   subscription shape, the catalog read, and [`subscribe::FrameStream`]
 //!   pulling groups and frames off a track in arrival order.

@@ -45,6 +45,12 @@
 /// groups finished back to back give a reader that chance. Nothing
 /// here reproduces it against a local relay, so it is offered and not
 /// recommended; see the README.
+///
+/// Since every track's groups wait for the relay to acknowledge the one
+/// before them ([`crate::delivery`]), a group has to last longer than
+/// that round trip plus a few tens of milliseconds for the track to keep
+/// up. A frame a group does not, on any relay further off than the
+/// loopback: the track's queue fills to its bound and groups go unpaced.
 pub const AUDIO_GROUP_MS: u32 = 200;
 
 /// What the open group is measured against.

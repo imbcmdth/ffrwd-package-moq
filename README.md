@@ -45,15 +45,21 @@ frame edges.
 five seconds - `track`, `groups`, `packets`, `bytes`, and `media`, the
 seconds of media that have gone out on it, which is what says whether
 a live run is keeping up - and one trailing row over the whole
-broadcast (`tracks`, `groups`, `packets`, `bytes`, `init_bytes`).
+broadcast (`tracks`, `groups`, `packets`, `bytes`, `init_bytes`, and
+`queue_max`, `wait_max_ms` and `unpaced` over the whole run).
 `'groups'` is the older shape, a row per published group (`track`,
 `group`, `packets`, `bytes`, `pts_start`, `pts_end`): ten a second for
 audio alone, so it is for piping somewhere rather than for watching.
 `'none'` leaves the trailing row alone.
 
 A track row also carries what the session looked like over the window:
-`appended` and `closed` (groups opened on the track and finished -
-they differ only by the one still open), `sub_latency_ms`,
+`appended` and `closed` (groups put on the wire and finished there -
+they differ only by the one still open, and `groups` runs ahead of
+both by what the track is holding back), `queued`, `queue_max`,
+`wait_max_ms` and `unpaced` (groups held back now, the most held at
+once, the longest one was held, and how many went before the one
+ahead of them was known delivered; see "One group at a time"),
+`sub_latency_ms`,
 `sub_priority` and `sub_ordered` (what the relay is actually asking
 for on that track, `-1` when nobody is subscribed), and `gap_max_ms`
 and `call_max_ms` (the longest the QUIC session lay undriven, and the
@@ -116,6 +122,31 @@ twenty seconds through `moq-relay` on this machine, 939 groups
 published and 939 received, at `0` as at `100`. So `0` is offered,
 documented and not recommended until that is understood.
 
+Since 0.7.2 the cause is better understood (see "One group at a time"),
+and `0` is still not sound, for a new reason: a group a frame long is
+shorter than the round trip it has to wait for. **`audio_group_ms` must
+be longer than the round trip to the relay plus a few tens of
+milliseconds**, and about twice the round trip to keep the queue short.
+Below that the track's queue fills to its bound and groups go
+unacknowledged anyway, which the rows count as `unpaced` rather than
+letting the audio fall behind real time. Measured with
+`tests/live_pacing.py`, which puts a round trip between the publisher
+and a local relay:
+
+| `audio_group_ms` | round trip | held at once | longest held | unpaced |
+| --- | --- | --- | --- | --- |
+| 200 | 20 ms | 1 | 126 ms | 0 |
+| 200 | 40 ms | 1 | 124 ms | 0 |
+| 200 | 80 ms | 1 | 158 ms | 0 |
+| 100 | 40 ms | 2 | 157 ms | 0 |
+| 50 | 20 ms | 4 | 219 ms | 0 |
+| 0 | 20 ms | 8 | 294 ms | 2480 of 4492 |
+| 0 | 40 ms | 8 | 295 ms | 3070 of 4502 |
+
+The held columns leave out the first ten seconds of each run, which hold
+the backlog from the wait for a first reader; `unpaced` is the whole
+run. No row fell behind real time.
+
 Tracks carry hang's own delivery priorities, higher sent first:
 `catalog.json` at 100, audio at 80, video at 60, and a data track, which
 hang has no number for, at 90 (see "Data tracks"). They break the tie on
@@ -134,6 +165,67 @@ The first publish is held until the track gains a subscriber: a MoQ
 subscription starts at the latest group, so anything sent earlier
 would never be seen. A run with nobody watching waits at the first
 packet.
+
+### One group at a time
+
+A relay built on moq-transport's `serve` model (the IETF stack in
+cloudflare/moq-rs, which Cloudflare's relay runs) keeps only a track's
+LATEST group, with no cache behind it, and forwards whichever group is
+latest when a subscriber's task next wakes. A group overtaken by the
+next one on its track before then is gone for good, and a fetch for it
+answers `not found`. On Cloudflare's draft-16 relay that lost the first
+of two messages written in one call five times in seven. Audio lost
+groups the same way: about one in four at a frame per group, groups out
+of a burst after a stalled call, and one group exactly where a pair of
+messages had held a call.
+
+So every track's groups leave one at a time, audio, video and data
+alike. A group goes onto the wire once the one before it on its track
+has been delivered (read to its end by the session, its last byte
+acknowledged by the relay) and 10 ms have passed since that one
+finished. Until then it waits in its track's queue, gathering its
+frames, and the call that cut it returns without waiting for it. The
+next call lets it go, first thing, once the acknowledgement is in. A
+group whose predecessor was acknowledged already goes out at once, as
+before, and a track nobody is subscribed to holds nothing back.
+
+Two bounds keep a queue from holding its track up. A group goes after
+250 ms behind an unacknowledged one regardless: a stalled session or a
+distant relay must not stop the track, and every millisecond held is a
+millisecond behind live. And a track holds at most 8 groups: one more
+sends the oldest on at once. Either way the group went without the
+protection, and the rows count it in `unpaced`.
+
+The session runs only inside a host call, so a held group goes out from
+a later call. While media flows that is a frame away. Once the media
+has been quiet for 250 ms, a call waits for its own queue instead, as
+every call did before 0.7.2, since it has no media to hold up. A group
+held in the last call before the media stops waits for the next call.
+
+Before 0.7.2 only a data track was paced, and the wait sat in the call:
+a pair of messages held the whole call, media included, for a round
+trip. A leaf publishing to Cloudflare showed it as `call_max_ms` rising
+from 38-49 ms to 57-91 ms around each break. Measured with
+`tests/live_pacing.py` (video, audio at 200 ms, pairs of messages every
+2.5 seconds, a round trip put between the publisher and a local relay),
+the longest call per five second window, over the 90 seconds after the
+join:
+
+| round trip | 0.7.1 median | 0.7.1 max | 0.7.2 median | 0.7.2 max |
+| --- | --- | --- | --- | --- |
+| 20 ms | 31.5 ms | 72 ms | 31 ms | 39 ms |
+| 40 ms | 48 ms | 97 ms | 38 ms | 42 ms |
+| 80 ms | 110 ms | 202 ms | 35.5 ms | 46 ms |
+
+What is left is the three short turns a call takes after writing a
+message. What the queue costs instead is a round trip on the group that
+waits, and the relay's own acknowledgement delay and the time to the
+next call on top: at those round trips a video group (a GOP, a second
+here) was held at most 94, 126 and 157 ms, once, at its start, and ran
+live after. Neither track fell behind real time in any run: the reader
+saw each packet come out no later against its pts at the end than at
+the start. The median delay from pts to the reader moved by between
+-10 and +27 ms.
 
 ## Subscribe
 
@@ -425,20 +517,15 @@ nothing, and it must not wait in a send queue behind it. It asks for
 ordered delivery, as audio does, since a newer message does not stand
 in for an older one.
 
-**Messages leave one at a time.** A track's next group opens only once
-the one before it has been delivered: read to its end by the session
-and acknowledged by the relay, and 10 ms past its finish, or 250 ms at
-most. A relay built on moq-transport's `serve` model (the IETF stack in
-cloudflare/moq-rs) keeps only a track's LATEST group and forwards
-whichever group is latest when a subscriber's task next wakes, so a
-group overtaken before then is gone, and a fetch for it answers `not
-found`. On Cloudflare's draft-16 relay that lost the first of two
-messages written in one call five times in seven. The cost is a round
-trip to the relay for a message that follows the one before it closer
-than that, and nothing for one that does not. `tests/live_data.py
---fixture pairs` publishes such pairs: moq-relay keeps every group and
-loses nothing either way, and the loop holds that every message of a
-pair arrives, whole and in order.
+**Messages leave one at a time**, as every track's groups do (see "One
+group at a time"). On Cloudflare's draft-16 relay the first of two
+messages written in one call was lost five times in seven before
+0.7.1. Now the second waits in the track's queue until the relay has
+acknowledged the first, a round trip later, and nothing waits for a
+message that follows the one before it further apart than that.
+`tests/live_data.py --fixture pairs` publishes such pairs: moq-relay
+keeps every group and loses nothing either way, and the loop holds that
+every message of a pair arrives, whole and in order.
 
 The catalog names the tracks in a `data` section of this package's
 own, beside hang's two:
