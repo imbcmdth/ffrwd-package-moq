@@ -98,6 +98,8 @@ MEND_DEADLINE = 90.0
 BUILD_DEADLINE = 1800
 TOOL_DEADLINE = 120
 DATA = PACKAGE / "tests" / "data"
+# What the sidecar writes on a data edge that has nothing to say.
+HEARTBEAT = b" "
 
 PUBLISH_QUERY = """
 COPY (
@@ -509,7 +511,12 @@ def one_run(args: argparse.Namespace) -> None:
             rows = list(publisher.rows)
         sent = [row for row in rows if row.get("track") == "data" and "group" in row]
         expected = expected_messages(args.fixture)
-        got = packets(work / "data.nut", True)
+        # A heartbeat is no message: since ffrwd 0.20.1 the sidecar writes
+        # one, a packet whose payload is a single space, onto a data edge at
+        # its start and whenever a tenth of a second of programme time
+        # passes with nothing written, so ffmpeg can interleave around it.
+        got = [packet for packet in packets(work / "data.nut", True)
+               if packet["bytes"] != HEARTBEAT]
         print(f"data: {len(expected)} messages in the fixture, {len(sent)} published, "
               f"{len(got)} received", flush=True)
         if len(sent) != len(expected):
