@@ -6,9 +6,9 @@ encoded on the way out. `subscribe` is a FROM relation: a broadcast
 arrives as rows, one per rendition, and the query does what it likes
 with them.
 
-Requires ffrwd 0.29.
+Requires ffrwd 0.29, whose `ffrwd/wasm` is 0.19.1.
 
-Both are nodes of `ffrwd:av` 0.19, built on
+Both are nodes of `ffrwd:av` 0.19.1, built on
 [ffrwd-node](https://github.com/imbcmdth/ffrwd-node). "On ffrwd 0.29"
 says what that changed and what the 0.29 compiler does not do yet.
 

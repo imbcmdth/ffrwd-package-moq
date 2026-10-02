@@ -150,8 +150,8 @@ source = "git+https://github.com/imbcmdth/ffrwd-nal?tag=v0.1.1#525a55aa83014a32d
 
 [[package]]
 name = "ffrwd-node"
-version = "0.1.0"
-source = "git+https://github.com/imbcmdth/ffrwd-node?tag=v0.1.0#84216905037bae949623b6df22febc8fbbc50e17"
+version = "0.2.0"
+source = "git+https://github.com/imbcmdth/ffrwd-node?tag=v0.2.0#c497d710024b1dbed06db360a03e06d6c0fb0882"
 dependencies = [
  "serde",
  "serde_json",
