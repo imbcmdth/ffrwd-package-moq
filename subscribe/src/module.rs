@@ -1,18 +1,13 @@
-wit_bindgen::generate!({
-	path: "wit",
-	world: "packet-source-module",
-});
-
-use std::cell::RefCell;
 use std::time::Duration;
 
-use exports::ffrwd::av::packet_source::{
-	Catalog, Guest, Meta, PadPackets, RenditionMeta, SourceTrack, StreamInfo,
+use ffrwd_node::{
+	Bound, CodedAudio, CodedFormat, CodedStream, CodedVideo, Init, Node, Out, Output, Packet,
+	Rational, Shape, Tick,
 };
-use ffrwd::av::types::{CodedAudio, CodedFormat, CodedStream, CodedVideo, Packet, Rational};
 use moq_core::order::{Hold, Queue};
 use moq_core::subscribe::{Received, Start, Step};
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use tokio::sync::mpsc;
 
 const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"hold_ms":{"type":"integer","minimum":0,"description":"how long a hole in a track's group sequence is held open for the group that would fill it before the relay is asked for it, in milliseconds; left out, 1000 on a live join, which has given up the past already, and 30000 on a backlog join, the subscription's own latency window"},"hold_mib":{"type":"integer","minimum":1,"default":64,"description":"how much one track holds meanwhile, in MiB; 64 covers a 30s window up to about 17 Mbit/s"},"join_ms":{"type":"integer","minimum":0,"default":2000,"description":"how long a joining reader waits for a lower group sequence before it fixes its cursor on a backlog join, in milliseconds; 0 starts at the first group that arrives, and a live join never waits at all"},"reconnect_s":{"type":"integer","minimum":0,"default":60,"description":"how long a reader whose session the relay dropped keeps trying to open a new one and take its tracks up again at the live edge, in seconds; 0 ends the run on the first drop"},"start":{"type":"string","enum":["live","backlog"],"default":"live","description":"where to join a broadcast already running: 'live' at the publisher's newest group, starting at the first group a decoder can begin at - a keyframe group for video, any group for audio - or 'backlog' at the oldest group the relay still holds, which reads the whole cache before the first packet comes out"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
@@ -66,7 +61,7 @@ const IDLE_TURNS: usize = 5;
 
 #[derive(Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-struct Params {
+pub(crate) struct Params {
 	relay: String,
 	broadcast: String,
 	#[serde(default)]
@@ -126,17 +121,38 @@ fn default_start() -> String {
 	"live".to_string()
 }
 
-fn parse_params(params: &str) -> Result<(Params, Start), String> {
-	let params: Params = serde_json::from_str(params).map_err(|err| format!("params: {err}"))?;
+fn check_params(params: &Params) -> Result<Start, String> {
 	// The relay URL's path and the token argument are two spellings of
 	// one field, so what the session will ask for is settled here, where
-	// params are refused. `probe` reads these params at compile time, so
+	// params are refused. `shape` reads these params at compile time, so
 	// a URL and a token that disagree stop the query rather than the run.
 	moq_core::relay::session_path(&params.relay, &params.token)?;
 	// And so is a start nobody spells: a typo stops the query rather
 	// than quietly reading the wrong end of the broadcast.
-	let start = Start::parse(&params.start)?;
-	Ok((params, start))
+	Start::parse(&params.start)
+}
+
+/// One track as the catalog is read into it: its coded stream, its
+/// relation row and what the catalog called it.
+struct SourceTrack {
+	coded: CodedStream,
+	row: u32,
+	rendition: RenditionMeta,
+}
+
+struct RenditionMeta {
+	name: Option<String>,
+	codecs: Option<String>,
+}
+
+/// Every track the catalog names, in its order.
+struct Catalog {
+	tracks: Vec<SourceTrack>,
+}
+
+/// One track's packets from one pull.
+struct PadPackets {
+	packets: Vec<Packet>,
 }
 
 /// The tokio floor the session runs on. Split from [`Reader`] so a call
@@ -163,6 +179,23 @@ impl Executor {
 	fn enter<T>(&self, work: impl std::future::Future<Output = T>) -> T {
 		self.local.block_on(&self.runtime, work)
 	}
+}
+
+thread_local! {
+	// One runtime for the instance's life: quinn-wasi binds its socket
+	// reactor to the first runtime a guest runs, and `shape` and `init` both
+	// dial, in that order, in one instance.
+	static EXECUTOR: std::cell::OnceCell<Executor> = const { std::cell::OnceCell::new() };
+}
+
+/// `work` run on the instance's one runtime.
+fn enter<T>(work: impl std::future::Future<Output = T>) -> Result<T, String> {
+	EXECUTOR.with(|cell| {
+		if cell.get().is_none() {
+			let _ = cell.set(Executor::new()?);
+		}
+		Ok(cell.get().expect("just set").enter(work))
+	})
 }
 
 /// What one reader task says about its track.
@@ -277,15 +310,9 @@ struct Reader {
 	hold: Hold,
 }
 
-/// The executor and the reader it drives, split so a call can block on
-/// the one while the work borrows the other.
+/// The reader the instance's runtime drives.
 struct State {
-	executor: Executor,
 	reader: Reader,
-}
-
-thread_local! {
-	static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
 }
 
 /// A dialed relay with the broadcast open: what both calls need
@@ -370,7 +397,6 @@ async fn open_broadcast(params: &Params, wait: Duration, dials: u32) -> Result<O
 /// One catalog data rendition as the track a source publishes: JSON
 /// messages in the timescale the catalog names, and nothing else to say.
 fn data_track(
-	index: usize,
 	rendition: &moq_core::catalog::Rendition,
 	timescale: u32,
 ) -> Result<SourceTrack, String> {
@@ -393,20 +419,10 @@ fn data_track(
 			profile: None,
 			level: None,
 		},
-		info: StreamInfo {
-			index: index as u32,
-			kind: "data".to_string(),
-			codec: rendition.codec.clone(),
-			duration: None,
-			tags: vec![],
-			time_base,
-		},
 		row: rendition.row,
 		rendition: RenditionMeta {
 			name: Some(rendition.name.clone()),
-			bandwidth: None,
 			codecs: Some(rendition.codec.clone()),
-			language: None,
 		},
 	})
 }
@@ -415,14 +431,13 @@ fn data_track(
 /// stream read off the init segment, its geometry off the catalog. A
 /// data rendition has no init segment, and is [`data_track`]'s.
 fn source_track(
-	index: usize,
 	rendition: &moq_core::catalog::Rendition,
 ) -> Result<(SourceTrack, Body), String> {
 	if let moq_core::catalog::Kind::Data { timescale } = rendition.kind {
-		return Ok((data_track(index, rendition, timescale)?, Body::Data { timescale }));
+		return Ok((data_track(rendition, timescale)?, Body::Data { timescale }));
 	}
 	if rendition.packaging == moq_core::catalog::Packaging::Legacy {
-		return legacy_track(index, rendition);
+		return legacy_track(rendition);
 	}
 	let track = ffrwd_bmff::track::Track::from_init(&rendition.init)
 		.map_err(|err| format!("rendition '{}': init segment: {err}", rendition.name))?;
@@ -431,7 +446,7 @@ fn source_track(
 		den: track.timescale as i32,
 	};
 	let config = &track.entry.config;
-	let (kind, codec, format, extradata, profile, level) = match (&rendition.kind, &track.entry.kind)
+	let (codec, format, extradata, profile, level) = match (&rendition.kind, &track.entry.kind)
 	{
 		(moq_core::catalog::Kind::Video { width, height }, b"avc1" | b"avc3") => {
 			let extradata = ffrwd_nal::config::avcc_to_annexb_extradata(config)
@@ -441,7 +456,6 @@ fn source_track(
 				None => (None, None),
 			};
 			(
-				"video",
 				"h264",
 				CodedFormat::Video(CodedVideo {
 					width: *width,
@@ -461,7 +475,6 @@ fn source_track(
 			},
 			b"mp4a",
 		) => (
-			"audio",
 			"aac",
 			CodedFormat::Audio(CodedAudio {
 				sample_rate: *sample_rate,
@@ -496,21 +509,10 @@ fn source_track(
 				profile,
 				level,
 			},
-			info: StreamInfo {
-				index: index as u32,
-				kind: kind.to_string(),
-				codec: codec.to_string(),
-				// A broadcast runs as long as its publisher does.
-				duration: None,
-				tags: vec![],
-				time_base,
-			},
 			row: rendition.row,
 			rendition: RenditionMeta {
 				name: Some(rendition.name.clone()),
-				bandwidth: None,
 				codecs: Some(rendition.codec.clone()),
-				language: None,
 			},
 		},
 		Body::Media(track),
@@ -529,10 +531,7 @@ fn source_track(
 /// one without carries Annex B with its parameter sets in the keyframes.
 /// An HEVC entry with an `hvcC` would be length-prefixed as well, and is
 /// refused until something publishes one.
-fn legacy_track(
-	index: usize,
-	rendition: &moq_core::catalog::Rendition,
-) -> Result<(SourceTrack, Body), String> {
+fn legacy_track(rendition: &moq_core::catalog::Rendition) -> Result<(SourceTrack, Body), String> {
 	use moq_core::catalog::Kind;
 	use moq_core::legacy::Codec;
 	let name = &rendition.name;
@@ -541,7 +540,7 @@ fn legacy_track(
 		num: 1,
 		den: 1_000_000,
 	};
-	let (kind, format, extradata, profile, level) = match (rendition.kind, codec) {
+	let (format, extradata, profile, level) = match (rendition.kind, codec) {
 		(Kind::Video { width, height }, Codec::H264 | Codec::Hevc | Codec::Av1) => {
 			let extradata = match (codec, rendition.config.is_empty()) {
 				(_, true) => Vec::new(),
@@ -565,7 +564,6 @@ fn legacy_track(
 				_ => (None, None),
 			};
 			(
-				"video",
 				CodedFormat::Video(CodedVideo {
 					width,
 					height,
@@ -591,7 +589,6 @@ fn legacy_track(
 				));
 			}
 			(
-				"audio",
 				CodedFormat::Audio(CodedAudio {
 					sample_rate,
 					channels,
@@ -619,47 +616,14 @@ fn legacy_track(
 				profile,
 				level,
 			},
-			info: StreamInfo {
-				index: index as u32,
-				kind: kind.to_string(),
-				codec: codec.name().to_string(),
-				// A broadcast runs as long as its publisher does.
-				duration: None,
-				tags: vec![],
-				time_base,
-			},
 			row: rendition.row,
 			rendition: RenditionMeta {
 				name: Some(rendition.name.clone()),
-				bandwidth: None,
 				codecs: Some(rendition.codec.clone()),
-				language: None,
 			},
 		},
 		Body::Legacy(codec),
 	))
-}
-
-/// The renditions `order` names, as catalog indices: what `open` was told
-/// to pull. An index the broadcast's catalog does not carry is refused by
-/// name, before anything is subscribed to.
-fn chosen(
-	renditions: &[moq_core::catalog::Rendition],
-	tracks: &[u32],
-) -> Result<Vec<usize>, String> {
-	tracks
-		.iter()
-		.map(|index| {
-			let index = *index as usize;
-			if index >= renditions.len() {
-				return Err(format!(
-					"this broadcast's catalog names {} rendition(s), so track {index} is not one of them",
-					renditions.len()
-				));
-			}
-			Ok(index)
-		})
-		.collect()
 }
 
 /// The renditions `order` names as a catalog the host reads, and the demuxers
@@ -675,7 +639,7 @@ fn catalog_of(
 	let mut readers = Vec::with_capacity(order.len());
 	for &index in order {
 		let rendition = &renditions[index];
-		let (track, body) = source_track(index, rendition)?;
+		let (track, body) = source_track(rendition)?;
 		let video = matches!(rendition.kind, moq_core::catalog::Kind::Video { .. });
 		let length_size = match (&body, video) {
 			(Body::Media(demux), true) => ffrwd_nal::config::avcc_length_size(&demux.entry.config),
@@ -704,15 +668,7 @@ fn catalog_of(
 			resumed: false,
 		});
 	}
-	Ok((
-		Catalog {
-			tracks,
-			// A relay broadcast ends when its publisher stops, which
-			// nothing here can know before it happens.
-			bounded: false,
-		},
-		readers,
-	))
+	Ok((Catalog { tracks }, readers))
 }
 
 impl Reader {
@@ -1222,51 +1178,121 @@ fn take_message(
 	Ok(true)
 }
 
-struct Subscribe;
+/// `subscribe` as the host runs it: the reader, and the output each of
+/// its pads leaves on, with whether it carries messages.
+pub(crate) struct Subscribe {
+	state: Option<State>,
+	ports: Vec<(String, bool)>,
+}
 
-impl Guest for Subscribe {
-	fn describe() -> Meta {
-		Meta {
-			name: "subscribe".to_string(),
-			version: "0.5.0".to_string(),
-			params_schema: PARAMS_SCHEMA.to_string(),
-			// A packet source has no row channel in `ffrwd:av`, so this
-			// is the shape of the rows that go to stderr instead; see
-			// [`moq_core::order::ROWS_SCHEMA`].
-			rows_schema: moq_core::order::ROWS_SCHEMA.to_string(),
-			// No decoded payload ever crosses, so no format list fills in.
-			pixel_formats: vec![],
-			sample_formats: vec![],
-			sample_rates: vec![],
-			channel_counts: vec![],
-			rows_language: vec![],
+/// The catalog's tracks as port names: each its rendition's name as far
+/// as a port name allows, and unique.
+fn ports(catalog: &Catalog) -> Vec<String> {
+	let mut names: Vec<String> = Vec::with_capacity(catalog.tracks.len());
+	for (index, track) in catalog.tracks.iter().enumerate() {
+		let written = track.rendition.name.clone().unwrap_or_default();
+		let mut name: String = written
+			.chars()
+			.map(|c| {
+				if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+					c
+				} else {
+					'_'
+				}
+			})
+			.collect();
+		if name.is_empty() || names.contains(&name) {
+			name = format!("{name}-{index}");
 		}
+		names.push(name);
 	}
+	names
+}
 
-	fn probe(params: String) -> Result<Catalog, String> {
-		let (params, start) = parse_params(&params)?;
-		let executor = Executor::new()?;
-		executor.enter(async {
-			let opened = open_broadcast(&params, PROBE_TIMEOUT, PROBE_DIALS).await?;
-			// The whole catalog, which is what makes the rows known at
-			// compile time. It is built before the session closes, so a
-			// rendition this module cannot read is named here rather
-			// than at run time.
+/// The catalog's relation: a row per rendition row, with the name and
+/// codecs of the media on it, and each track's index into it.
+fn relation(catalog: &Catalog) -> (Vec<String>, Vec<u32>) {
+	let mut rows: Vec<u32> = catalog.tracks.iter().map(|track| track.row).collect();
+	rows.sort_unstable();
+	rows.dedup();
+	let relation = rows
+		.iter()
+		.map(|row| {
+			let on: Vec<&SourceTrack> = catalog.tracks.iter().filter(|t| t.row == *row).collect();
+			let media: Vec<&&SourceTrack> = on
+				.iter()
+				.filter(|t| !matches!(t.coded.format, CodedFormat::Data))
+				.collect();
+			let named = media.first().copied().or(on.first());
+			let codecs: Vec<&str> = media
+				.iter()
+				.filter_map(|t| t.rendition.codecs.as_deref())
+				.collect();
+			serde_json::json!({
+				"name": named.and_then(|t| t.rendition.name.clone()),
+				"codecs": (!codecs.is_empty()).then(|| codecs.join(",")),
+			})
+			.to_string()
+		})
+		.collect();
+	let index = catalog
+		.tracks
+		.iter()
+		.map(|track| rows.iter().position(|row| *row == track.row).unwrap_or(0) as u32)
+		.collect();
+	(relation, index)
+}
+
+impl Node for Subscribe {
+	const NAME: &'static str = "subscribe";
+	const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+	const PARAMS_SCHEMA: &'static str = PARAMS_SCHEMA;
+	const ROWS_SCHEMA: &'static str = moq_core::order::ROWS_SCHEMA;
+	type Params = Params;
+
+	/// Connects, reads the catalog and says what it holds without pulling
+	/// any media: a packets output per media track, a data output per data
+	/// track, and the relation rows they belong to. Nothing bounds a
+	/// broadcast, so neither does the shape.
+	fn shape(params: &Params, _: &Bound) -> ffrwd_node::Result<Shape> {
+		let start = check_params(params)?;
+		let catalog = enter(async {
+			let opened = open_broadcast(params, PROBE_TIMEOUT, PROBE_DIALS).await?;
 			let every = (0..opened.renditions.len()).collect::<Vec<_>>();
 			let (catalog, _) = catalog_of(&opened.renditions, &every, start)?;
 			drop(opened.broadcast);
 			drop(opened.session);
 			opened.endpoint.wait_idle().await;
-			Ok(catalog)
-		})
+			Ok::<_, String>(catalog)
+		})??;
+		let names = ports(&catalog);
+		let (relation, rows) = relation(&catalog);
+		let mut shape = Shape::new().self_clocked().bounded(false);
+		for row in &relation {
+			shape = shape.relation_row(row);
+		}
+		for ((track, name), row) in catalog.tracks.iter().zip(&names).zip(rows) {
+			let output = match track.coded.format {
+				CodedFormat::Data => Output::rows(name),
+				_ => Output::packets(name).coded(track.coded.clone()),
+			};
+			shape = shape.output(output.time_base(track.coded.time_base).row(row));
+		}
+		Ok(shape)
 	}
 
-	fn open(params: String, tracks: Vec<u32>) -> Result<Catalog, String> {
-		let (params, start) = parse_params(&params)?;
-		let executor = Executor::new()?;
-		let (catalog, reader) = executor.enter(async {
+	/// Subscribes to the tracks the query latched onto, at the edge
+	/// `start` names, and to nothing else.
+	fn init(params: Params, init: &Init) -> ffrwd_node::Result<Subscribe> {
+		let start = check_params(&params)?;
+		let (ports, reader) = enter(async {
 			let opened = open_broadcast(&params, OPEN_TIMEOUT, 1).await?;
-			let order = chosen(&opened.renditions, &tracks)?;
+			let every = (0..opened.renditions.len()).collect::<Vec<_>>();
+			let (whole, _) = catalog_of(&opened.renditions, &every, start)?;
+			let names = ports(&whole);
+			let order: Vec<usize> = (0..names.len())
+				.filter(|&i| init.latched(&names[i]))
+				.collect();
 			// One line per run naming what this source pulls, so a run can
 			// be read back against the catalog it narrowed.
 			eprintln!(
@@ -1283,24 +1309,16 @@ impl Guest for Subscribe {
 					.collect::<Vec<_>>()
 					.join(", ")
 			);
-			let (catalog, renditions) = catalog_of(&opened.renditions, &order, start)?;
-			// Only the tracks this run was told to pull are subscribed
-			// to, and each becomes the pad at its place in `order`.
-			//
-			// Every one of them is REGISTERED before any is awaited, which
-			// is what keeps a ladder's rungs together: a live subscription
-			// starts at whatever group was the publisher's latest when it
-			// was accepted, so subscribing a track and then waiting out a
-			// round trip before subscribing the next would join each rung
-			// a round trip further on. moq-net registers the subscription
-			// in `Consumer::subscribe` and only the wait for the track's
-			// info is deferred to the await, so these go out in one flight
-			// and every track joins the same edge.
+			let (_, renditions) = catalog_of(&opened.renditions, &order, start)?;
+			// Every track is REGISTERED before any is awaited, which is what
+			// keeps a ladder's rungs together: a live subscription starts at
+			// whatever group was the publisher's latest when it was
+			// accepted, so subscribing a track and then waiting out a round
+			// trip before subscribing the next would join each rung a round
+			// trip further on.
 			let (sender, frames) = mpsc::unbounded_channel::<Wire>();
 			let mut opening = Vec::with_capacity(order.len());
 			for &index in &order {
-				// Subscribed once here, so a name the broadcast does not
-				// carry is refused by `open` rather than mid-run.
 				let name = opened.renditions[index].name.clone();
 				let subscribing = subscribe_track(&opened.broadcast, &name, start)?;
 				opening.push((name, subscribing));
@@ -1317,8 +1335,15 @@ impl Guest for Subscribe {
 					sender.clone(),
 				));
 			}
+			let ports: Vec<(String, bool)> = order
+				.iter()
+				.map(|&index| {
+					let data = matches!(whole.tracks[index].coded.format, CodedFormat::Data);
+					(names[index].clone(), data)
+				})
+				.collect();
 			Ok::<_, String>((
-				catalog,
+				ports,
 				Reader {
 					endpoint: opened.endpoint,
 					session: Some(opened.session),
@@ -1334,30 +1359,52 @@ impl Guest for Subscribe {
 					hold: Hold::new(hold_ms(&params, start), params.hold_mib, params.join_ms),
 				},
 			))
-		})?;
-
-		STATE.with(|state| {
-			*state.borrow_mut() = Some(State { executor, reader });
-		});
-		Ok(catalog)
+		})??;
+		Ok(Subscribe {
+			state: Some(State { reader }),
+			ports,
+		})
 	}
 
-	fn next() -> Result<Option<Vec<PadPackets>>, String> {
-		STATE.with(|state| {
-			let mut holder = state.borrow_mut();
-			let State { executor, reader } = holder.as_mut().ok_or("next called before open")?;
-			let pulled = executor.enter(reader.pull())?;
-			if pulled.is_none() {
-				// Every track finished: close the session rather than
-				// leave it open for a call that will not come.
-				let mut done = holder.take().expect("the reader is here");
-				done.executor.enter(async {
-					drop(done.reader.session.take());
-					done.reader.endpoint.wait_idle().await;
-				});
+	/// Blocks until something is ready, then hands every track's packets
+	/// on its port and the reader's rows on the run's. Once every track
+	/// has finished it says so, and the session closes.
+	fn process(&mut self, tick: &Tick, out: &mut Out) -> ffrwd_node::Result<()> {
+		let Some(State { reader }) = self.state.as_mut() else {
+			return Ok(());
+		};
+		let pulled = if tick.last() {
+			None
+		} else {
+			enter(reader.pull())??
+		};
+		for row in moq_core::order::take_rows() {
+			out.report(&RawValue::from_string(row)?)?;
+		}
+		let Some(pads) = pulled else {
+			let mut done = self.state.take().expect("the reader is here");
+			enter(async {
+				drop(done.reader.session.take());
+				done.reader.endpoint.wait_idle().await;
+			})?;
+			out.finish();
+			return Ok(());
+		};
+		for ((port, data), pad) in self.ports.iter().zip(pads) {
+			for packet in pad.packets {
+				if *data {
+					// A message's pts never goes back on its port, as a
+					// publisher writing one track in order never sends.
+					let pts = out
+						.last(port)
+						.map_or(packet.pts, |last| packet.pts.max(last));
+					out.message(port, pts, packet.data)?;
+				} else {
+					out.packet(port, packet)?;
+				}
 			}
-			Ok(pulled)
-		})
+		}
+		Ok(())
 	}
 }
 
@@ -1543,6 +1590,4 @@ async fn read_groups(
 		}
 	}
 }
-
-export!(Subscribe);
 

@@ -23,11 +23,7 @@ jobs:
           tar -xzf /tmp/wasi-sdk.tar.gz -C /opt
           echo "CC_wasm32_wasip2=/opt/wasi-sdk-34.0-x86_64-linux/bin/clang" >> "$GITHUB_ENV"
           echo "AR_wasm32_wasip2=/opt/wasi-sdk-34.0-x86_64-linux/bin/llvm-ar" >> "$GITHUB_ENV"
-      - name: Install ffrwd and the wit package
-        run: |
-          pip install ffrwd
-          ffrwd install -g ffrwd/wasm
-      - name: Build the module
+      - name: Build the modules
         run: cargo build --target wasm32-wasip2 --release
       - name: Unit tests
         run: cargo test --release

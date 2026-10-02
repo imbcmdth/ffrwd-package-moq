@@ -1,5 +1,5 @@
-//! A packet sink that publishes MoQ: encoded h264 and aac packets in, a
-//! live broadcast on a relay out.
+//! A sink node that publishes MoQ: encoded h264 and aac packets and JSON
+//! messages in, a live broadcast on a relay out.
 //!
 //! The stream's out-of-band header - h264's SPS/PPS, aac's
 //! AudioSpecificConfig - becomes an init segment, carried inside the
@@ -25,12 +25,15 @@
 //! pts range - and the final call adds a summary.
 //!
 //! The QUIC session makes progress only inside `init` and `process`
-//! calls: the host's packet cadence is the driver's clock. A steady
-//! feed keeps it live, and the final call drains the wire before the
-//! session closes.
+//! calls, so the node keeps time by a rate of 50 ticks a second: a tick
+//! with nothing in it is a turn for the session, and the last one, once
+//! every input has ended, drains the wire before the session closes.
 
 // The module is wasm32-wasip2 alone: its transport rides wasi:sockets.
 // A native build of the workspace compiles this crate to nothing, so
 // `cargo test` on the host never chases the wasi-only dependencies.
 #[cfg(target_os = "wasi")]
 mod module;
+
+#[cfg(target_os = "wasi")]
+ffrwd_node::export!(module::Publish);

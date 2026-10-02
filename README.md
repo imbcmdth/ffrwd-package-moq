@@ -6,11 +6,11 @@ encoded on the way out. `subscribe` is a FROM relation: a broadcast
 arrives as rows, one per rendition, and the query does what it likes
 with them.
 
-Needs ffrwd 0.19.0 or later: the modules are built on the world
-`ffrwd:av@0.17.0`, which no sidecar before it hosts. Before 0.18.1,
-sound that passed through a module left the sidecar seconds at a time,
-and a live broadcast published from such a query lost most of its
-audio.
+Requires ffrwd 0.29.
+
+Both are nodes of `ffrwd:av` 0.19, built on
+[ffrwd-node](https://github.com/imbcmdth/ffrwd-node). "On ffrwd 0.29"
+says what that changed and what the 0.29 compiler does not do yet.
 
 ## Publish
 
@@ -207,9 +207,10 @@ protection, and the rows count it in `unpaced`.
 The session runs only inside a host call, so a held group goes out from
 a later call. Since 0.7.3 a call with no packets in it is a TURN: the
 session runs, what the queues may let go goes onto the socket, and the
-call returns. From ffrwd 0.21.2 the sidecar makes one whenever nothing
-has reached the sink for 20 ms, so a held group goes out within a turn
-of the acknowledgement it waits on, however its packets arrive.
+call returns. As a node, publish keeps time by a rate of 50 ticks a
+second, so a tick that brings nothing is a turn and a held group goes out
+within 20 ms of the acknowledgement it waits on, however its packets
+arrive; its last tick comes once every input has ended.
 
 That matters on a LEAF, a query reading a broadcast and publishing it
 again. Its packets arrive the way the upstream groups do, whole: a GOP of
@@ -279,8 +280,10 @@ COPY (
 ```
 
 The catalog is read at compile time, the way ffprobe reads a file, so
-the broadcast must be on the relay before the query compiles. A probe
-that sees no announce within 15 seconds asks again on a new session
+the broadcast must be on the relay before the query compiles: the node's
+shape is the catalog, a packets output per media track and a data output
+per data track, grouped into relation rows, and only the outputs the
+query reads are subscribed to. A shape that sees no announce within 15 seconds asks again on a new session
 before it refuses the query: Cloudflare's relay has been seen not to
 announce a broadcast that was up to a fresh session, and a second one
 took. A broadcast that is not there is refused within 30 seconds.
@@ -528,12 +531,11 @@ video packet after it a keyframe.
 
 ### What a subscriber says
 
-A packet source has no row channel in `ffrwd:av`: `next` hands back
-packets and nothing else. So the subscriber's rows go to its own stderr
-as `subscribe: row <json>` lines, one object to a line, in the shape
-`describe` reports as `rows_schema`. A run under `ffrwd run` keeps that
-stderr to itself unless the run failed; `FFRWD_DUMP_STDERR=<dir>`
-writes every member's out either way, which is how the loop reads them.
+The subscriber's rows are the node's rows, beside its outputs, in the
+shape `describe` reports as `rows_schema`. They went to its stderr while
+it was a packet source, which had no row channel; ffrwd 0.29's compiler
+does not write a node's rows anywhere yet, so for now they reach a run
+only when its sidecar is given a rows label (`[@rows=r]`).
 
 A TRACK row goes out every five seconds and once more when the track
 ends (`final`). Per track it carries `received` and `delivered` (groups
@@ -760,6 +762,44 @@ presentation time or the size that caused it, and carries the byte
 offset instead. This package puts back what it alone knows, at its own
 call sites: which track, and which packet.
 
+## On ffrwd 0.29
+
+0.9.0 moves both modules to the node world. `publish` reads packets
+inputs `video` (one or more, h264), `audio` (any, aac) and `data` (any,
+JSON), each as it arrives, on a rate clock of 50 ticks a second; its rows
+are the node's rows. `subscribe` reads nothing and keeps its own time:
+its shape is the catalog, read over the network when the query
+compiles, a packets output per media track and a data output per data
+track, grouped into relation rows, and `init` subscribes only to the
+outputs the query reads. Its rows leave its stderr for the node's rows.
+`build.rs` and the 0.17 bindings go.
+
+What the 0.29 compiler does not do yet, and so what was checked around
+it, against 0.8.0 on ffrwd 0.28.0:
+
+- It refuses a node at a COPY's TO (`RETURNS sink`: "a struct is not a
+  stream"), so `publish` cannot be called from a query on 0.29, and
+  neither the recipes that publish nor the loops that run them can run.
+  `tests/live.py`'s run was repeated with the sidecar stage its plan
+  makes started by hand: 240 frames reassembled in 8 groups, 1281228
+  bytes end to end, every group's packets and bytes the same as 0.8.0's
+  on 0.28.0, and both scoped runs (the path in the URL and as the token)
+  the same 60 frames and 307274 bytes.
+- It writes no node's rows anywhere, so the rows above were read off the
+  sidecar with a rows label.
+- A node source's streams written to a file are not stamped back
+  (`-copyts` is missing at the destination), so a file starts at 0 where
+  0.28 kept the broadcast's pts.
+
+`subscribe` on 0.29 and on 0.28 read one broadcast at once (published by
+0.8.0, paced, with a data track): over the span both read, every packet
+was the same, pts, dts, size, flags and bytes (180 video, 276 audio, 27
+messages). The 0.29 reader joined 16 s of broadcast later: it dials the
+relay three times before its first packet (the compiler's shape, the
+shape the instance resolves at `init`, and `init` itself). With both
+nodes on one broadcast, 43 messages of `tests/data/messages.nut` went
+out as 43 groups and came back whole, in order and at their pts.
+
 ## License
 
 This package is **MIT OR Apache-2.0**, and so is everything vendored
@@ -787,11 +827,10 @@ carried for wasm32-wasip2 fixes upstream does not ship yet).
 
 ## Building
 
-The module builds against the wit from the installed `ffrwd/wasm`
-package, and ring's C sources want wasi-sdk's clang:
+The modules build on ffrwd-node, which carries the world and its
+bindings, and ring's C sources want wasi-sdk's clang:
 
 ```
-ffrwd install -g ffrwd/wasm
 CC_wasm32_wasip2=<wasi-sdk>/bin/clang cargo build --target wasm32-wasip2 --release
 ```
 

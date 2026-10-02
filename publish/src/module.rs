@@ -1,17 +1,11 @@
-wit_bindgen::generate!({
-	path: "wit",
-	world: "packet-sink-module",
-});
-
-use std::cell::RefCell;
 use std::time::Duration;
 
 use bytes::Bytes;
-use exports::ffrwd::av::packet_sink::{
-	Arity, Guest, InputStream, Meta, PacketSinkMeta, PadPackets, Processed, Wants,
+use ffrwd_node::{
+	Bound, CodedFormat, CodedStream, Format, Init, Input, Node, Out, Packet, Rational, Shape, Tick,
 };
-use ffrwd::av::types::CodedFormat;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"rows":{"type":"string","enum":["summary","groups","none"],"default":"summary","description":"what the sink reports: 'summary' is one row per track every 5s and a final total, 'groups' a row per published group, 'none' the final total alone"},"hold_s":{"type":"number","minimum":0,"default":10,"description":"how long the first media waits for a first subscriber before it goes out anyway, in seconds; a subscription starts at the latest group, so holding keeps a file's opening from being lost, and 0 publishes at once, which suits a live source nobody watches yet"},"reconnect_s":{"type":"integer","minimum":0,"default":60,"description":"how long a publisher whose session the relay dropped keeps trying to open a new one and announce the broadcast again, in seconds; groups are still written meanwhile, and 0 ends the run on the first drop"},"audio_group_ms":{"type":"integer","minimum":0,"default":200,"description":"how long an audio group runs, in milliseconds; a fifth of a second is ten AAC frames at 48kHz, and shorter groups have been seen losing whole groups through a public relay under load. 0 is one frame per group, which is what upstream hang writes and is experimental here"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
 
@@ -109,6 +103,9 @@ const MEDIA_QUIET: Duration = moq_core::delivery::DELIVER_MAX;
 /// the cost is nothing.
 const CATALOG_REFRESH: Duration = Duration::from_secs(3);
 
+/// How often the session gets a turn while nothing arrives, a second.
+const TURNS: i32 = 50;
+
 /// How long a publisher whose session ended waits between tries at a
 /// new one: the first wait, and the longest the doubling reaches.
 const RECONNECT_FIRST: Duration = Duration::from_millis(500);
@@ -116,7 +113,7 @@ const RECONNECT_MAX: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-struct Params {
+pub(crate) struct Params {
 	relay: String,
 	broadcast: String,
 	#[serde(default)]
@@ -663,12 +660,7 @@ struct State {
 	session: Session,
 }
 
-thread_local! {
-	static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
-}
-
-fn parse_params(params: &str) -> Result<Params, String> {
-	let params: Params = serde_json::from_str(params).map_err(|err| format!("params: {err}"))?;
+fn check_params(params: &Params) -> Result<(), String> {
 	// The relay URL's path and the token argument are two spellings of
 	// one field, so what the session will ask for is settled here, where
 	// params are refused, rather than at the dial: a URL and a token that
@@ -682,7 +674,7 @@ fn parse_params(params: &str) -> Result<Params, String> {
 			params.hold_s
 		));
 	}
-	Ok(params)
+	Ok(())
 }
 
 impl Session {
@@ -1168,386 +1160,441 @@ impl Session {
 	}
 }
 
-struct Publish;
-
-impl Guest for Publish {
-	fn describe() -> PacketSinkMeta {
-		PacketSinkMeta {
-			meta: Meta {
-				name: "publish".to_string(),
-				version: "0.5.0".to_string(),
-				params_schema: PARAMS_SCHEMA.to_string(),
-				rows_schema: ROWS_SCHEMA.to_string(),
-				// No decoded payload ever arrives, so no format list fills in.
-				pixel_formats: vec![],
-				sample_formats: vec![],
-				sample_rates: vec![],
-				channel_counts: vec![],
-				rows_language: vec![],
+fn open(streams: Vec<InputStream>, params: Params) -> Result<State, String> {
+	let audio_group_ms = params.audio_group_ms;
+	let reporting = Rows::parse(&params.rows)?;
+	if streams.is_empty() {
+		return Err("publish reads at least one stream".into());
+	}
+	// Every muxer is built before the session, so a stream this
+	// module cannot package is refused before anything is dialed.
+	let mut built = Vec::with_capacity(streams.len());
+	for stream in &streams {
+		let coded = &stream.coded;
+		built.push(match &coded.format {
+			CodedFormat::Video(video) => {
+				if coded.codec != "h264" {
+					return Err(format!(
+						"publish packages h264 video, and this stream is {}",
+						coded.codec
+					));
+				}
+				// The avcC is built here, from the Annex-B SPS/PPS
+				// the wire carried out of band, and handed to the
+				// muxer as an opaque record: the container layer
+				// reads no codec bytes.
+				let (sps, pps) = ffrwd_nal::config::parse_parameter_sets(&coded.extradata);
+				let avcc = ffrwd_nal::config::build_avcc(&sps, &pps)
+					.map_err(|err| format!("the h264 stream's extradata builds no avcC: {err}"))?;
+				// The stream's own profile and level name the codec;
+				// parsing the avcC is the fallback for a wire that
+				// does not say.
+				let codec = match (coded.profile, coded.level) {
+					(Some(profile), Some(level)) => {
+						ffrwd_nal::codec_string::avc_codec_from(profile as u8, level as u8, &avcc)
+					}
+					_ => ffrwd_nal::codec_string::avc_codec(&avcc),
+				};
+				let length_size = ffrwd_nal::config::avcc_length_size(&avcc);
+				let muxer = ffrwd_bmff::mux::Muxer::video(
+					ffrwd_bmff::mux::Video {
+						kind: *b"avc1",
+						width: video.width,
+						height: video.height,
+						config: avcc,
+					},
+					coded.time_base.num,
+					coded.time_base.den,
+				)
+				.map_err(|err| {
+					format!(
+						"the h264 stream at time base {}/{} packages as no avc1 track: {err}",
+						coded.time_base.num, coded.time_base.den
+					)
+				})?;
+				Built {
+					muxer: Some(muxer),
+					codec,
+					media: Media::Video {
+						width: video.width,
+						height: video.height,
+					},
+					time_base: (coded.time_base.num, coded.time_base.den),
+					length_size,
+				}
+			}
+			CodedFormat::Audio(audio) => {
+				if coded.codec != "aac" {
+					return Err(format!(
+						"publish packages aac audio, and this stream is {}",
+						coded.codec
+					));
+				}
+				let muxer = ffrwd_bmff::mux::Muxer::audio(
+					ffrwd_bmff::mux::Audio {
+						sample_rate: audio.sample_rate,
+						channels: audio.channels,
+						config: coded.extradata.clone(),
+					},
+					coded.time_base.num,
+					coded.time_base.den,
+				)
+				.map_err(|err| {
+					format!(
+						"the aac stream at time base {}/{} packages as no mp4a track: {err}",
+						coded.time_base.num, coded.time_base.den
+					)
+				})?;
+				Built {
+					muxer: Some(muxer),
+					// The AudioSpecificConfig crosses as extradata,
+					// and is what names the codec.
+					codec: moq_core::catalog::aac_codec(&coded.extradata),
+					media: Media::Audio {
+						sample_rate: audio.sample_rate,
+						channels: audio.channels,
+					},
+					time_base: (coded.time_base.num, coded.time_base.den),
+					length_size: 0,
+				}
+			}
+			CodedFormat::Data => {
+				if coded.codec != "json" {
+					return Err(format!(
+						"publish carries json data, one JSON object a message, and this data \
+							 stream is {}",
+						coded.codec
+					));
+				}
+				Built {
+					muxer: None,
+					codec: coded.codec.clone(),
+					media: Media::Data {
+						timescale: message_timescale(coded.time_base.num, coded.time_base.den),
+					},
+					time_base: (coded.time_base.num, coded.time_base.den),
+					length_size: 0,
+				}
+			}
+		});
+	}
+	// Renditions come from the rows, not from argument names: every
+	// stream carries the relation row it belongs to, and the row's
+	// rendition-meta is what the source (a manifest, another moq
+	// broadcast) said about it. A row with a video and an audio pad
+	// is one muxed rendition; a video alone or an audio alone is its
+	// own. The naming rule itself is a pure function in moq-core, so
+	// it is unit-tested without a session or the wit types.
+	let pads: Vec<moq_core::catalog::RowPad> = streams
+		.iter()
+		.zip(&built)
+		.map(|(stream, b)| moq_core::catalog::RowPad {
+			row: stream.row,
+			kind: match b.media {
+				Media::Video { height, .. } => moq_core::catalog::RowKind::Video { height },
+				Media::Audio { .. } => moq_core::catalog::RowKind::Audio,
+				Media::Data { .. } => moq_core::catalog::RowKind::Data,
 			},
-			// The fmp4 packaging is codec-shaped: avcC from SPS/PPS for
-			// video, esds from the AudioSpecificConfig for audio.
-			video_codecs: vec!["h264".to_string()],
-			audio_codecs: vec!["aac".to_string()],
-			// One broadcast carries as many renditions as the query names,
-			// and the audio and the data streams it names beside them - or
-			// none, for a query that has none.
-			video: Arity::Many,
-			audio: Arity::Any,
-			data: Arity::Any,
-			// Every packet is published, so every packet is wanted.
-			wants: Wants::All,
+			name: stream.name.clone(),
+		})
+		.collect();
+	let names = moq_core::catalog::track_names_for_rows(
+		&pads,
+		DEFAULT_VIDEO_TRACK,
+		DEFAULT_AUDIO_TRACK,
+		DEFAULT_DATA_TRACK,
+	);
+	// What each track is worth when the session has more to send than
+	// the wire takes. A relay reads every track of a broadcast on one
+	// session and asks for them alike, so this tie-break is what keeps
+	// a video keyframe from sitting in front of a sound, and either of
+	// them in front of a message announcing what comes next.
+	//
+	// A track's frame timestamps travel in its own timescale, which
+	// moq-net sets at milliseconds unless told otherwise. A media
+	// track's time rides inside its fragments and the wire's is only a
+	// label, but a message's pts IS the frame's timestamp, so a data
+	// track counts in microseconds, which is what it is written in.
+	let kinds: Vec<(u8, bool, moq_net::Timescale)> = built
+		.iter()
+		.map(|b| match b.media {
+			Media::Video { .. } => (
+				moq_core::catalog::PRIORITY_VIDEO,
+				false,
+				moq_net::Timescale::default(),
+			),
+			Media::Audio { .. } => (
+				moq_core::catalog::PRIORITY_AUDIO,
+				true,
+				moq_net::Timescale::default(),
+			),
+			Media::Data { .. } => (
+				moq_core::catalog::PRIORITY_DATA,
+				true,
+				moq_net::Timescale::MICRO,
+			),
+		})
+		.collect();
+
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_time()
+		.build()
+		.map_err(|err| format!("runtime: {err}"))?;
+	let local = tokio::task::LocalSet::new();
+	let executor = Executor { runtime, local };
+
+	// Everything moq-net touches runs on the runtime, model setup
+	// included. The broadcast and its tracks exist before the
+	// session: the session's driver announces whatever the origin
+	// already carries.
+	let (origin, broadcast, catalog, tracks, connected) = executor.enter(async {
+		let origin = moq_net::Origin::random().produce();
+		let mut broadcast = origin
+			.create_broadcast(
+				params.broadcast.as_str(),
+				moq_net::broadcast::Route::announced(),
+			)
+			.map_err(|err| format!("broadcast '{}': {err}", params.broadcast))?;
+		// The default keep window evicts a non-latest group after
+		// 5s; give a backlogged subscriber more rope.
+		let info = moq_net::track::Info::default().with_latency_max(KEEP);
+		let catalog_name = moq_core::catalog::TRACK;
+		let catalog = broadcast
+			.create_track(
+				catalog_name,
+				info.clone()
+					.with_priority(moq_core::catalog::PRIORITY_CATALOG),
+			)
+			.map_err(|err| format!("track '{catalog_name}': {err}"))?;
+		let mut tracks = Vec::with_capacity(names.len());
+		for (name, &(priority, ordered, timescale)) in names.iter().zip(&kinds) {
+			// Audio also asks to be served in sequence order. A track's
+			// groups are otherwise newest-first, which is right for
+			// video - a late picture is worth less than the next one -
+			// and wrong for sound, where a group skipped is a click and
+			// the one behind it cannot stand in. moq-net carries this in
+			// TRACK_INFO and a subscriber takes it as the default for
+			// its own subscription, so it reaches the relay's re-serve
+			// rather than only our own queue. Data asks the same: every
+			// message counts, and a newer one does not stand in for it.
+			let track = broadcast
+				.create_track(
+					name.as_str(),
+					info.clone()
+						.with_priority(priority)
+						.with_ordered(ordered)
+						.with_timescale(timescale),
+				)
+				.map_err(|err| format!("track '{name}': {err}"))?;
+			tracks.push(track);
 		}
+		let connected = moq_core::relay::dial(
+			&params.relay,
+			&params.cert,
+			&params.token,
+			moq_net::Client::new().with_publisher(origin.consume()),
+		)
+		.await?;
+		Ok::<_, String>((origin, broadcast, catalog, tracks, connected))
+	})?;
+
+	let renditions = built
+		.into_iter()
+		.zip(names)
+		.zip(tracks)
+		.map(|((built, name), track)| Rendition {
+			name,
+			codec: built.codec,
+			media: built.media,
+			track: Some(track),
+			pacer: moq_core::delivery::Pacer::new(),
+			group_open: false,
+			discipline: match built.media {
+				Media::Video { .. } => moq_core::group::Groups::video(),
+				Media::Data { .. } => moq_core::group::Groups::messages(),
+				Media::Audio { .. } => moq_core::group::Groups::audio(
+					built.time_base.0,
+					built.time_base.1,
+					audio_group_ms,
+				),
+			},
+			muxer: built.muxer,
+			time_base: built.time_base,
+			length_size: built.length_size,
+			init_bytes: 0,
+			groups: 0,
+			packets: 0,
+			bytes: 0,
+			media_seconds: 0.0,
+			group_packets: 0,
+			group_bytes: 0,
+			group_pts_min: 0,
+			group_pts_max: 0,
+		})
+		.collect();
+
+	let driver = executor.local.spawn_local(connected.driver);
+
+	Ok(State {
+		executor,
+		session: Session {
+			endpoint: connected.endpoint,
+			session: Some(connected.session),
+			driver: Some(driver),
+			origin,
+			redial: None,
+			broadcast: Some(broadcast),
+			catalog: Some(catalog),
+			renditions,
+			params,
+			started: false,
+			catalog_sent: None,
+			rows: reporting,
+			summary_sent: None,
+			left_at: None,
+			gap_max: Duration::ZERO,
+			call_max: Duration::ZERO,
+			media_at: None,
+			turns: false,
+		},
+	})
+}
+
+/// One packets pad's packets from one tick, in the order `init` was given
+/// the streams: what [`Session::drive`] reads.
+struct PadPackets {
+	packets: Vec<Packet>,
+}
+
+/// What one tick reports: rows as they come, and the run's trailing total.
+struct Processed {
+	rows: Vec<String>,
+	trailing: Vec<String>,
+}
+
+/// One bound stream, as the session is built from it.
+struct InputStream {
+	coded: CodedStream,
+	row: u32,
+	name: Option<String>,
+}
+
+/// `publish` as the host runs it: the session, and the streams it reads
+/// in the order their pads are.
+pub(crate) struct Publish {
+	state: Option<State>,
+	streams: Vec<(u32, bool)>,
+}
+
+impl Node for Publish {
+	const NAME: &'static str = "publish";
+	const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+	const PARAMS_SCHEMA: &'static str = PARAMS_SCHEMA;
+	const ROWS_SCHEMA: &'static str = ROWS_SCHEMA;
+	type Params = Params;
+
+	fn shape(params: &Params, _: &Bound) -> ffrwd_node::Result<Shape> {
+		check_params(params)?;
+		// The fmp4 packaging is codec-shaped: avcC from SPS/PPS for video,
+		// esds from the AudioSpecificConfig for audio. A rate clock gives the
+		// session turns while nothing arrives, and its last call comes once
+		// every input has ended.
+		Ok(Shape::new()
+			.input(Input::packets("video").many().arrival().codecs(&["h264"]))
+			.input(
+				Input::packets("audio")
+					.optional()
+					.many()
+					.arrival()
+					.codecs(&["aac"]),
+			)
+			.input(Input::rows("data").optional().many().arrival())
+			.rate(Rational::new(TURNS, 1)))
 	}
 
-	fn init(streams: Vec<InputStream>, params: String) -> Result<(), String> {
-		let params = parse_params(&params)?;
-		let audio_group_ms = params.audio_group_ms;
-		let reporting = Rows::parse(&params.rows)?;
-		if streams.is_empty() {
-			return Err("publish reads at least one stream".into());
-		}
-		// Every muxer is built before the session, so a stream this
-		// module cannot package is refused before anything is dialed.
-		let mut built = Vec::with_capacity(streams.len());
-		for stream in &streams {
-			let coded = &stream.coded;
-			built.push(match &coded.format {
-				CodedFormat::Video(video) => {
-					if coded.codec != "h264" {
-						return Err(format!(
-							"publish packages h264 video, and this stream is {}",
-							coded.codec
-						));
-					}
-					// The avcC is built here, from the Annex-B SPS/PPS
-					// the wire carried out of band, and handed to the
-					// muxer as an opaque record: the container layer
-					// reads no codec bytes.
-					let (sps, pps) = ffrwd_nal::config::parse_parameter_sets(&coded.extradata);
-					let avcc = ffrwd_nal::config::build_avcc(&sps, &pps).map_err(|err| {
-						format!("the h264 stream's extradata builds no avcC: {err}")
-					})?;
-					// The stream's own profile and level name the codec;
-					// parsing the avcC is the fallback for a wire that
-					// does not say.
-					let codec = match (coded.profile, coded.level) {
-						(Some(profile), Some(level)) => ffrwd_nal::codec_string::avc_codec_from(
-							profile as u8,
-							level as u8,
-							&avcc,
-						),
-						_ => ffrwd_nal::codec_string::avc_codec(&avcc),
-					};
-					let length_size = ffrwd_nal::config::avcc_length_size(&avcc);
-					let muxer = ffrwd_bmff::mux::Muxer::video(
-						ffrwd_bmff::mux::Video {
-							kind: *b"avc1",
-							width: video.width,
-							height: video.height,
-							config: avcc,
-						},
-						coded.time_base.num,
-						coded.time_base.den,
-					)
-					.map_err(|err| {
-						format!(
-							"the h264 stream at time base {}/{} packages as no avc1 track: {err}",
-							coded.time_base.num, coded.time_base.den
-						)
-					})?;
-					Built {
-						muxer: Some(muxer),
-						codec,
-						media: Media::Video {
-							width: video.width,
-							height: video.height,
-						},
-						time_base: (coded.time_base.num, coded.time_base.den),
-						length_size,
-					}
-				}
-				CodedFormat::Audio(audio) => {
-					if coded.codec != "aac" {
-						return Err(format!(
-							"publish packages aac audio, and this stream is {}",
-							coded.codec
-						));
-					}
-					let muxer = ffrwd_bmff::mux::Muxer::audio(
-						ffrwd_bmff::mux::Audio {
-							sample_rate: audio.sample_rate,
-							channels: audio.channels,
-							config: coded.extradata.clone(),
-						},
-						coded.time_base.num,
-						coded.time_base.den,
-					)
-					.map_err(|err| {
-						format!(
-							"the aac stream at time base {}/{} packages as no mp4a track: {err}",
-							coded.time_base.num, coded.time_base.den
-						)
-					})?;
-					Built {
-						muxer: Some(muxer),
-						// The AudioSpecificConfig crosses as extradata,
-						// and is what names the codec.
-						codec: moq_core::catalog::aac_codec(&coded.extradata),
-						media: Media::Audio {
-							sample_rate: audio.sample_rate,
-							channels: audio.channels,
-						},
-						time_base: (coded.time_base.num, coded.time_base.den),
-						length_size: 0,
-					}
-				}
-				CodedFormat::Data => {
-					if coded.codec != "json" {
-						return Err(format!(
-							"publish carries json data, one JSON object a message, and this data \
-							 stream is {}",
-							coded.codec
-						));
-					}
-					Built {
-						muxer: None,
-						codec: coded.codec.clone(),
-						media: Media::Data {
-							timescale: message_timescale(
-								coded.time_base.num,
-								coded.time_base.den,
-							),
-						},
-						time_base: (coded.time_base.num, coded.time_base.den),
-						length_size: 0,
-					}
-				}
-			});
-		}
-		// Renditions come from the rows, not from argument names: every
-		// stream carries the relation row it belongs to, and the row's
-		// rendition-meta is what the source (a manifest, another moq
-		// broadcast) said about it. A row with a video and an audio pad
-		// is one muxed rendition; a video alone or an audio alone is its
-		// own. The naming rule itself is a pure function in moq-core, so
-		// it is unit-tested without a session or the wit types.
-		let pads: Vec<moq_core::catalog::RowPad> = streams
-			.iter()
-			.zip(&built)
-			.map(|(stream, b)| moq_core::catalog::RowPad {
-				row: stream.row,
-				kind: match b.media {
-					Media::Video { height, .. } => moq_core::catalog::RowKind::Video { height },
-					Media::Audio { .. } => moq_core::catalog::RowKind::Audio,
-					Media::Data { .. } => moq_core::catalog::RowKind::Data,
+	fn init(params: Params, init: &Init) -> ffrwd_node::Result<Publish> {
+		let mut inputs = Vec::new();
+		let mut streams = Vec::new();
+		for stream in init.all() {
+			let coded = match &stream.format {
+				Some(Format::Packets(coded)) => coded.clone(),
+				Some(Format::Data(codec)) => CodedStream {
+					codec: codec.clone(),
+					time_base: stream.info.time_base,
+					format: CodedFormat::Data,
+					extradata: Vec::new(),
+					profile: None,
+					level: None,
 				},
+				_ => {
+					return Err(
+						format!("`{}` carries neither packets nor messages", stream.port).into(),
+					)
+				}
+			};
+			streams.push((stream.id, matches!(coded.format, CodedFormat::Data)));
+			inputs.push(InputStream {
+				coded,
+				row: stream.row.unwrap_or(0),
 				name: stream.rendition.name.clone(),
-			})
-			.collect();
-		let names = moq_core::catalog::track_names_for_rows(
-			&pads,
-			DEFAULT_VIDEO_TRACK,
-			DEFAULT_AUDIO_TRACK,
-			DEFAULT_DATA_TRACK,
-		);
-		// What each track is worth when the session has more to send than
-		// the wire takes. A relay reads every track of a broadcast on one
-		// session and asks for them alike, so this tie-break is what keeps
-		// a video keyframe from sitting in front of a sound, and either of
-		// them in front of a message announcing what comes next.
-		//
-		// A track's frame timestamps travel in its own timescale, which
-		// moq-net sets at milliseconds unless told otherwise. A media
-		// track's time rides inside its fragments and the wire's is only a
-		// label, but a message's pts IS the frame's timestamp, so a data
-		// track counts in microseconds, which is what it is written in.
-		let kinds: Vec<(u8, bool, moq_net::Timescale)> = built
-			.iter()
-			.map(|b| match b.media {
-				Media::Video { .. } => (
-					moq_core::catalog::PRIORITY_VIDEO,
-					false,
-					moq_net::Timescale::default(),
-				),
-				Media::Audio { .. } => (
-					moq_core::catalog::PRIORITY_AUDIO,
-					true,
-					moq_net::Timescale::default(),
-				),
-				Media::Data { .. } => (
-					moq_core::catalog::PRIORITY_DATA,
-					true,
-					moq_net::Timescale::MICRO,
-				),
-			})
-			.collect();
-
-		let runtime = tokio::runtime::Builder::new_current_thread()
-			.enable_time()
-			.build()
-			.map_err(|err| format!("runtime: {err}"))?;
-		let local = tokio::task::LocalSet::new();
-		let executor = Executor { runtime, local };
-
-		// Everything moq-net touches runs on the runtime, model setup
-		// included. The broadcast and its tracks exist before the
-		// session: the session's driver announces whatever the origin
-		// already carries.
-		let (origin, broadcast, catalog, tracks, connected) = executor.enter(async {
-			let origin = moq_net::Origin::random().produce();
-			let mut broadcast = origin
-				.create_broadcast(
-					params.broadcast.as_str(),
-					moq_net::broadcast::Route::announced(),
-				)
-				.map_err(|err| format!("broadcast '{}': {err}", params.broadcast))?;
-			// The default keep window evicts a non-latest group after
-			// 5s; give a backlogged subscriber more rope.
-			let info = moq_net::track::Info::default().with_latency_max(KEEP);
-			let catalog_name = moq_core::catalog::TRACK;
-			let catalog = broadcast
-				.create_track(
-					catalog_name,
-					info.clone()
-						.with_priority(moq_core::catalog::PRIORITY_CATALOG),
-				)
-				.map_err(|err| format!("track '{catalog_name}': {err}"))?;
-			let mut tracks = Vec::with_capacity(names.len());
-			for (name, &(priority, ordered, timescale)) in names.iter().zip(&kinds) {
-				// Audio also asks to be served in sequence order. A track's
-				// groups are otherwise newest-first, which is right for
-				// video - a late picture is worth less than the next one -
-				// and wrong for sound, where a group skipped is a click and
-				// the one behind it cannot stand in. moq-net carries this in
-				// TRACK_INFO and a subscriber takes it as the default for
-				// its own subscription, so it reaches the relay's re-serve
-				// rather than only our own queue. Data asks the same: every
-				// message counts, and a newer one does not stand in for it.
-				let track = broadcast
-					.create_track(
-						name.as_str(),
-						info.clone()
-							.with_priority(priority)
-							.with_ordered(ordered)
-							.with_timescale(timescale),
-					)
-					.map_err(|err| format!("track '{name}': {err}"))?;
-				tracks.push(track);
-			}
-			let connected = moq_core::relay::dial(
-				&params.relay,
-				&params.cert,
-				&params.token,
-				moq_net::Client::new().with_publisher(origin.consume()),
-			)
-			.await?;
-			Ok::<_, String>((origin, broadcast, catalog, tracks, connected))
-		})?;
-
-		let renditions = built
-			.into_iter()
-			.zip(names)
-			.zip(tracks)
-			.map(|((built, name), track)| Rendition {
-				name,
-				codec: built.codec,
-				media: built.media,
-				track: Some(track),
-				pacer: moq_core::delivery::Pacer::new(),
-				group_open: false,
-				discipline: match built.media {
-					Media::Video { .. } => moq_core::group::Groups::video(),
-					Media::Data { .. } => moq_core::group::Groups::messages(),
-					Media::Audio { .. } => moq_core::group::Groups::audio(
-						built.time_base.0,
-						built.time_base.1,
-						audio_group_ms,
-					),
-				},
-				muxer: built.muxer,
-				time_base: built.time_base,
-				length_size: built.length_size,
-				init_bytes: 0,
-				groups: 0,
-				packets: 0,
-				bytes: 0,
-				media_seconds: 0.0,
-				group_packets: 0,
-				group_bytes: 0,
-				group_pts_min: 0,
-				group_pts_max: 0,
-			})
-			.collect();
-
-		let driver = executor.local.spawn_local(connected.driver);
-
-		STATE.with(|s| {
-			*s.borrow_mut() = Some(State {
-				executor,
-				session: Session {
-					endpoint: connected.endpoint,
-					session: Some(connected.session),
-					driver: Some(driver),
-					origin,
-					redial: None,
-					broadcast: Some(broadcast),
-					catalog: Some(catalog),
-					renditions,
-					params,
-					started: false,
-					catalog_sent: None,
-					rows: reporting,
-					summary_sent: None,
-					left_at: None,
-					gap_max: Duration::ZERO,
-					call_max: Duration::ZERO,
-					media_at: None,
-					turns: false,
-				},
 			});
-		});
+		}
+		Ok(Publish {
+			state: Some(open(inputs, params)?),
+			streams,
+		})
+	}
+
+	fn set_params(&mut self, params: Params) -> ffrwd_node::Result<()> {
+		let state = self
+			.state
+			.as_ref()
+			.ok_or("set-params after the last call")?;
+		if params != state.session.params {
+			return Err(
+				"publish cannot move to another relay, broadcast or track mid-stream".into(),
+			);
+		}
 		Ok(())
 	}
 
-	fn set_params(params: String) -> Result<(), String> {
-		let asked = parse_params(&params)?;
-		STATE.with(|s| {
-			let holder = s.borrow();
-			let state = holder.as_ref().ok_or("set-params before init")?;
-			if asked != state.session.params {
-				return Err(
-					"publish cannot move to another relay, broadcast or track mid-stream".into(),
-				);
-			}
-			Ok(())
-		})
-	}
-
-	fn process(pads: Vec<PadPackets>, last: bool) -> Processed {
-		STATE.with(|s| {
-			let mut holder = s.borrow_mut();
-			let state = holder.as_mut().expect("process called before init");
-
-			// Nothing to publish and no close asked: a turn for the session,
-			// which lets go what the queues may. See [`Session::drive`].
-			let State { executor, session } = state;
-			if !last && pads.iter().all(|pad| pad.packets.is_empty()) {
-				session.turns = true;
-			}
-			match executor.enter(session.drive(&pads, last)) {
-				Ok(processed) => {
-					if last {
-						*holder = None;
-					}
-					processed
-				}
-				// The call has no error channel; a failure mid-stream
-				// can only stop the run, with the reason named.
-				Err(err) => panic!("publish: {err}"),
-			}
-		})
+	fn process(&mut self, tick: &Tick, out: &mut Out) -> ffrwd_node::Result<()> {
+		let last = tick.last();
+		let pads: Vec<PadPackets> = self
+			.streams
+			.iter()
+			.map(|&(id, data)| PadPackets {
+				packets: if data {
+					tick.messages(id)
+						.into_iter()
+						.map(|message| Packet {
+							pts: message.pts,
+							dts: Some(message.pts),
+							duration: None,
+							keyframe: true,
+							data: message.data,
+						})
+						.collect()
+				} else {
+					tick.packets(id)
+				},
+			})
+			.collect();
+		let Some(State { executor, session }) = self.state.as_mut() else {
+			return Ok(());
+		};
+		// Nothing to publish and no close asked: a turn for the session,
+		// which lets go what the queues may. See [`Session::drive`].
+		if !last && pads.iter().all(|pad| pad.packets.is_empty()) {
+			session.turns = true;
+		}
+		let processed = executor.enter(session.drive(&pads, last))?;
+		if last {
+			self.state = None;
+		}
+		for row in processed.rows.into_iter().chain(processed.trailing) {
+			out.report(&RawValue::from_string(row)?)?;
+		}
+		Ok(())
 	}
 }
-
-export!(Publish);

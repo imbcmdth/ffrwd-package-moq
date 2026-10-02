@@ -13,11 +13,10 @@
 -- geometry and its fmp4 init segment.
 --
 -- A data column (a data_stream of JSON messages: a JSON NUT's d.data[1],
--- a data filter's output, another broadcast's s.data[1]) rides beside
+-- a node's data output, another broadcast's s.data[1]) rides beside
 -- the rows and publishes as a track of its own, named by the rendition
--- name the host hands its pad, or data, data.1, ... in the order the
--- query names them (ffrwd 0.19.0 hands none, so an alias does not reach
--- the module yet). Each message is one MoQ group of one frame in hang's
+-- name the host hands its stream, or data, data.1, ... in the order the
+-- query names them. Each message is one MoQ group of one frame in hang's
 -- legacy framing, its pts as a varint of microseconds and then its
 -- bytes as they arrived, and it goes out the moment it arrives, ahead
 -- of any media handed over with it; a message that follows the one
@@ -155,8 +154,7 @@ RETURNS sink
 -- to arrive would put the rest of the backlog below itself. A live join
 -- has nothing older coming and never waits. A hole given up on and a
 -- group that arrives too late to be used are both counted and named in
--- a row on the module's stderr, never dropped in silence; see the
--- README.
+-- a row of the run's rows, never dropped in silence; see the README.
 --
 -- reconnect_s is how long a reader whose session the relay dropped
 -- keeps dialing for a new one, in seconds, 60 by default. A relay resets

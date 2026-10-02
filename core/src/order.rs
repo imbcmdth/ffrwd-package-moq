@@ -20,18 +20,16 @@
 //! has to land where a decoder can start, so the caller says of each
 //! group whether it can be decoded from and the queue does the rest.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde::Serialize;
 
-/// What this module reports, as rows on its own stderr.
-///
-/// A packet source has no row channel in `ffrwd:av`: `next` hands back
-/// packets and nothing else. So these go out as `subscribe: row <json>`
-/// lines instead, one object to a line. `kind` says which of the five
-/// shapes it is: a TRACK row every [`REPORT_EVERY`] and once more when
+/// What subscribe reports, as rows on the run's rows output: kept here as
+/// they happen until the node hands them over ([`take_rows`]), one object
+/// a row. `kind` says which of the five shapes it is: a TRACK row every [`REPORT_EVERY`] and once more when
 /// the track ends (`final`), a HOLE row for every hole given up on, a
 /// LATE row for every group that arrived below the cursor and could not
 /// be used, and a SKIPPED row for every group a live join stepped over
@@ -318,13 +316,19 @@ pub fn report_reconnect(attempts: u64, down_ms: u64, error: &str) {
 	});
 }
 
-/// One row on stderr, which is where a packet source's rows go; see
-/// [`ROWS_SCHEMA`].
+thread_local! {
+	static ROWS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// One row, kept for the next [`take_rows`]; see [`ROWS_SCHEMA`].
 fn row(body: &impl Serialize) {
-	eprintln!(
-		"subscribe: row {}",
-		serde_json::to_string(body).expect("a row serializes")
-	);
+	let text = serde_json::to_string(body).expect("a row serializes");
+	ROWS.with(|rows| rows.borrow_mut().push(text));
+}
+
+/// Every row reported since the last call, oldest first.
+pub fn take_rows() -> Vec<String> {
+	ROWS.with(|rows| std::mem::take(&mut *rows.borrow_mut()))
 }
 
 impl<F: Weigh> Queue<F> {
