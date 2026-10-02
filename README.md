@@ -10,7 +10,7 @@ Requires ffrwd 0.29, whose `ffrwd/wasm` is 0.19.1.
 
 Both are nodes of `ffrwd:av` 0.19.1, built on
 [ffrwd-node](https://github.com/imbcmdth/ffrwd-node). "On ffrwd 0.29"
-says what that changed and what the 0.29 compiler does not do yet.
+says what that changed and how it was checked.
 
 ## Publish
 
@@ -799,6 +799,24 @@ relay three times before its first packet (the compiler's shape, the
 shape the instance resolves at `init`, and `init` itself). With both
 nodes on one broadcast, 43 messages of `tests/data/messages.nut` went
 out as 43 groups and came back whole, in order and at their pts.
+
+0.9.1 is the same two nodes on ffrwd:av 0.19.1 and ffrwd-node 0.2.0. On
+the node world's CLI and sidecar at 81f1b69, which lowers a node at a
+COPY's TO, writes a node's rows and keeps a node source's pts at a file:
+
+- `tests/live.py` runs as written: 240 frames reassembled in 8 groups,
+  1281228 bytes end to end, and both scoped runs 60 frames each. Run by
+  hand as before, the publisher's groups are 0.8.0's on ffrwd 0.28.0,
+  packets and bytes, group for group, and the scoped runs 60 frames and
+  307274 bytes. Its rows carry the host's `pts` and `time` beside its own.
+- `subscribe` on 0.29 and on 0.28 reading one broadcast at once: over
+  the span both read, every packet the same, pts, dts, size, flags and
+  bytes (1050 video, 1606 audio, 41 messages), with no shift between the
+  two files now that a node source's file keeps the broadcast's pts. The
+  0.29 reader joined 5 s of broadcast later.
+- With both nodes on one broadcast, the 43 messages of
+  `tests/data/messages.nut` went out as 43 groups of the 612 published
+  and came back whole, as on 0.9.0.
 
 ## License
 
