@@ -50,15 +50,6 @@ const TRACK_RETRY: Duration = Duration::from_millis(500);
 const RECONNECT_FIRST: Duration = Duration::from_millis(500);
 const RECONNECT_MAX: Duration = Duration::from_secs(5);
 
-/// How long one pull keeps the session turning after it has something
-/// to hand back, and how many idle turns end it early. The QUIC driver
-/// runs only while a call is blocked on the executor, so a pull that
-/// returned the instant anything arrived would leave the wire unread
-/// between calls.
-const DRIVE_SLICE: Duration = Duration::from_millis(1);
-const DRIVE_TURNS: usize = 200;
-const IDLE_TURNS: usize = 5;
-
 #[derive(Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Params {
@@ -200,8 +191,14 @@ fn enter<T>(work: impl std::future::Future<Output = T>) -> Result<T, String> {
 
 /// What one reader task says about its track.
 enum Wire {
-	/// One complete group: its sequence and its frames, each frame a
-	/// complete fmp4 fragment, or for a data track the one message.
+	/// One frame of a group, as it arrives: a complete fmp4 fragment, a
+	/// legacy sample, or for a data track the one message. A frame is
+	/// whole on its own, so it is handed on without waiting for the rest
+	/// of its group.
+	Frame(usize, Received),
+	/// The group of this sequence has been read to its end.
+	End(usize, u64),
+	/// One complete group, asked for outright: its sequence and its frames.
 	Group(usize, u64, Vec<Received>),
 	/// The relay was asked for one group outright and would not serve
 	/// it: it does not have it, so the hole waiting for it is a hole
@@ -269,7 +266,7 @@ impl Rendition {
 	/// again at a sync sample, since the frames it would have referred
 	/// back to went with the groups in between.
 	fn restart(&mut self) {
-		self.queue.restarted = true;
+		self.queue.restart();
 		self.order.restart();
 		if self.video {
 			self.join = moq_core::group::Join::video();
@@ -308,6 +305,9 @@ struct Reader {
 	asking: Vec<(usize, u64)>,
 	/// What every track's hold is bounded by.
 	hold: Hold,
+	/// When the last pull returned, which is when the session last stopped
+	/// turning.
+	left: Option<std::time::Instant>,
 }
 
 /// The reader the instance's runtime drives.
@@ -675,13 +675,33 @@ impl Reader {
 	/// One pull: the packets that came in, a list per track in catalog
 	/// order, or none once every track has finished and nothing is held.
 	///
-	/// A call blocks until something is ready and then keeps the session
-	/// turning for a while: the reader tasks and the QUIC driver run
-	/// only while a call is on the executor, so returning at the first
-	/// sign of a frame would leave the wire unread between calls.
+	/// A pull returns as soon as it has packets to hand on. The reader
+	/// tasks and the QUIC driver run only while a call is on the executor,
+	/// so a pull first lets them run once, which takes in what the wire
+	/// has already brought, and then waits on them only while it has
+	/// nothing to hand on. The host calls a source again as soon as a call
+	/// returns, so the session turns between the two.
+	///
+	/// Before 0.9.2 a pull went on turning the session for up to 200 more
+	/// sleeps of a millisecond once it had something, while groups kept
+	/// arriving. Packets then left in lumps, and on Windows, where each of
+	/// those sleeps is nearer 2 ms, lumps of up to 400 ms.
 	async fn pull(&mut self) -> Result<Option<Vec<PadPackets>>, String> {
+		let began = std::time::Instant::now();
+		let gap = self.left.map(|left| began.duration_since(left));
+		let pulled = self.take_in().await;
+		let now = std::time::Instant::now();
+		self.left = Some(now);
+		for rendition in &mut self.renditions {
+			rendition.queue.note_call(gap, now.duration_since(began));
+		}
+		pulled
+	}
+
+	async fn take_in(&mut self) -> Result<Option<Vec<PadPackets>>, String> {
 		let mut pads: Vec<Vec<Packet>> = (0..self.renditions.len()).map(|_| Vec::new()).collect();
-		let mut produced = false;
+		// What the wire brought while the host had the call.
+		tokio::task::yield_now().await;
 		loop {
 			while let Ok(wire) = self.frames.try_recv() {
 				self.hold(wire)?;
@@ -700,11 +720,11 @@ impl Reader {
 				self.reconnect(why).await?;
 				continue;
 			}
-			produced |= self.release(&mut pads, self.over())?;
+			let produced = self.release(&mut pads, self.over())?;
 			self.ask();
 			self.report();
 			if produced {
-				break;
+				return Ok(Some(into_pads(pads)));
 			}
 			if self.over() {
 				// Every track has finished and no answer is outstanding:
@@ -713,7 +733,7 @@ impl Reader {
 				for rendition in &mut self.renditions {
 					rendition.queue.report(true);
 				}
-				return Ok(produced.then(|| into_pads(pads)));
+				return Ok(None);
 			}
 			// Nothing ready: wait for the wire, but only for a tick. The
 			// hold releases on a deadline as well as on an arrival, and a
@@ -726,23 +746,6 @@ impl Reader {
 				Err(_) => {}
 			}
 		}
-
-		let mut idle = 0;
-		for _ in 0..DRIVE_TURNS {
-			tokio::time::sleep(DRIVE_SLICE).await;
-			let mut arrived = false;
-			while let Ok(wire) = self.frames.try_recv() {
-				arrived = true;
-				self.hold(wire)?;
-			}
-			self.release(&mut pads, false)?;
-			self.ask();
-			idle = if arrived { 0 } else { idle + 1 };
-			if idle >= IDLE_TURNS {
-				break;
-			}
-		}
-		Ok(Some(into_pads(pads)))
 	}
 
 	/// Whether the run is over: every track's reader has finished and
@@ -789,28 +792,25 @@ impl Reader {
 	/// a track did. What each kind of word means is [`Queue`]'s business.
 	fn hold(&mut self, wire: Wire) -> Result<(), String> {
 		match wire {
+			Wire::Frame(index, frame) => {
+				let rendition = &mut self.renditions[index];
+				let sequence = frame.group;
+				resumed_at(rendition, sequence)?;
+				// Whether a decoder could start at this group, which is
+				// what a live join lands on, when this frame is what says
+				// so. The keyframe flag comes off the fragment the publisher
+				// wrote rather than off a convention about where groups are
+				// cut.
+				let decides = match rendition.queue.deciding(sequence) {
+					true => frame_decides(rendition, &frame),
+					false => None,
+				};
+				rendition.queue.frame(sequence, frame, decides)
+			}
+			Wire::End(index, sequence) => self.renditions[index].queue.end(sequence),
 			Wire::Group(index, sequence, frames) => {
 				let rendition = &mut self.renditions[index];
-				// The first group on a new session. A publisher that carried
-				// on counts on from where it was; one that started again
-				// counts from nothing, and its clock went back with it,
-				// which no reader downstream of this one can follow.
-				if std::mem::take(&mut rendition.resumed) {
-					if let Some(cursor) = rendition.queue.cursor() {
-						if sequence + 1 < cursor {
-							return Err(format!(
-								"track '{}' came back on a new session at group {sequence}, \
-								 below the {cursor} this reader had reached: its publisher \
-								 started again, and its timestamps with it",
-								rendition.name
-							));
-						}
-					}
-				}
-				// Whether a decoder could start at this group, which is
-				// what a live join lands on. The keyframe flag comes off
-				// the fragment the publisher wrote rather than off a
-				// convention about where groups are cut.
+				resumed_at(rendition, sequence)?;
 				let decodable = decodable(rendition, &frames);
 				rendition.queue.push(sequence, frames, decodable)
 			}
@@ -1004,30 +1004,51 @@ impl Reader {
 /// either way, and the next one is read. A message stands alone, so a
 /// data group is always one to start at.
 fn decodable(rendition: &Rendition, frames: &[Received]) -> bool {
-	let track = match &rendition.body {
-		Body::Media(track) => track,
-		Body::Data { .. } => return !frames.is_empty(),
-		Body::Legacy(codec) => {
-			// The first frame with a sample in it decides, as the first
-			// sample of a fragment does.
-			return frames.iter().find_map(|frame| {
-				match legacy_sample(rendition, *codec, &frame.payload) {
-					Ok(Some((_, _, keyframe))) => Some(!rendition.video || keyframe),
-					Ok(None) => None,
-					Err(_) => Some(false),
-				}
-			}) == Some(true);
-		}
-	};
-	for fragment in frames {
-		let Ok(samples) = track.fragment_samples(&fragment.payload) else {
-			return false;
-		};
-		if let Some(sample) = samples.first() {
-			return !rendition.video || sample.keyframe;
+	frames
+		.iter()
+		.find_map(|frame| frame_decides(rendition, frame))
+		== Some(true)
+}
+
+/// What one frame says about whether a decoder can start at its group:
+/// the first frame with a sample in it decides, and one with none - a
+/// fragment carrying nothing for this track, a legacy frame that is a pts
+/// alone - says nothing. A frame that cannot be read says no.
+fn frame_decides(rendition: &Rendition, frame: &Received) -> Option<bool> {
+	match &rendition.body {
+		Body::Data { .. } => Some(true),
+		Body::Legacy(codec) => match legacy_sample(rendition, *codec, &frame.payload) {
+			Ok(Some((_, _, keyframe))) => Some(!rendition.video || keyframe),
+			Ok(None) => None,
+			Err(_) => Some(false),
+		},
+		Body::Media(track) => match track.fragment_samples(&frame.payload) {
+			Ok(samples) => samples
+				.first()
+				.map(|sample| !rendition.video || sample.keyframe),
+			Err(_) => Some(false),
+		},
+	}
+}
+
+/// The first group on a new session. A publisher that carried on counts
+/// on from where it was; one that started again counts from nothing, and
+/// its clock went back with it, which no reader downstream of this one
+/// can follow.
+fn resumed_at(rendition: &mut Rendition, sequence: u64) -> Result<(), String> {
+	if std::mem::take(&mut rendition.resumed) {
+		if let Some(cursor) = rendition.queue.cursor() {
+			if sequence + 1 < cursor {
+				return Err(format!(
+					"track '{}' came back on a new session at group {sequence}, below the \
+					 {cursor} this reader had reached: its publisher started again, and its \
+					 timestamps with it",
+					rendition.name
+				));
+			}
 		}
 	}
-	false
+	Ok(())
 }
 
 fn into_pads(pads: Vec<Vec<Packet>>) -> Vec<PadPackets> {
@@ -1357,6 +1378,7 @@ impl Node for Subscribe {
 					finished: 0,
 					asking: Vec::new(),
 					hold: Hold::new(hold_ms(&params, start), params.hold_mib, params.join_ms),
+					left: None,
 				},
 			))
 		})??;
@@ -1481,10 +1503,11 @@ async fn fetch_group(
 /// One track's groups onto the shared channel until it finishes, and
 /// the word that it has.
 ///
-/// Frames are gathered per group and the group goes out whole, the
-/// moment the stream says it has been read to its end. That matters most
-/// to a data track, whose next group may be a minute away: a message has
-/// to go on when its own group ends, not when the next one begins.
+/// Each frame goes out the moment the stream hands it over, and the end
+/// of its group once the stream says the group has been read to its end.
+/// A frame is whole on its own, so nothing waits for the rest of its
+/// group: before 0.9.2 a group went out whole at its end, which held a
+/// GOP of pictures back, and a message waited for its group's end.
 /// The channel is unbounded on purpose - one track blocking on a full
 /// queue would stop it reading its subscription, and the relay would
 /// age its groups out while another track drained. Nothing accumulates
@@ -1514,37 +1537,38 @@ async fn read_groups(
 	let mut stream = moq_core::subscribe::FrameStream::new(subscriber);
 	let mut attempts = 0u32;
 	loop {
-		// The group being gathered is dropped on a resubscribe: only a
-		// group read to its end goes out, and the sequence cursor
-		// downstream drops whatever the new subscription repeats.
-		let mut open: Option<(u64, Vec<Received>)> = None;
+		// Each frame goes on as it arrives, and the end of its group after
+		// it. A group the stream broke off in is left to the hold, which is
+		// told the track restarted and takes the group up again if the new
+		// subscription hands it over from its start.
+		let mut open: Option<u64> = None;
 		let failure = loop {
 			match stream.step().await {
-				Ok(Some(Step::Frame(frame))) => match &mut open {
-					Some((sequence, frames)) if *sequence == frame.group => frames.push(frame),
-					_ => {
-						// A group whose end was never read, which only a
-						// stream that moved on without one can hand over.
-						if let Some((sequence, frames)) = open.take() {
-							if sender.send(Wire::Group(index, sequence, frames)).is_err() {
-								return;
-							}
-						}
-						open = Some((frame.group, vec![frame]));
-					}
-				},
-				Ok(Some(Step::End(ended))) => {
-					if let Some((sequence, frames)) = open.take_if(|(sequence, _)| *sequence == ended) {
-						if sender.send(Wire::Group(index, sequence, frames)).is_err() {
+				Ok(Some(Step::Frame(frame))) => {
+					// A group whose end was never read, which only a stream
+					// that moved on without one can hand over.
+					if let Some(sequence) = open.take_if(|sequence| *sequence != frame.group) {
+						if sender.send(Wire::End(index, sequence)).is_err() {
 							return;
 						}
 					}
+					open = Some(frame.group);
+					if sender.send(Wire::Frame(index, frame)).is_err() {
+						return;
+					}
 				}
-				// The publisher finished the track: its last group goes
-				// out and this reader is done.
+				Ok(Some(Step::End(ended))) => {
+					if open.take_if(|sequence| *sequence == ended).is_some()
+						&& sender.send(Wire::End(index, ended)).is_err()
+					{
+						return;
+					}
+				}
+				// The publisher finished the track: its last group ends and
+				// this reader is done.
 				Ok(None) => {
-					if let Some((sequence, frames)) = open.take() {
-						let _ = sender.send(Wire::Group(index, sequence, frames));
+					if let Some(sequence) = open.take() {
+						let _ = sender.send(Wire::End(index, sequence));
 					}
 					return;
 				}

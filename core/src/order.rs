@@ -19,6 +19,17 @@
 //! begins and ends, and the demuxing is the caller's - but a live join
 //! has to land where a decoder can start, so the caller says of each
 //! group whether it can be decoded from and the queue does the rest.
+//!
+//! A group comes in a frame at a time ([`Queue::frame`], then
+//! [`Queue::end`]) or whole ([`Queue::push`]), and the group at the
+//! cursor goes out a frame at a time too: its frames are handed on as
+//! they arrive, and the cursor moves past it once its end has been read.
+//! A frame is whole on its own (a fragment carries its own sizes), so
+//! nothing waits for the rest of its group. A video group is a GOP, and
+//! a reader that held each one until its end handed a GOP of pictures on
+//! at once, the first of them a GOP late. Only the group AT the cursor
+//! goes out early: one behind a hole, or behind a group still being
+//! read, waits as a whole group always did.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,7 +46,7 @@ use serde::Serialize;
 /// be used, and a SKIPPED row for every group a live join stepped over
 /// on its way to one a decoder can start at, and a RECONNECT row each
 /// time a session the relay dropped was replaced by a new one.
-pub const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","enum":["track","hole","late","skipped","reconnect"]},"track":{"type":"string"},"received":{"type":"integer"},"delivered":{"type":"integer"},"repeated":{"type":"integer"},"bytes":{"type":"integer"},"holes_opened":{"type":"integer"},"holes_filled":{"type":"integer"},"holes_abandoned_gone":{"type":"integer"},"holes_abandoned_budget":{"type":"integer"},"holes_abandoned_restart":{"type":"integer"},"holes_abandoned_end":{"type":"integer"},"dropped_late":{"type":"integer"},"skipped_join":{"type":"integer"},"fetches":{"type":"integer"},"fetches_refused":{"type":"integer"},"hold_max_groups":{"type":"integer"},"hold_max_bytes":{"type":"integer"},"reorder_max":{"type":"integer"},"first":{"type":["integer","null"]},"last":{"type":["integer","null"]},"final":{"type":"boolean"},"from":{"type":"integer"},"to":{"type":"integer"},"reason":{"type":"string","enum":["gone","budget","restart","end"]},"held_groups":{"type":"integer"},"held_bytes":{"type":"integer"},"group":{"type":"integer"},"cursor":{"type":"integer"},"attempts":{"type":"integer"},"down_ms":{"type":"integer"},"error":{"type":"string"}},"additionalProperties":false}"#;
+pub const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","enum":["track","hole","late","skipped","reconnect"]},"track":{"type":"string"},"received":{"type":"integer"},"delivered":{"type":"integer"},"repeated":{"type":"integer"},"bytes":{"type":"integer"},"holes_opened":{"type":"integer"},"holes_filled":{"type":"integer"},"holes_abandoned_gone":{"type":"integer"},"holes_abandoned_budget":{"type":"integer"},"holes_abandoned_restart":{"type":"integer"},"holes_abandoned_end":{"type":"integer"},"dropped_late":{"type":"integer"},"skipped_join":{"type":"integer"},"fetches":{"type":"integer"},"fetches_refused":{"type":"integer"},"hold_max_groups":{"type":"integer"},"hold_max_bytes":{"type":"integer"},"reorder_max":{"type":"integer"},"first":{"type":["integer","null"]},"last":{"type":["integer","null"]},"gap_max_ms":{"type":"integer"},"call_max_ms":{"type":"integer"},"final":{"type":"boolean"},"from":{"type":"integer"},"to":{"type":"integer"},"reason":{"type":"string","enum":["gone","budget","restart","end"]},"held_groups":{"type":"integer"},"held_bytes":{"type":"integer"},"group":{"type":"integer"},"cursor":{"type":"integer"},"attempts":{"type":"integer"},"down_ms":{"type":"integer"},"error":{"type":"string"}},"additionalProperties":false}"#;
 
 /// How long a hole in a track's group sequence is held open for the
 /// group that would fill it, and how much one track holds meanwhile.
@@ -196,6 +207,13 @@ pub struct Counters {
 	/// The first and last sequence delivered; null until one is.
 	first: Option<u64>,
 	last: Option<u64>,
+	/// Over the window since the last track row: the longest the session
+	/// lay undriven between two pulls, and the longest one pull lasted,
+	/// most of which is waiting for something to hand on. The session
+	/// runs only while a pull is on the executor, so the first is what a
+	/// host that stops calling costs the wire.
+	gap_max_ms: u64,
+	call_max_ms: u64,
 }
 
 /// What a held frame weighs against the hold's budget ([`HOLD_BYTES`]):
@@ -209,6 +227,27 @@ impl Weigh for Bytes {
 	fn weight(&self) -> u64 {
 		self.len() as u64
 	}
+}
+
+/// One group in the hold: the frames that have not gone out yet, and
+/// what is known about it so far.
+struct Held<F> {
+	/// Frames received and not yet handed on, in order.
+	frames: Vec<F>,
+	/// Frames received in all, those handed on included: where a second
+	/// copy of the group (a fetch's answer, or a new subscription's) takes
+	/// up from.
+	have: u64,
+	/// Whether the group's end has been read: nothing more of it is coming.
+	complete: bool,
+	/// Whether a decoder can start at this group, once a frame has said;
+	/// see [`Queue::push`].
+	decodable: Option<bool>,
+	/// The group was being read when its track was taken up again on a
+	/// new subscription, which may hand it over again from its first
+	/// frame, or may start past it. `Some(n)` counts the frames of that
+	/// second copy seen so far; the first `have` of them are already here.
+	again: Option<u64>,
 }
 
 /// One track's group sequence: what has arrived, what is held for the
@@ -225,9 +264,11 @@ pub struct Queue<F: Weigh = Bytes> {
 	/// the lowest sequence the relay hands over, or the first group a
 	/// decoder can start at.
 	start: crate::subscribe::Start,
-	/// Completed groups waiting for the one before them, and what they
-	/// weigh; see [`HOLD_BYTES`].
-	pending: BTreeMap<u64, Vec<F>>,
+	/// Groups waiting for the one before them, whole or still being read,
+	/// and what they weigh; see [`HOLD_BYTES`]. The group at the cursor
+	/// is here while it is being read, with the frames of it that have
+	/// not gone out yet.
+	pending: BTreeMap<u64, Held<F>>,
 	pending_bytes: u64,
 	/// The next group in sequence; None until the cursor is fixed.
 	cursor: Option<u64>,
@@ -251,6 +292,11 @@ pub struct Queue<F: Weigh = Bytes> {
 	/// usually hands the same group over later, which is a repeat
 	/// rather than a group that came too late to use.
 	fetched: BTreeSet<u64>,
+	/// Groups whose frames are let go as they arrive, until their end:
+	/// one that arrived below the cursor, one a live join stepped over,
+	/// a second copy of a group already here. Each was counted once, at
+	/// its first frame.
+	passing: BTreeSet<u64>,
 	/// Whether the track was taken up again on a fresh subscription,
 	/// which is a hole nothing will fill: the new subscription starts
 	/// at the live edge and the groups between are gone.
@@ -345,6 +391,7 @@ impl<F: Weigh> Queue<F> {
 			fetching: None,
 			gone: None,
 			fetched: BTreeSet::new(),
+			passing: BTreeSet::new(),
 			restarted: false,
 			counters: Counters::default(),
 			reported: None,
@@ -357,7 +404,8 @@ impl<F: Weigh> Queue<F> {
 		self.cursor
 	}
 
-	/// Files one group the relay handed over.
+	/// Files one group the relay handed over whole: a fetch's answer, or a
+	/// group read to its end before it was filed.
 	///
 	/// A group below the cursor cannot be filed: its place in the
 	/// sequence has passed, and what this module hands the host is
@@ -374,11 +422,126 @@ impl<F: Weigh> Queue<F> {
 	/// told, and it is told it because a live join has to land on such a
 	/// group. It is read at the join and ignored afterwards.
 	pub fn push(&mut self, sequence: u64, frames: Vec<F>, decodable: bool) {
+		self.arrive(sequence, frames, Some(decodable), true);
+	}
+
+	/// Files one frame of a group still being read, as it arrives; the
+	/// group's end is [`Self::end`]. Everything [`Self::push`] says of a
+	/// group holds of one that comes a frame at a time.
+	///
+	/// `decides` is whether a decoder can start at the group, when this
+	/// frame is the one that says (the first carrying a sample for the
+	/// track), and None when it says nothing; [`Self::deciding`] says
+	/// whether the group still needs telling. A group whose end comes
+	/// before any frame has said is one a decoder cannot start at.
+	pub fn frame(&mut self, sequence: u64, frame: F, decides: Option<bool>) {
+		self.arrive(sequence, vec![frame], decides, false);
+	}
+
+	/// The group of this sequence has been read to its end: nothing more
+	/// of it is coming, and the cursor can move past it once its frames
+	/// have gone out.
+	pub fn end(&mut self, sequence: u64) {
+		self.arrive(sequence, Vec::new(), None, true);
+	}
+
+	/// Whether a frame of this group should be asked whether a decoder can
+	/// start at the group: it is new here, or no frame of it has said yet.
+	pub fn deciding(&self, sequence: u64) -> bool {
+		!self.passing.contains(&sequence)
+			&& self
+				.pending
+				.get(&sequence)
+				.is_none_or(|held| held.decodable.is_none())
+	}
+
+	/// The track was taken up again on a fresh subscription, at the live
+	/// edge. A hole at the cursor is then a hole nothing will fill (see
+	/// [`Self::restarted`]). A group that was being read when the old
+	/// subscription broke may come again on the new one from its first
+	/// frame, and then the frames already here are passed over and the
+	/// rest are taken; or the new subscription starts past it, and the
+	/// group ends where it broke off once a newer group is here.
+	pub fn restart(&mut self) {
+		self.restarted = true;
+		self.passing.clear();
+		for held in self.pending.values_mut() {
+			if !held.complete {
+				held.again = Some(0);
+			}
+		}
+	}
+
+	/// Files frames of one group: all of it when `complete` and `frames`
+	/// are both given, its end alone when `frames` is empty, one frame of
+	/// it otherwise.
+	fn arrive(&mut self, sequence: u64, frames: Vec<F>, decides: Option<bool>, complete: bool) {
+		if self.passing.contains(&sequence) {
+			// The rest of a group already counted and let go.
+			if complete {
+				self.passing.remove(&sequence);
+			}
+			return;
+		}
 		let bytes: u64 = frames.iter().map(Weigh::weight).sum();
-		self.counters.received += 1;
 		self.counters.bytes += bytes;
+		let whole = complete && !frames.is_empty();
+		if let Some(held) = self.pending.get_mut(&sequence) {
+			if held.complete {
+				// The same group twice, which a resubscribe can do. The one
+				// already held is the one that goes out.
+				self.counters.received += 1;
+				self.counters.repeated += 1;
+				if !complete {
+					self.passing.insert(sequence);
+				}
+				return;
+			}
+			// More of a group still being read. A second copy of it from
+			// its first frame - a fetch's answer, or a new subscription's
+			// after a restart - passes over the frames already here.
+			let mut seen = match whole {
+				true => Some(0),
+				false => held.again,
+			};
+			if whole || (held.again == Some(0) && !frames.is_empty()) {
+				self.counters.received += 1;
+				self.counters.repeated += 1;
+			}
+			let mut fresh = 0;
+			for frame in frames {
+				if let Some(count) = seen.as_mut() {
+					*count += 1;
+					if *count <= held.have {
+						continue;
+					}
+				}
+				fresh += frame.weight();
+				held.have += 1;
+				held.frames.push(frame);
+			}
+			if !whole {
+				held.again = seen;
+			}
+			if held.decodable.is_none() {
+				held.decodable = decides;
+			}
+			if complete {
+				held.complete = true;
+				held.decodable.get_or_insert(false);
+			}
+			let decodable = held.decodable == Some(true);
+			self.pending_bytes += fresh;
+			self.note_join(sequence, decodable);
+			self.note_hold();
+			return;
+		}
+		self.counters.received += 1;
 		if let Some(next) = self.cursor {
 			if sequence < next {
+				if !complete {
+					self.passing.insert(sequence);
+				}
 				// A group a fetch already filled the hole with: the
 				// subscription hands it over too, in its own time.
 				if self.fetched.remove(&sequence) {
@@ -390,44 +553,59 @@ impl<F: Weigh> Queue<F> {
 				return;
 			}
 		}
-		if self.pending.contains_key(&sequence) {
-			// The same group twice, which a resubscribe can do. The one
-			// already held is the one that goes out.
-			self.counters.repeated += 1;
-			return;
-		}
 		if self.fetching == Some(sequence) {
-			// The answer to a fetch: remember it, so the subscription's
-			// own copy is read as the repeat it is. One per hole, and
-			// the oldest goes when there have been many.
+			// The answer to a fetch, or the subscription's own copy of the
+			// group the fetch is for: remember it, so the other one is read
+			// as the repeat it is. One per hole, and the oldest goes when
+			// there have been many.
 			self.fetching = None;
 			self.fetched.insert(sequence);
 			while self.fetched.len() > ROW_CAP as usize {
 				self.fetched.pop_first();
 			}
 		}
-		self.pending.insert(sequence, frames);
+		let decodable = match complete {
+			true => Some(decides.unwrap_or(false)),
+			false => decides,
+		};
+		self.pending.insert(
+			sequence,
+			Held {
+				have: frames.len() as u64,
+				frames,
+				complete,
+				decodable,
+				again: None,
+			},
+		);
 		self.pending_bytes += bytes;
-		if self.cursor.is_none() {
-			match self.start {
-				// A lower sequence than any yet: the relay is still handing
-				// over the older end of the backlog, so the join waits on.
-				crate::subscribe::Start::Backlog => {
-					if self.join_low.is_none_or(|(low, _)| sequence < low) {
-						self.join_low = Some((sequence, Instant::now()));
-					}
-				}
-				// The lowest group a decoder can start at. There is no
-				// waiting: the publisher serves a live subscription from its
-				// newest group, so nothing older is coming and the first
-				// group that can be started at is where this reader starts.
-				crate::subscribe::Start::Live => {
-					if decodable && self.join_ready.is_none_or(|low| sequence < low) {
-						self.join_ready = Some(sequence);
-					}
-				}
+		if self.cursor.is_none() && self.start == crate::subscribe::Start::Backlog {
+			// A lower sequence than any yet: the relay is still handing
+			// over the older end of the backlog, so the join waits on.
+			if self.join_low.is_none_or(|(low, _)| sequence < low) {
+				self.join_low = Some((sequence, Instant::now()));
 			}
 		}
+		self.note_join(sequence, decodable == Some(true));
+		self.note_hold();
+	}
+
+	/// A live join's cursor is the lowest group a decoder can start at.
+	/// There is no waiting: the publisher serves a live subscription from
+	/// its newest group, so nothing older is coming and the first group
+	/// that can be started at is where this reader starts.
+	fn note_join(&mut self, sequence: u64, decodable: bool) {
+		if decodable
+			&& self.cursor.is_none()
+			&& self.start == crate::subscribe::Start::Live
+			&& self.join_ready.is_none_or(|low| sequence < low)
+		{
+			self.join_ready = Some(sequence);
+		}
+	}
+
+	/// The deepest the hold has been, and the widest it has stretched.
+	fn note_hold(&mut self) {
 		self.counters.hold_max_groups = self
 			.counters
 			.hold_max_groups
@@ -442,7 +620,14 @@ impl<F: Weigh> Queue<F> {
 		}
 	}
 
-	/// The next group to hand on, or None while the hold is waiting.
+	/// The frames to hand on next, and the group they belong to, or None
+	/// while the hold is waiting.
+	///
+	/// The group at the cursor goes out as it arrives: each call hands on
+	/// the frames of it that have come in since the last, and the cursor
+	/// moves past it once its end has been read and its last frames are
+	/// handed on. So a group can come back in several takes, the last of
+	/// them perhaps with no frames at all.
 	///
 	/// `last` takes what is left whatever the sequence says: nothing
 	/// more is coming. A sequence pushed onto `ask` is one the relay is
@@ -546,26 +731,43 @@ impl<F: Weigh> Queue<F> {
 		if !ready {
 			return None;
 		}
-		let frames = self.pending.remove(&oldest).expect("just found");
+		let newer = self.pending.len() > 1;
+		let held = self.pending.get_mut(&oldest).expect("just found");
+		let frames = std::mem::take(&mut held.frames);
+		// A group that was being read when its track was taken up again,
+		// with a newer group already here: the new subscription started
+		// past it, and the rest of it is not coming.
+		let done = held.complete || last || (held.again.is_some() && newer);
 		self.pending_bytes -= frames.iter().map(Weigh::weight).sum::<u64>();
-		self.cursor = Some(oldest + 1);
 		self.join_low = None;
 		self.join_ready = None;
-		self.counters.delivered += 1;
 		self.counters.first.get_or_insert(oldest);
+		if !done {
+			// The group is still being read: what it has so far goes out,
+			// and the cursor stays on it.
+			self.cursor = Some(oldest);
+			return (!frames.is_empty()).then_some((oldest, frames));
+		}
+		self.pending.remove(&oldest);
+		self.cursor = Some(oldest + 1);
+		self.counters.delivered += 1;
 		self.counters.last = Some(oldest);
 		Some((oldest, frames))
 	}
 
 	/// Lets go of every held group below `low`, which is where a live
-	/// join fixes its cursor. Each one is counted and named.
+	/// join fixes its cursor. Each one is counted and named, and the rest
+	/// of one still being read is let go as it arrives.
 	fn step_over_to(&mut self, low: u64) {
 		while let Some((&oldest, _)) = self.pending.iter().next() {
 			if oldest >= low {
 				break;
 			}
-			let frames = self.pending.remove(&oldest).expect("just found");
-			self.pending_bytes -= frames.iter().map(Weigh::weight).sum::<u64>();
+			let held = self.pending.remove(&oldest).expect("just found");
+			self.pending_bytes -= held.frames.iter().map(Weigh::weight).sum::<u64>();
+			if !held.complete {
+				self.passing.insert(oldest);
+			}
 			self.counters.skipped_join += 1;
 			self.report_skipped(oldest, low);
 		}
@@ -591,6 +793,17 @@ impl<F: Weigh> Queue<F> {
 			counters: &self.counters,
 			last,
 		});
+		self.counters.gap_max_ms = 0;
+		self.counters.call_max_ms = 0;
+	}
+
+	/// One pull: how long the session lay undriven before it, when there
+	/// was one before it, and how long it lasted.
+	pub fn note_call(&mut self, gap: Option<Duration>, call: Duration) {
+		if let Some(gap) = gap {
+			self.counters.gap_max_ms = self.counters.gap_max_ms.max(gap.as_millis() as u64);
+		}
+		self.counters.call_max_ms = self.counters.call_max_ms.max(call.as_millis() as u64);
 	}
 
 	/// Whether this track's incident rows are still being spelled out;
@@ -878,5 +1091,210 @@ mod tests {
 		queue.push(3, group(3), false);
 		assert!(drain(&mut queue, patient(), false).is_empty());
 		assert_eq!(drain(&mut queue, patient(), true), vec![3]);
+	}
+
+	/// One frame of a group: its sequence and its index in it, as bytes,
+	/// so what comes out says which frame it is.
+	fn piece(sequence: u64, index: u8) -> Bytes {
+		Bytes::from(vec![sequence as u8, index])
+	}
+
+	/// Every frame the queue hands on now, as (sequence, index) pairs.
+	fn frames_out(queue: &mut Queue, hold: Hold, last: bool) -> Vec<(u8, u8)> {
+		let mut ask = Vec::new();
+		let mut out = Vec::new();
+		while let Some((_, frames)) = queue.take(hold, last, &mut ask) {
+			out.extend(frames.iter().map(|frame| (frame[0], frame[1])));
+		}
+		out
+	}
+
+	#[test]
+	fn the_group_at_the_cursor_goes_out_a_frame_at_a_time() {
+		// A GOP is a group, and a reader that waited for its end handed a
+		// GOP of pictures on at once. The group at the cursor goes out as
+		// it comes in, and the cursor moves past it at its end.
+		let mut queue = Queue::new("v0".into(), Start::Live);
+		queue.frame(5, piece(5, 0), Some(true));
+		assert_eq!(frames_out(&mut queue, patient(), false), vec![(5, 0)]);
+		assert_eq!(queue.cursor(), Some(5));
+		queue.frame(5, piece(5, 1), None);
+		queue.frame(5, piece(5, 2), None);
+		assert_eq!(
+			frames_out(&mut queue, patient(), false),
+			vec![(5, 1), (5, 2)]
+		);
+		// Nothing new, nothing out, and the cursor stays on the group.
+		assert!(frames_out(&mut queue, patient(), false).is_empty());
+		assert_eq!(queue.counters.delivered, 0);
+		queue.end(5);
+		assert!(frames_out(&mut queue, patient(), false).is_empty());
+		assert_eq!(queue.cursor(), Some(6));
+		assert_eq!(queue.counters.delivered, 1);
+		assert_eq!(queue.counters.received, 1);
+		queue.frame(6, piece(6, 0), Some(true));
+		assert_eq!(frames_out(&mut queue, patient(), false), vec![(6, 0)]);
+		assert_eq!(queue.counters.first, Some(5));
+	}
+
+	#[test]
+	fn a_group_behind_one_still_being_read_waits_for_it() {
+		// Only the group AT the cursor goes out early. One after it waits
+		// for its end, whole, as every group did before.
+		let mut queue = Queue::new("a0".into(), Start::Backlog);
+		queue.frame(0, piece(0, 0), Some(true));
+		assert_eq!(frames_out(&mut queue, now(), false), vec![(0, 0)]);
+		queue.push(1, vec![piece(1, 0), piece(1, 1)], true);
+		queue.frame(2, piece(2, 0), Some(true));
+		assert!(frames_out(&mut queue, now(), false).is_empty());
+		assert_eq!(
+			queue.counters.holes_opened, 0,
+			"a group being read is not a hole"
+		);
+		queue.frame(0, piece(0, 1), None);
+		queue.end(0);
+		assert_eq!(
+			frames_out(&mut queue, now(), false),
+			vec![(0, 1), (1, 0), (1, 1), (2, 0)]
+		);
+		assert_eq!(queue.cursor(), Some(2));
+		assert_eq!(queue.counters.delivered, 2);
+	}
+
+	#[test]
+	fn a_live_join_steps_over_a_group_it_cannot_start_in_as_it_arrives() {
+		// The first frame says whether a decoder can start at the group.
+		// One that cannot is stepped over once, and the rest of its frames
+		// are let go as they come rather than counted late one by one.
+		let mut queue = Queue::new("v0".into(), Start::Live);
+		queue.frame(70, piece(70, 0), Some(false));
+		assert!(frames_out(&mut queue, patient(), false).is_empty());
+		queue.frame(70, piece(70, 1), None);
+		queue.frame(71, piece(71, 0), Some(true));
+		assert_eq!(frames_out(&mut queue, patient(), false), vec![(71, 0)]);
+		assert!(
+			!queue.deciding(70),
+			"a group stepped over is not asked about"
+		);
+		queue.frame(70, piece(70, 2), None);
+		queue.end(70);
+		queue.frame(71, piece(71, 1), None);
+		assert_eq!(frames_out(&mut queue, patient(), false), vec![(71, 1)]);
+		assert_eq!(queue.counters.skipped_join, 1);
+		assert_eq!(queue.counters.dropped_late, 0);
+	}
+
+	#[test]
+	fn a_fragment_that_says_nothing_leaves_the_join_to_the_next_one() {
+		// A frame carrying no sample for the track says nothing about the
+		// group, so the join waits for one that does.
+		let mut queue = Queue::new("v0".into(), Start::Live);
+		queue.frame(3, piece(3, 0), None);
+		assert!(queue.deciding(3));
+		assert!(frames_out(&mut queue, patient(), false).is_empty());
+		queue.frame(3, piece(3, 1), Some(true));
+		assert!(!queue.deciding(3));
+		assert_eq!(
+			frames_out(&mut queue, patient(), false),
+			vec![(3, 0), (3, 1)]
+		);
+	}
+
+	#[test]
+	fn a_late_group_arriving_a_frame_at_a_time_is_counted_once() {
+		let mut queue = Queue::new("a0".into(), Start::Backlog);
+		queue.push(10, vec![piece(10, 0)], true);
+		assert_eq!(frames_out(&mut queue, now(), false), vec![(10, 0)]);
+		queue.frame(9, piece(9, 0), Some(true));
+		queue.frame(9, piece(9, 1), None);
+		queue.end(9);
+		assert_eq!(queue.counters.dropped_late, 1);
+		assert_eq!(queue.counters.received, 2);
+		assert!(frames_out(&mut queue, now(), false).is_empty());
+	}
+
+	#[test]
+	fn a_fetched_copy_of_a_group_being_read_adds_only_what_was_missing() {
+		// A hole the relay is asked about, whose group then starts to
+		// arrive on the subscription, and the fetch's whole copy after
+		// that: every frame goes out once, in order.
+		let mut queue = Queue::new("a0".into(), Start::Backlog);
+		queue.push(0, vec![piece(0, 0)], true);
+		assert_eq!(frames_out(&mut queue, now(), false), vec![(0, 0)]);
+		queue.push(2, vec![piece(2, 0)], true);
+		let mut ask = Vec::new();
+		assert!(queue.take(now(), false, &mut ask).is_none());
+		assert_eq!(ask, vec![1]);
+		queue.frame(1, piece(1, 0), Some(true));
+		assert_eq!(frames_out(&mut queue, now(), false), vec![(1, 0)]);
+		queue.push(1, vec![piece(1, 0), piece(1, 1), piece(1, 2)], true);
+		assert_eq!(
+			frames_out(&mut queue, now(), false),
+			vec![(1, 1), (1, 2), (2, 0)]
+		);
+		assert_eq!(queue.counters.holes_filled, 1);
+		assert_eq!(queue.counters.dropped_late, 0);
+		// The subscription's own copy goes on arriving, and is let go.
+		queue.frame(1, piece(1, 1), None);
+		queue.end(1);
+		assert!(frames_out(&mut queue, now(), false).is_empty());
+		assert_eq!(queue.counters.dropped_late, 0);
+	}
+
+	#[test]
+	fn a_group_a_restart_broke_off_is_taken_up_where_it_stopped() {
+		// The subscription broke mid-group and the new one at the live
+		// edge starts at that same group: the frames already handed on
+		// are passed over and the rest are taken.
+		let mut queue = Queue::new("v0".into(), Start::Live);
+		queue.frame(8, piece(8, 0), Some(true));
+		queue.frame(8, piece(8, 1), None);
+		assert_eq!(
+			frames_out(&mut queue, patient(), false),
+			vec![(8, 0), (8, 1)]
+		);
+		queue.restart();
+		queue.frame(8, piece(8, 0), Some(true));
+		queue.frame(8, piece(8, 1), None);
+		assert!(frames_out(&mut queue, patient(), false).is_empty());
+		queue.frame(8, piece(8, 2), None);
+		queue.end(8);
+		queue.frame(9, piece(9, 0), Some(true));
+		assert_eq!(
+			frames_out(&mut queue, patient(), false),
+			vec![(8, 2), (9, 0)]
+		);
+		assert_eq!(queue.counters.dropped_late, 0);
+		assert_eq!(queue.counters.repeated, 1);
+		assert_eq!(queue.counters.holes_opened, 0);
+	}
+
+	#[test]
+	fn a_group_a_restart_broke_off_ends_there_when_the_new_subscription_starts_past_it() {
+		let mut queue = Queue::new("v0".into(), Start::Live);
+		queue.frame(8, piece(8, 0), Some(true));
+		assert_eq!(frames_out(&mut queue, patient(), false), vec![(8, 0)]);
+		queue.restart();
+		// Nothing newer yet: the broken group may still come again.
+		assert!(frames_out(&mut queue, patient(), false).is_empty());
+		assert_eq!(queue.cursor(), Some(8));
+		queue.frame(11, piece(11, 0), Some(true));
+		assert_eq!(frames_out(&mut queue, patient(), false), vec![(11, 0)]);
+		assert_eq!(queue.counters.holes_abandoned_restart, 1);
+		assert_eq!(queue.counters.delivered, 1);
+		assert_eq!(queue.cursor(), Some(11));
+	}
+
+	#[test]
+	fn the_end_of_a_track_takes_a_group_still_being_read() {
+		let mut queue = Queue::new("a0".into(), Start::Live);
+		queue.frame(4, piece(4, 0), Some(true));
+		queue.frame(4, piece(4, 1), None);
+		assert_eq!(
+			frames_out(&mut queue, patient(), true),
+			vec![(4, 0), (4, 1)]
+		);
+		assert_eq!(queue.counters.delivered, 1);
+		assert!(frames_out(&mut queue, patient(), true).is_empty());
 	}
 }
