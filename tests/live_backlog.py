@@ -333,6 +333,10 @@ def judge(name: str, published: list[dict], reader: Tail, dest: Path,
     return True
 
 
+# The starved reader's hold: a megabyte, far under the backlog.
+STARVED_BYTES = 1 << 20
+
+
 def judge_starved(published: list[dict], reader: Tail, dest: Path) -> bool:
     """The reader whose hold was too small on purpose.
 
@@ -340,7 +344,9 @@ def judge_starved(published: list[dict], reader: Tail, dest: Path) -> bool:
     backlog. What it must not do is lose them quietly. Every hole given
     up on and every group that came too late has to be named in a row of
     its own, the counters have to account for every group received, and
-    what it did write has to still be in order.
+    what it did write has to still be in order. When the relay hands the
+    backlog over in order there is no hole to lose, and then it owes the
+    whole backlog and a hold that kept to its megabyte while it filled.
     """
     rows = reader.counters()
     tracks = [row for row in rows if row.get("kind") == "track" and row.get("final")]
@@ -364,10 +370,27 @@ def judge_starved(published: list[dict], reader: Tail, dest: Path) -> bool:
         )
     )
     failures = []
-    if not abandoned:
-        failures.append("a one megabyte hold gave nothing up, so it was not starved")
-    if not summary["holes_abandoned_budget"]:
-        failures.append("nothing was given up for the budget")
+    # Whether the relay handed the backlog over in order. moq-relay does,
+    # some runs, and then a hold of any size has no hole to give up: the
+    # cursor is fixed at group 0 once the budget is reached and every group
+    # after it follows. What such a run owes is the whole backlog, and a
+    # hold that never went over its budget while it took it in.
+    whole = (not abandoned and not int(summary["dropped_late"])
+             and int(summary["delivered"]) == len(published))
+    if whole:
+        held = int(summary["hold_max_bytes"])
+        # A hold is checked as each frame lands, so it ends at most one
+        # frame over; an audio frame is well under 64 KiB.
+        if held > STARVED_BYTES + (64 << 10):
+            failures.append(f"the backlog came in order and the hold held {held} bytes, "
+                            f"over its {STARVED_BYTES}")
+        print(f"starved: the relay handed the backlog over in order, so nothing was "
+              f"given up; the hold held at most {held} bytes")
+    else:
+        if not abandoned:
+            failures.append("a one megabyte hold gave nothing up, so it was not starved")
+        if not summary["holes_abandoned_budget"]:
+            failures.append("nothing was given up for the budget")
     if len(holes) != abandoned:
         failures.append(f"{abandoned} holes abandoned and {len(holes)} named")
     if len(late) != int(summary["dropped_late"]):
@@ -456,7 +479,7 @@ def one_run(args: argparse.Namespace) -> None:
         if args.starve and not args.plain:
             starved = start_reader(subscribe_query, port, cert_hex,
                                    work / "starved.mkv", "starved",
-                                   {**hold, "hold_mib": 1})
+                                   {**hold, "hold_mib": STARVED_BYTES >> 20})
             readers.append(starved)
             print(f"starved reader pid {starved.child.pid}", flush=True)
 

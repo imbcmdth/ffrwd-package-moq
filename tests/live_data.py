@@ -30,9 +30,9 @@ What it owes:
     which), with no hole, late group or skip on the reader's data track;
   - every message leaves the subscriber no later than the first video
     packet whose pts is at or past the message's own, give or take
-    `LEAD_SLACK`: every track now leaves in one NUT, which the host
-    interleaves by timestamp, so at an equal pts the picture can be written
-    a moment first.
+    `LEAD_SLACK` (100 ms): the publisher's host hands a message in after
+    the picture of the same pts, and the picture is no longer held for its
+    group at the reader.
 
 `--fixture pairs` publishes `tests/data/pairs.nut` instead (its source is
 `pairs.txt`): 81 messages of about 1.2 KB, in pairs at one pts every 2.5
@@ -102,9 +102,13 @@ MEND_DEADLINE = 90.0
 BUILD_DEADLINE = 1800
 TOOL_DEADLINE = 120
 DATA = PACKAGE / "tests" / "data"
-# How far a message may come out behind the picture of its pts, in seconds,
-# and still have left with it; see the check.
-LEAD_SLACK = 0.005
+# How far a message may come out behind the picture of its own pts, in
+# seconds. The publisher's host hands a message to publish on its clock's
+# next tick after the picture of the same pts, and since 0.9.2 the picture
+# is no longer held at the reader for its group, so the message can trail
+# it by that much: 15 to 48 ms measured at 30 fps. Before, the margin the
+# other way was the GOP the picture waited.
+LEAD_SLACK = 0.1
 # What the sidecar writes on a data edge that has nothing to say.
 HEARTBEAT = b" "
 
@@ -648,10 +652,8 @@ def one_run(args: argparse.Namespace) -> None:
             print(f"  message {position} pts {packet['pts_time']:9.6f}s  picture pts "
                   f"{beside['pts_time']:9.6f}s  message out {at - started:7.3f}s  picture "
                   f"out {then - started:7.3f}s  lead {lead * 1000:7.1f} ms", flush=True)
-            # Every track now leaves in one NUT, which the host interleaves
-            # by timestamp, so at an equal pts the picture can be written a
-            # moment ahead of the message: that is the muxer's order, not a
-            # message held behind its media, which is seconds.
+            # See LEAD_SLACK: a message trails the picture of its own pts by
+            # the publisher's own lag, and is never held behind its media.
             if lead < -LEAD_SLACK:
                 problems.append(f"message {position} at {packet['pts_time']:.6f}s came out "
                                 f"{-lead * 1000:.1f} ms after the picture at "
