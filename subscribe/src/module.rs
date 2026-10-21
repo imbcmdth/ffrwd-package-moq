@@ -715,9 +715,17 @@ impl Reader {
 		let mut pads: Vec<Vec<Packet>> = (0..self.renditions.len()).map(|_| Vec::new()).collect();
 		// What the wire brought while the host had the call.
 		tokio::task::yield_now().await;
+		let mut produced = false;
 		loop {
 			while let Ok(wire) = self.frames.try_recv() {
 				self.hold(wire)?;
+				// A burst can bring more than a track's hold may keep, a
+				// backlog hundreds of groups deep in one go. The budget is
+				// held to as it fills, not once the burst is in.
+				let hold = self.hold;
+				if self.renditions.iter().any(|rendition| rendition.queue.full(hold)) {
+					produced |= self.release(&mut pads, false)?;
+				}
 			}
 			// The session ended under the tracks, or one of them could not
 			// be taken up again on it: open a new one before anything else.
@@ -733,7 +741,7 @@ impl Reader {
 				self.reconnect(why).await?;
 				continue;
 			}
-			let produced = self.release(&mut pads, self.over())?;
+			produced |= self.release(&mut pads, self.over())?;
 			self.ask();
 			self.report();
 			if produced {

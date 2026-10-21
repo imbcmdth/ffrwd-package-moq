@@ -404,6 +404,12 @@ impl<F: Weigh> Queue<F> {
 		self.cursor
 	}
 
+	/// Whether the hold is at its budget: what arrives next would take it
+	/// over (see [`HOLD_BYTES`]).
+	pub fn full(&self, hold: Hold) -> bool {
+		self.pending_bytes >= hold.bytes
+	}
+
 	/// Files one group the relay handed over whole: a fetch's answer, or a
 	/// group read to its end before it was filed.
 	///
