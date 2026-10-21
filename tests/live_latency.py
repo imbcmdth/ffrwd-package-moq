@@ -67,6 +67,7 @@ from common import (
     free_udp_port,
     guest,
     kill_tree,
+    node_shape,
     run,
     spawn,
     start_relay,
@@ -241,7 +242,15 @@ def one_run(args: argparse.Namespace) -> dict:
                           "-v", f"source={source}")
         publisher = Tail(spawn(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, env=env, cwd=PACKAGE))
-        time.sleep(3.0)
+        # The reader goes up once the broadcast is on the relay: a reader
+        # that waits for it inside the run is a stage the host sees idle,
+        # and the host stops a stage idle for 30 s.
+        params = {"relay": f"moqt://127.0.0.1:{port}", "broadcast": BROADCAST,
+                  "cert": cert_hex}
+        until = time.monotonic() + 120
+        while node_shape(guest("subscribe"), params, strict=False) is None:
+            if publisher.child.poll() is not None or time.monotonic() > until:
+                sys.exit(f"the broadcast never came up:\n{publisher.text()[1][-1500:]}")
 
         pipe = TimedPipe(f"latency-{args.fps}", work / "video.nut")
         read_query = work / "subscribe.sql"
