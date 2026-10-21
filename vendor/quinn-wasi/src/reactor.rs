@@ -15,6 +15,7 @@
 //! the socket drains it.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::Waker;
 use std::time::Duration;
@@ -22,6 +23,23 @@ use std::time::Duration;
 use wasi::io::poll::Pollable;
 
 const SWEEP: Duration = Duration::from_millis(1);
+
+/// Whether the reactor waits for an armed socket inside `wasi:io/poll`
+/// rather than sleeping between sweeps; see [`park_in_poll`].
+static PARK_IN_POLL: AtomicBool = AtomicBool::new(false);
+
+/// Has the reactor, with sockets armed and none of them ready, wait in
+/// `wasi:io/poll.poll` on those sockets and a clock of one sweep, after
+/// letting every other runnable task go first, instead of sleeping a
+/// sweep through `tokio::time`. A datagram is then seen the moment the
+/// host sees it rather than at the next sweep, which matters where the
+/// host's timer is coarse: under wasmtime on Windows a one millisecond
+/// sleep lasts about 15.6 ms. The cost is that a tokio timer due within
+/// that sweep fires when the wait ends, at most one sweep late, where
+/// before the runtime parked until it exactly. Off by default.
+pub fn park_in_poll(on: bool) {
+    PARK_IN_POLL.store(on, Ordering::Relaxed);
+}
 
 /// Names one registered pollable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,12 +142,35 @@ impl Reactor {
                 // Let the woken tasks run (and likely re-arm) before the
                 // next sweep.
                 tokio::task::yield_now().await;
+            } else if any_armed && PARK_IN_POLL.load(Ordering::Relaxed) {
+                // Every other runnable task, and tokio's expired timers,
+                // first: the wait below blocks the thread.
+                tokio::task::yield_now().await;
+                self.wait(SWEEP);
             } else if any_armed {
                 tokio::time::sleep(SWEEP).await;
             } else {
                 self.armed.notified().await;
             }
         }
+    }
+}
+
+impl Reactor {
+    /// Blocks until an armed pollable is ready or `longest` has passed.
+    fn wait(&self, longest: Duration) {
+        let state = self.state.lock().unwrap();
+        let clock = wasi::clocks::monotonic_clock::subscribe_duration(
+            u64::try_from(longest.as_nanos()).unwrap_or(u64::MAX),
+        );
+        let mut waiting: Vec<&Pollable> = state
+            .entries
+            .values()
+            .filter(|entry| !entry.wakers.is_empty())
+            .map(|entry| &entry.pollable)
+            .collect();
+        waiting.push(&clock);
+        let _ = wasi::io::poll::poll(&waiting);
     }
 }
 

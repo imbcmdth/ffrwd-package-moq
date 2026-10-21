@@ -139,3 +139,31 @@ pub async fn connect(
 		driver,
 	})
 }
+
+/// How long a one millisecond sleep may take before the host's timer
+/// counts as coarse; see [`park_if_coarse`].
+const COARSE: Duration = Duration::from_millis(4);
+
+/// Measures the host's timer and, where it is coarse, has the socket
+/// reactor under every session of this instance wait for a datagram
+/// inside `wasi:io/poll` instead of sleeping between sweeps (see
+/// [`quinn_wasi::reactor::park_in_poll`]). Returns the median of three one
+/// millisecond sleeps, and whether the reactor now waits in poll.
+///
+/// The reactor sweeps the sockets once a millisecond, and a datagram that
+/// lands between sweeps waits for the next one. Under wasmtime on Windows
+/// a one millisecond sleep lasts about 15.6 ms, so each frame a reader
+/// took off the wire waited 8 ms on average for its sweep, and up to
+/// 15.6. Where a sleep lasts what it asks for (Linux) nothing changes.
+pub async fn park_if_coarse() -> (Duration, bool) {
+	let mut took = Vec::with_capacity(3);
+	for _ in 0..3 {
+		let began = std::time::Instant::now();
+		tokio::time::sleep(Duration::from_millis(1)).await;
+		took.push(began.elapsed());
+	}
+	took.sort();
+	let coarse = took[1] > COARSE;
+	quinn_wasi::reactor::park_in_poll(coarse);
+	(took[1], coarse)
+}

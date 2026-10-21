@@ -184,6 +184,19 @@ fn enter<T>(work: impl std::future::Future<Output = T>) -> Result<T, String> {
 	EXECUTOR.with(|cell| {
 		if cell.get().is_none() {
 			let _ = cell.set(Executor::new()?);
+			// Where the host's timer is coarse, a frame would wait for the
+			// socket reactor's next sweep; see `park_if_coarse`.
+			let (sleep, coarse) = cell
+				.get()
+				.expect("just set")
+				.enter(moq_core::wasi::park_if_coarse());
+			if coarse {
+				eprintln!(
+					"subscribe: a 1 ms sleep lasts {:.1} ms here, so the socket reactor waits \
+					 in wasi:io/poll",
+					sleep.as_secs_f64() * 1000.0
+				);
+			}
 		}
 		Ok(cell.get().expect("just set").enter(work))
 	})
