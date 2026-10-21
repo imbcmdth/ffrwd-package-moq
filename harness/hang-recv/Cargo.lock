@@ -939,10 +939,12 @@ name = "hang-recv"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "hang",
  "moq-mux",
  "moq-native",
  "moq-net",
+ "serde_json",
  "tokio",
  "url",
 ]
