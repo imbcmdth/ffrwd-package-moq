@@ -4,8 +4,8 @@
 
 Publish a ladder to a local relay, then read it back: subscribe.wasm
 opens the broadcast, reads catalog.json, subscribes to every rendition
-and demuxes each fmp4 fragment to the packets it was built from, one
-`-f nut` output per catalog track. Every rung must come back at its own
+and demuxes each fmp4 fragment to the packets it was built from, every
+catalog track a stream of one NUT, split into a file per track afterwards. Every rung must come back at its own
 geometry, the audio at its own rate, and each track's packet count must
 agree with what sub-recv reassembled off the same broadcast.
 
@@ -49,7 +49,9 @@ from common import (
     kill_tree,
     run,
     spawn,
+    split_streams,
     start_relay,
+    start_subscribe_node,
     start_subscriber,
     wait_subscriber,
 )
@@ -85,41 +87,36 @@ def make_source(path: Path) -> None:
 
 def start_source(
     module: Path, port: int, cert_hex: str, broadcast: str, outputs: list[Path]
-) -> subprocess.Popen:
-    """subscribe.wasm under the sidecar: one nut output per catalog track.
+):
+    """subscribe.wasm under the sidecar, every catalog track into one NUT
+    that `wait_source` splits into `outputs`, a file per track.
 
-    The grants are the ones the compiler's own run path writes; only its
-    probe leaves them off. So is `-track`: an output of a packet source
-    says which track of the module's catalog it carries, 0-based and in
-    catalog order, and what the outputs name is what the source
-    subscribes to.
+    It goes up once the publisher has: its ports are the catalog's, which
+    the shape reads off the relay. It asks for the backlog, so it reads the
+    broadcast from its first group, as the readers beside it do.
     """
-    params = json.dumps({
+    params = {
         "relay": f"moqt://127.0.0.1:{port}",
         "broadcast": broadcast,
         "cert": cert_hex,
         "token": "",
-    })
-    argv = [str(SIDECAR), "-udp", str(module), "-http", str(module),
-            "-m", str(module), "-params", params]
-    for track, path in enumerate(outputs):
-        argv += ["-track", str(track), "-f", "nut", str(path)]
-    print("+", " ".join(argv[:6]), "...", flush=True)
-    return spawn(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        "start": "backlog",
+    }
+    nut = outputs[0].parent / f"{outputs[0].stem}-all.nut"
+    reader, _ = start_subscribe_node(module, params, nut, "module")
+    reader.split = (nut, outputs)
+    return reader
 
 
-def wait_source(reader: subprocess.Popen, deadline: int) -> None:
-    try:
-        stdout, stderr = reader.communicate(timeout=deadline)
-    except subprocess.TimeoutExpired:
-        kill_tree(reader)
-        stdout, stderr = reader.communicate()
-        sys.exit(f"the subscribe module did not finish:\n{stdout}\n{stderr[-1200:]}")
+def wait_source(reader, deadline: int) -> None:
+    code = reader.finish(deadline)
+    _, stderr = reader.text()
     if stderr.strip():
         print("--- subscribe stderr ---")
         print(stderr[-1200:])
-    if reader.returncode != 0:
+    if code != 0:
         sys.exit(f"the subscribe module failed: {stderr[-800:]}")
+    split_streams(*reader.split)
 
 
 def start_publish(recipe: str, port: int, cert_hex: str, broadcast: str,
@@ -249,12 +246,13 @@ def one_run(rungs: int, keep: bool) -> None:
                              rendition=index, output=f"recv{index}.mp4")
             for index in range(tracks)
         ]
-        # Every reader goes up before the publisher, waiting for the
+        # The sub-recv readers go up before the publisher, waiting for the
         # broadcast to be announced: the module publishing holds its
         # first media until something has asked for a rendition, and a
-        # reader that arrives after that starts wherever it lands.
-        module = start_source(guest("subscribe"), port, cert_hex, BROADCAST, nuts)
-        readers.append(module)
+        # reader that arrives after that starts wherever it lands. The
+        # subscribe module follows the publisher, since its shape reads the
+        # catalog off the relay, and asks for the backlog to start where
+        # they do.
         publisher = start_publish(
             "publish-ladder.sql", port, cert_hex, BROADCAST,
             ["-v", f"source={source}", "-v", f"rungs={rungs}",
@@ -262,9 +260,11 @@ def one_run(rungs: int, keep: bool) -> None:
              "-v", "bitrates=" + ",".join(BITRATES[:rungs])],
         )
         readers.append(publisher)
+        module = start_source(guest("subscribe"), port, cert_hex, BROADCAST, nuts)
+        readers.append(module.child)
         rows = wait_publish(publisher, RUN_DEADLINE)
         readers.remove(publisher)
-        readers.remove(module)
+        readers.remove(module.child)
         wait_source(module, READER_DEADLINE)
         transcripts = [wait_subscriber(reader, READER_DEADLINE) for reader in readers]
         readers = []
@@ -345,9 +345,9 @@ def chain(rung: Path, port: int, cert_hex: str, out: Path) -> None:
     made of are run one after the other here instead.
     """
     copy = out / "copy.nut"
-    reader = start_source(guest("subscribe"), port, cert_hex, COPY, [copy])
     publisher = start_publish("publish.sql", port, cert_hex, COPY,
                               ["-v", f"source={rung}"])
+    reader = start_source(guest("subscribe"), port, cert_hex, COPY, [copy])
     rows = wait_publish(publisher, RUN_DEADLINE)
     wait_source(reader, READER_DEADLINE)
     assert [row for row in rows if "tracks" in row], "the copy published no summary"

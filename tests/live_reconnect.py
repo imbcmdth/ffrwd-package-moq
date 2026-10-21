@@ -11,7 +11,8 @@ for as long as `reconnect_s` allows (60s by default).
 
 The shape of a run: a local moq-relay, a PACED publisher (one rung and its
 audio, a row per published group), and the subscribe module under the
-sidecar reading both tracks to .nut files on one session. After `--warmup`
+sidecar reading both tracks on one session into one NUT, split into a .nut
+file per track afterwards. After `--warmup`
 seconds of media the relay is killed - a process gone, which says nothing
 to either side, so each finds out from the QUIC idle timeout - and after
 `--down` seconds it is started again on the same port. Then the run goes on
@@ -55,7 +56,9 @@ from common import (
     kill_tree,
     run,
     spawn,
+    split_streams,
     start_relay,
+    start_subscribe_node,
 )
 
 BROADCAST = "live/reconnect"
@@ -107,22 +110,19 @@ def start_publisher(query: Path, source: Path, port: int, cert_hex: str) -> Tail
                       text=True, env=env, cwd=PACKAGE))
 
 
-def start_reader(port: int, cert_hex: str, outputs: list[Path]) -> Tail:
-    module = guest("subscribe")
-    params = json.dumps({
+def start_reader(port: int, cert_hex: str, nut: Path) -> Tail:
+    """The subscribe module under the sidecar, every track of the catalog
+    into one NUT; see `common.start_subscribe_node`."""
+    params = {
         "relay": f"moqt://127.0.0.1:{port}",
         "broadcast": BROADCAST,
         "cert": cert_hex,
         "token": "",
         "start": "live",
         "reconnect_s": 60,
-    })
-    argv = [str(SIDECAR), "-udp", str(module), "-http", str(module),
-            "-m", str(module), "-params", params]
-    for track, path in enumerate(outputs):
-        argv += ["-track", str(track), "-f", "nut", str(path)]
-    print("+ reader:", " ".join(argv[:6]), "...", flush=True)
-    return Tail(spawn(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+    }
+    reader, _ = start_subscribe_node(guest("subscribe"), params, nut, "reconnect")
+    return reader
 
 
 def media_clock(publisher: Tail) -> float:
@@ -226,7 +226,7 @@ def one_run(args: argparse.Namespace) -> None:
 
         publisher = start_publisher(query, source, port, cert_hex)
         outputs = [work / "video.nut", work / "audio.nut"]
-        reader = start_reader(port, cert_hex, outputs)
+        reader = start_reader(port, cert_hex, work / "read.nut")
 
         wait_until(lambda: media_clock(publisher) >= args.warmup, args.seconds + 60,
                    "warming up", publisher, reader)
@@ -265,6 +265,7 @@ def one_run(args: argparse.Namespace) -> None:
             if row.get("kind") == "reconnect":
                 print("reader row:", json.dumps(row))
 
+        split_streams(work / "read.nut", outputs)
         problems = []
         if published != 0:
             problems.append(f"the publisher exited {published}")

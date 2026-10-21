@@ -9,6 +9,12 @@ the output pipes, and a harness that then waits for pipe EOF waits forever.
 what a loop needs when it has to know what the publisher has published before
 it decides when to attach a reader.
 
+`start_subscribe_node` runs the subscribe module under the sidecar the way
+ffrwd 0.29 runs a node: one instance, its ports named after the catalog's
+tracks and written as the streams of one NUT, and its rows as NDJSON on its
+stdout, which `Tail.counters` reads. `split_streams` gives a loop written for
+a file per track its files back.
+
 Toolchain overrides: WASMTIME, MOQ_RELAY, WASI_SDK_PATH (or CC_wasm32_wasip2
 directly), FFRWD_WASM for the sidecar binary, FFRWD_CLI for an installed
 ffrwd, FFRWD_REPO for the checkout holding the compiler and the sidecar.
@@ -18,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -136,6 +143,10 @@ def run(argv: list[str], deadline: int, **kwargs) -> subprocess.CompletedProcess
     return subprocess.CompletedProcess(argv, child.returncode, stdout, stderr)
 
 
+# What a subscribe row's `kind` is; see moq_core::order::ROWS_SCHEMA.
+SUBSCRIBE_ROWS = ("track", "hole", "late", "skipped", "reconnect")
+
+
 class Tail:
     """A child's stdout and stderr drained as they come, kept whole.
 
@@ -200,8 +211,11 @@ class Tail:
         return mine + "".join(path.read_text(errors="replace") for path in members)
 
     def counters(self) -> list[dict]:
-        """The subscribe module's own rows, off its stderr."""
-        out = []
+        """The subscribe module's own rows: the node's rows, which ffrwd 0.29
+        writes as the run's on its stdout, and before it a packet source's
+        lines on its stderr."""
+        with self.lock:
+            out = [row for row in self.rows if row.get("kind") in SUBSCRIBE_ROWS]
         for line in self.module_stderr().splitlines():
             marker = line.find("subscribe: row ")
             if marker >= 0:
@@ -223,6 +237,75 @@ class Tail:
         for thread in self.threads:
             thread.join(timeout=30)
         return self.child.returncode
+
+
+def node_shape(module: Path, params: dict, deadline: int = 120,
+               strict: bool = True) -> dict | None:
+    """What a node module says it is for `params`, as the sidecar reports it
+    to the compiler: its outputs, each with its port name, in order. A shape
+    that fails stops the loop, or with `strict` off is None."""
+    done = run([SIDECAR, "--shape", module, "-udp", module, "-http", module,
+                "-params", json.dumps(params)], deadline, capture_output=True, text=True)
+    if done.returncode != 0:
+        if not strict:
+            return None
+        sys.exit(f"the shape failed:\n{done.stderr[-1500:]}")
+    return json.loads(done.stdout.strip().splitlines()[-1])
+
+
+def filter_value(value: object) -> str:
+    """One node parameter as a `-filter_complex` string carries it: ffmpeg's
+    option escaping, then its filtergraph escaping on top, which is how the
+    CLI writes them."""
+    text = str(value)
+    if text == "":
+        return "''"
+    for plain, escaped in (("\\", "\\\\"), ("'", "\\'"), (":", "\\:"), ("=", "\\=")):
+        text = text.replace(plain, escaped)
+    return re.sub(r"([\\'\[\],;#\s])", r"\\\1", text)
+
+
+def start_node_reader(module: Path, params: dict, ports: list[str], nut: object,
+                      label: str) -> Tail:
+    """The subscribe module under the sidecar as ffrwd 0.29 runs a node: ONE
+    instance, one session, the named output ports written as the streams of
+    one NUT in the order given, and the node's rows as NDJSON on stdout. Its
+    stderr stays on a pipe, so the moment it subscribes is visible."""
+    network = "subscribe=" + ":".join(
+        f"{key}={filter_value(value)}" for key, value in params.items()
+    )
+    network += "".join(f"[{port}=out{index}]" for index, port in enumerate(ports))
+    network += f"[@rows=out{len(ports)}]"
+    argv = [str(SIDECAR), "-http", str(module), "-udp", str(module),
+            "-m", f"subscribe={module}", "-filter_complex", network,
+            "-bound", "subscribe=[]"]
+    for index in range(len(ports)):
+        argv += ["-map", f"[out{index}]"]
+    argv += ["-f", "nut", str(nut), "-map", f"[out{len(ports)}]", "-f", "ndjson", "pipe:1"]
+    print(f"+ reader {label}: {SIDECAR.name} -m subscribe {' '.join(ports)}", flush=True)
+    return Tail(spawn(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+
+
+def start_subscribe_node(module: Path, params: dict, nut: object, label: str,
+                         ports: list[str] | None = None) -> tuple[Tail, list[str]]:
+    """`start_node_reader` over the ports the module's shape names, every one
+    of them unless `ports` says which. The shape reads the catalog, so the
+    broadcast has to be announced, or about to be: the shape waits for it."""
+    named = [output["name"] for output in node_shape(module, params)["outputs"]]
+    chosen = named if ports is None else [port for port in named if port in ports]
+    return start_node_reader(module, params, chosen, nut, label), chosen
+
+
+def split_streams(nut: Path, outputs: list[Path], deadline: int = 120) -> None:
+    """A node reader's one NUT, a file per stream: stream `i` into
+    `outputs[i]`, copied, so a loop written for a file per track reads them
+    as it always did."""
+    for index, path in enumerate(outputs):
+        done = run(["ffmpeg", "-v", "error", "-y", "-i", str(nut), "-map", f"0:{index}",
+                    "-c", "copy", "-f", "nut", str(path)],
+                   deadline, capture_output=True, text=True)
+        if done.returncode != 0:
+            sys.exit(f"splitting stream {index} out of {nut}:\n{done.stderr[-800:]}")
 
 
 def free_udp_port() -> int:

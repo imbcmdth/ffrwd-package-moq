@@ -78,7 +78,9 @@ from common import (
     kill_tree,
     run,
     spawn,
+    split_streams,
     start_relay,
+    start_subscribe_node,
 )
 
 SECONDS = 110
@@ -238,20 +240,19 @@ def start_session_reader(module: Path, port: int, cert_hex: str,
     pipe rather than through the CLI, so the moment it subscribes is
     visible from here.
     """
-    params = json.dumps({
+    params = {
         "relay": f"moqt://127.0.0.1:{port}",
         "broadcast": BROADCAST,
         "cert": cert_hex,
         "token": "",
         "start": "live",
-    })
-    argv = [str(SIDECAR), "-udp", str(module), "-http", str(module),
-            "-m", str(module), "-params", params]
-    for track, path in enumerate(outputs):
-        argv += ["-track", str(track), "-f", "nut", str(path)]
-    print(f"+ reader {label}:", " ".join(argv[:6]), "...", flush=True)
-    return Tail(spawn(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                      text=True))
+    }
+    # One NUT carries every track, split into `outputs` once the run is
+    # over (`split`).
+    nut = outputs[0].parent / f"{label}-all.nut"
+    reader, _ = start_subscribe_node(module, params, nut, label)
+    reader.split = (nut, outputs)
+    return reader
 
 
 def newest_groups(publisher: Tail) -> dict[str, int]:
@@ -601,6 +602,8 @@ def one_run(args: argparse.Namespace) -> None:
                 print(reader.module_stderr()[-3000:])
                 sys.exit(f"the {name} reader failed ({code})")
         readers = []
+        for reader in (watch, edge):
+            split_streams(*reader.split)
 
         print()
         failures = []

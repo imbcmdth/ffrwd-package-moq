@@ -17,9 +17,8 @@ seconds, two sharing a pts, one off the millisecond grid and outside ASCII,
 one whose bytes are not their JSON's canonical spelling; `messages.txt` is
 its source, which ffrwd-nut's `json_nut` example turns into the .nut), and
 the subscribe module under the sidecar reading the video, the audio and the
-data track to .nut files on one session. The video and the data leave the
-sidecar through pipes this loop reads as they arrive, so each packet's
-arrival is timed.
+data track on one session, into one NUT that leaves the sidecar through a
+pipe this loop reads as it arrives, so each packet's arrival is timed.
 
 What it owes:
 
@@ -30,7 +29,10 @@ What it owes:
     order, at the pts the publisher published it at (its `groups` rows say
     which), with no hole, late group or skip on the reader's data track;
   - every message leaves the subscriber no later than the first video
-    packet whose pts is at or past the message's own.
+    packet whose pts is at or past the message's own, give or take
+    `LEAD_SLACK`: every track now leaves in one NUT, which the host
+    interleaves by timestamp, so at an equal pts the picture can be written
+    a moment first.
 
 `--fixture pairs` publishes `tests/data/pairs.nut` instead (its source is
 `pairs.txt`): 81 messages of about 1.2 KB, in pairs at one pts every 2.5
@@ -81,8 +83,10 @@ from common import (
     guest,
     kill_tree,
     run,
+    node_shape,
     spawn,
     start_relay,
+    start_subscribe_node,
 )
 
 BROADCAST = "live/data"
@@ -98,6 +102,9 @@ MEND_DEADLINE = 90.0
 BUILD_DEADLINE = 1800
 TOOL_DEADLINE = 120
 DATA = PACKAGE / "tests" / "data"
+# How far a message may come out behind the picture of its pts, in seconds,
+# and still have left with it; see the check.
+LEAD_SLACK = 0.005
 # What the sidecar writes on a data edge that has nothing to say.
 HEARTBEAT = b" "
 
@@ -268,14 +275,18 @@ TRACKS = {"video": 0, "audio": 1, "data": 2}
 
 
 def probe(port: int, cert_hex: str) -> dict:
-    """The catalog as the sidecar reports it at compile time."""
-    module = guest("subscribe")
-    done = run([SIDECAR, "--probe", module, "-udp", module, "-http", module,
-                "-params", reader_params(port, cert_hex)],
-               TOOL_DEADLINE, capture_output=True, text=True)
-    if done.returncode != 0:
-        sys.exit(f"the probe failed:\n{done.stderr[-1500:]}")
-    return json.loads(done.stdout.strip().splitlines()[-1])
+    """The catalog as the sidecar reports it at compile time: the node's
+    shape, a track per output with its kind, codec, time base and row."""
+    shape = node_shape(guest("subscribe"), json.loads(reader_params(port, cert_hex)))
+    tracks = []
+    for output in shape.get("outputs", []):
+        coded = output.get("format") or {}
+        kind = "data" if output.get("kind") == "data" else (coded.get("format") or {}).get("kind")
+        base = output.get("time_base") or {}
+        tracks.append({"kind": kind, "codec": coded.get("codec"),
+                       "time_base": [base.get("num"), base.get("den")],
+                       "row": output.get("row")})
+    return {"tracks": tracks}
 
 
 def compile_subscriber(port: int, cert_hex: str, out: Path, query: Path) -> str:
@@ -294,14 +305,12 @@ def compile_subscriber(port: int, cert_hex: str, out: Path, query: Path) -> str:
     return done.stdout
 
 
-def start_reader(port: int, cert_hex: str, outputs: list[tuple[int, str]]) -> Tail:
-    module = guest("subscribe")
-    argv = [str(SIDECAR), "-udp", str(module), "-http", str(module),
-            "-m", str(module), "-params", reader_params(port, cert_hex)]
-    for track, spelling in outputs:
-        argv += ["-track", str(track), "-f", "nut", spelling]
-    print("+ reader:", " ".join(argv[:6]), "...", flush=True)
-    return Tail(spawn(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+def start_reader(port: int, cert_hex: str, nut: str) -> Tail:
+    """The subscribe module under the sidecar, every catalog track into one
+    NUT, the streams in `TRACKS` order; see `common.start_subscribe_node`."""
+    reader, _ = start_subscribe_node(guest("subscribe"), json.loads(reader_params(port, cert_hex)),
+                                     nut, "data")
+    return reader
 
 
 def hexdump_bytes(dump: str) -> bytes:
@@ -316,9 +325,9 @@ def hexdump_bytes(dump: str) -> bytes:
     return bytes(out)
 
 
-def packets(path: Path, data: bool) -> list[dict]:
+def packets(path: Path, data: bool, stream: int = 0) -> list[dict]:
     entries = "packet=pts,pts_time,pos,size,flags" + (",data" if data else "")
-    argv = ["ffprobe", "-v", "error", "-select_streams", "0",
+    argv = ["ffprobe", "-v", "error", "-select_streams", str(stream),
             "-show_entries", entries, "-of", "json"]
     if data:
         argv.append("-show_data")
@@ -448,13 +457,9 @@ def one_run(args: argparse.Namespace) -> None:
         # does: it waits for the broadcast, and it has to be subscribed
         # before the first message goes out, since a live join starts at
         # the newest group.
-        video = TimedPipe("video", work / "video.nut")
-        data = TimedPipe("data", work / "data.nut")
-        reader = start_reader(port, cert_hex, [
-            (TRACKS["video"], video.spelling),
-            (TRACKS["audio"], str(work / "audio.nut")),
-            (TRACKS["data"], data.spelling),
-        ])
+        # Every track rides one NUT, timed as it arrives.
+        video = data = TimedPipe("read", work / "read.nut")
+        reader = start_reader(port, cert_hex, video.spelling)
 
         # While the broadcast runs: the catalog as a query sees it, and a
         # query naming the data column compiled against it.
@@ -515,7 +520,7 @@ def one_run(args: argparse.Namespace) -> None:
         # one, a packet whose payload is a single space, onto a data edge at
         # its start and whenever a tenth of a second of programme time
         # passes with nothing written, so ffmpeg can interleave around it.
-        got = [packet for packet in packets(work / "data.nut", True)
+        got = [packet for packet in packets(work / "read.nut", True, TRACKS["data"])
                if packet["bytes"] != HEARTBEAT]
         print(f"data: {len(expected)} messages in the fixture, {len(sent)} published, "
               f"{len(got)} received", flush=True)
@@ -609,7 +614,7 @@ def one_run(args: argparse.Namespace) -> None:
         # When each message came out against the picture of the same pts,
         # and beside that when the publisher said it had closed each: its
         # data group, and the video group holding that picture.
-        pictures = packets(work / "video.nut", False)
+        pictures = packets(work / "read.nut", False, TRACKS["video"])
         with publisher.lock:
             stamped = list(publisher.stamped)
         closed_data = [at for at, row in stamped
@@ -643,7 +648,11 @@ def one_run(args: argparse.Namespace) -> None:
             print(f"  message {position} pts {packet['pts_time']:9.6f}s  picture pts "
                   f"{beside['pts_time']:9.6f}s  message out {at - started:7.3f}s  picture "
                   f"out {then - started:7.3f}s  lead {lead * 1000:7.1f} ms", flush=True)
-            if lead < 0:
+            # Every track now leaves in one NUT, which the host interleaves
+            # by timestamp, so at an equal pts the picture can be written a
+            # moment ahead of the message: that is the muxer's order, not a
+            # message held behind its media, which is seconds.
+            if lead < -LEAD_SLACK:
                 problems.append(f"message {position} at {packet['pts_time']:.6f}s came out "
                                 f"{-lead * 1000:.1f} ms after the picture at "
                                 f"{beside['pts_time']:.6f}s")

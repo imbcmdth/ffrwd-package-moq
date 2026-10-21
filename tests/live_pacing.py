@@ -30,8 +30,8 @@ What it reports:
     pts, over the first and the last ten seconds: a track that falls behind
     real time comes out later and later, so the lateness at the end less
     that at the start is its drift. The least late packet of each stretch
-    is the one compared, since a video packet waits for its group at the
-    reader and the rest of a group rides that sawtooth.
+    is the one compared, since before 0.9.2 a video packet waited for its
+    group at the reader and the rest of a group rode that sawtooth.
 
 `--shape leaf` measures a LEAF instead: the paced publisher goes straight
 to the relay as a head, and a second query subscribes to it and publishes
@@ -244,11 +244,12 @@ def windows(rows: list[dict]) -> list[list[dict]]:
     return out
 
 
-def lateness(path: Path, pipe: TimedPipe, started: float) -> list[tuple[float, float]]:
+def lateness(path: Path, pipe: TimedPipe, started: float,
+             stream: int) -> list[tuple[float, float]]:
     """(pts, seconds it came out after the run started less its pts), per
     packet, in the order they arrived."""
     out = []
-    for packet in packets(path, False):
+    for packet in packets(path, False, stream):
         if packet["size"] <= 1:
             continue
         at = pipe.arrival(packet["pos"] + packet["size"])
@@ -324,10 +325,9 @@ def one_run(args: argparse.Namespace) -> None:
             publisher = start_publisher(query, delay.port, cert_hex, args.audio_group_ms,
                                         BROADCAST, source=source, messages=messages)
         started = time.monotonic()
-        pipes = {name: TimedPipe(f"pacing-{name}", work / f"{name}.nut")
-                 for name in TRACKS}
-        reader = start_reader(port, cert_hex,
-                              [(TRACKS[name], pipes[name].spelling) for name in TRACKS])
+        # Every track rides one NUT, timed as it arrives.
+        pipe = TimedPipe("pacing", work / "read.nut")
+        reader = start_reader(port, cert_hex, pipe.spelling)
 
         if head is not None:
             headed = head.finish(args.seconds + 240)
@@ -336,8 +336,7 @@ def one_run(args: argparse.Namespace) -> None:
                 print(f"the head exited {headed}:\n{head.text()[1][-1500:]}")
         published = publisher.finish(args.seconds + 240)
         read = reader.finish(120)
-        for pipe in pipes.values():
-            pipe.finish(30)
+        pipe.finish(30)
         _, err = publisher.text()
         (work / "reader.err").write_text(reader.module_stderr(), encoding="utf-8")
         (work / "publisher.err").write_text(err, encoding="utf-8")
@@ -396,7 +395,7 @@ def one_run(args: argparse.Namespace) -> None:
         for name in TRACKS:
             if name == "data":
                 continue
-            timed = lateness(work / f"{name}.nut", pipes[name], started)
+            timed = lateness(work / "read.nut", pipe, started, TRACKS[name])
             (work / f"{name}.late.txt").write_text(
                 "".join(f"{pts:.6f} {late:.6f}\n" for pts, late in timed))
             seen = drift(timed)
@@ -411,7 +410,7 @@ def one_run(args: argparse.Namespace) -> None:
             if behind:
                 problems.append(f"{name} fell behind real time by {seen['drift']:.3f}s")
 
-        got = packets(work / "data.nut", True)
+        got = packets(work / "read.nut", True, TRACKS["data"])
         expected = expected_messages(args.fixture)
         wanted = [message for _, message in expected]
         # A heartbeat is a one-byte packet, and no message.
