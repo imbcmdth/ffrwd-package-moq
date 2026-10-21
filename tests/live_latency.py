@@ -1,6 +1,6 @@
 """The latency oracle: subscribe hands each frame on as it arrives, not in batches.
 
-    python tests/live_latency.py [--fps N] [--seconds N] [--size WxH]
+    python tests/live_latency.py [--fps N] [--seconds N] [--long] [--size WxH]
                                  [--spread-max F] [--work DIR] [--no-build] [--keep]
 
 The shape of a run: a local moq-relay, a PACED publisher of one video track
@@ -75,7 +75,10 @@ from live_data import TimedPipe
 
 BROADCAST = "live/latency"
 FPS = 60
-SECONDS = 60
+# 25 seconds of frames by default, which is enough to fail on batching;
+# --long is the minute the README's numbers were measured over.
+SECONDS = 25
+LONG_SECONDS = 60
 SETTLE = 5.0
 SPREAD_MAX = 2.0
 # Seconds either side of a packet its floor is read over: more than a GOP.
@@ -278,7 +281,9 @@ def one_run(args: argparse.Namespace) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fps", type=int, default=FPS)
-    parser.add_argument("--seconds", type=int, default=SECONDS)
+    parser.add_argument("--seconds", type=int, default=None)
+    parser.add_argument("--long", action="store_true",
+                        help=f"{LONG_SECONDS} s rather than {SECONDS} s")
     parser.add_argument("--size", default="1920x1080")
     parser.add_argument("--settle", type=float, default=SETTLE)
     parser.add_argument("--spread-max", type=float, default=SPREAD_MAX,
@@ -288,6 +293,8 @@ def main() -> None:
     parser.add_argument("--no-build", dest="build", action="store_false")
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args()
+    if args.seconds is None:
+        args.seconds = LONG_SECONDS if args.long else SECONDS
     if not SIDECAR.exists():
         sys.exit(f"no sidecar at {SIDECAR}; build it first (cargo build --release)")
     result = one_run(args)

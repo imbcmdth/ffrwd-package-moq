@@ -1,6 +1,6 @@
 """The chain oracle: a broadcast read, re-encoded and published again, timed by the clock in its picture.
 
-    python tests/live_chain.py [--fps N] [--seconds N] [--drop-at S] [--down S]
+    python tests/live_chain.py [--long] [--fps N] [--seconds N] [--drop-at S] [--down S]
                                [--start live|backlog] [--vcodec C] [--preset P]
                                [--bframes N] [--gop N] [--bitrate B]
                                [--package DIR] [--json PATH] [--work DIR] [--no-build] [--keep]
@@ -81,8 +81,13 @@ from common import (
 )
 
 FPS = 60
-SECONDS = 150
-DROP_AT = 50.0
+# The short form, the default: 30 seconds, one join, no drop, which is
+# enough to fail on a broken chain or a batching reader. --long is the
+# matrix's run: 150 seconds with relay A dropped 50 seconds in.
+SECONDS = 30
+DROP_AT = 0.0
+LONG_SECONDS = 150
+LONG_DROP_AT = 50.0
 DOWN = 4.0
 SETTLE = 8.0
 # The window after the relay comes back that the distributions leave out:
@@ -816,8 +821,10 @@ def one_run(args: argparse.Namespace) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fps", type=int, default=FPS)
-    parser.add_argument("--seconds", type=int, default=SECONDS)
-    parser.add_argument("--drop-at", type=float, default=DROP_AT,
+    parser.add_argument("--seconds", type=int, default=None)
+    parser.add_argument("--long", action="store_true",
+                        help=f"{LONG_SECONDS} s with relay A dropped {LONG_DROP_AT:.0f} s in")
+    parser.add_argument("--drop-at", type=float, default=None,
                         help="seconds in to drop relay A; 0 drops nothing")
     parser.add_argument("--down", type=float, default=DOWN)
     parser.add_argument("--start", default="live", choices=("live", "backlog"),
@@ -847,6 +854,10 @@ def main() -> None:
     parser.add_argument("--no-build", dest="build", action="store_false")
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args()
+    if args.seconds is None:
+        args.seconds = LONG_SECONDS if args.long else SECONDS
+    if args.drop_at is None:
+        args.drop_at = LONG_DROP_AT if args.long else DROP_AT
     if args.preset is None:
         args.preset = {"libx264": "veryfast", "h264_nvenc": "p1"}.get(args.vcodec)
     result = one_run(args)
