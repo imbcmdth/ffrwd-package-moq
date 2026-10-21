@@ -422,6 +422,13 @@ what every stream-copy muxer downstream needs, so the reordering is
 absorbed in a HOLD. The same hold runs on a live join, where what it has
 to absorb is a group or two rather than hundreds.
 
+Since 0.9.2 the hold takes a group a frame at a time, and the group at
+its cursor goes out the same way: each frame is handed on as it
+arrives, and the cursor moves past the group once its end has been
+read. A frame is whole on its own, so nothing waits for the rest of its
+group. A group behind a hole, or behind the group still being read,
+waits whole as before. See "Latency".
+
 The hold waits, and it does not give up on a missing group on a timer.
 `hold_ms` is how long a hole stands open before the relay is ASKED for
 that group by sequence, not how long before the group is written off.
@@ -435,9 +442,10 @@ still has it serves it and the hole closes; one that does not refuses,
 and only that refusal lets the cursor step over the hole. The other
 ways out are `hold_mib` (64 by default: the memory one track's hold may
 use, which is 30 seconds of about 17 Mbit/s and three orders of
-magnitude more than audio needs), a resubscribe after the wire broke,
-since the new subscription starts at the live edge and what is missing
-is gone, and the end of the track.
+magnitude more than audio needs, and held to as a burst fills the hold
+since 0.9.2, where before a burst could take it past), a resubscribe
+after the wire broke, since the new subscription starts at the live
+edge and what is missing is gone, and the end of the track.
 
 `join_ms` (2000 by default) is the other half, and a backlog idea alone.
 A cursor fixed at the first group that arrives puts the whole backlog
@@ -486,6 +494,157 @@ answer rather than a defect, and it is named in a HOLE row like any
 other. A relay told to keep more (`--cache-duration`) or a publisher
 running ahead of real time, which is what `backlog` is for, does not
 reach it.
+
+### Latency
+
+Before 0.9.2 a subscriber handed a video packet on only once the whole
+group it belonged to had arrived. A group is a GOP, so the first picture of
+each group waited a GOP and the last none: packets left in batches of a
+GOP, and their latency was a sawtooth a GOP high. The foundmeat ingest
+proof measured that as "about 300 ms in a sawtooth, batches of about 12":
+its gateway cut a group at every keyframe, and x264 put a keyframe every
+9 to 13 frames there. The pull's drive loop (up to 200 sleeps of a
+millisecond once it had something) was not what made the batches: it
+ended once five turns passed with no group arriving, 5 to 80 ms.
+
+0.9.2 changes three things:
+
+- The hold takes a group a frame at a time, and the group at its cursor
+  goes out the same way (see "The hold"). A frame is a whole `moof`+`mdat`
+  fragment, a legacy sample or a message, so nothing waits for the rest of
+  its group.
+- A pull returns as soon as it has packets. It lets the reader tasks and
+  the QUIC driver run once first, which takes in what the wire brought
+  while the host had the call, and waits on them only while it has
+  nothing to hand on. The host calls a source again as soon as a call
+  returns: `gap_max_ms` on the track rows, the longest the session lay
+  undriven between two pulls, stayed under 80 ms in the Windows runs
+  below, with one 239 ms while a `backlog` join was being written out.
+- The socket reactor under the session sweeps the sockets once a
+  millisecond, and a datagram that lands between sweeps waits for the next
+  one. Under wasmtime on Windows a one millisecond sleep lasts 15.6 ms. So
+  where a 1 ms sleep measures over 4 ms, the module has the reactor wait in
+  `wasi:io/poll` on its sockets instead, and a datagram is seen when the
+  host has it. On Linux, where a sleep lasts what it asks for, nothing
+  changes.
+
+Measured against a native reader (moq-native, the ingest proof's probe)
+on the same relay at the same time: each frame's arrival at a query reading
+`ffrwd.moq.subscribe` into a NUT pipe, less its arrival at the native
+reader, over 60 seconds of a paced 1080p broadcast with a keyframe a
+second. Windows is the 9950X with the sidecar of ffrwd 0.29.4; Linux is an
+i7-8750H in a container of foundmeat's runner image (ffrwd 0.32.5).
+
+| | fps | 0.9.1 | 0.9.2 |
+| --- | --- | --- | --- |
+| Windows | 60 | 592 / 994 / 1091 | 1.0 / 1.4 / 15 |
+| Windows | 30 | 623 / 1013 / 1377 | 1.1 / 1.6 / 14 |
+| Linux | 60 | 522 / 921 / 1010 | 3.2 / 4.9 / 15 |
+| Linux | 30 | 523 / 920 / 1004 | 3.7 / 5.4 / 21 |
+
+Median, p90 and max, in ms. Before, the median frame was half a GOP
+late and the worst a whole one; after, a frame leaves subscribe within a
+few milliseconds of the native reader having it. On Linux the reactor
+still sweeps every millisecond, which is most of what is left there.
+
+By the ingest proof's own method (its `tools/latency.py`, the clock in the
+picture, SRT at 200 ms, a subscriber writing MPEG-TS over UDP), on
+Windows: 779 ms before and 515 after at 30 fps, against 446 for its
+native reader on the same relay, and 563 before and 365 after at 60 fps,
+against 348. What is left, 69 ms at 30 fps and 17 at 60, is one or two
+frame intervals on the way out through MPEG-TS: the proof found its
+MPEG-TS reader alone holds one, 33 ms at 30 fps, since it knows a picture
+is whole only when the next one starts, and the comparison above, through
+NUT, shows none of it in subscribe.
+
+`tests/live_latency.py` holds this: a paced 1080p publisher, a reader
+under `ffrwd run`, and each packet's arrival against its own decode time.
+It fails when one packet in ten arrives in a batch of three or more. On
+Windows at 60 fps, over its `--long` minute:
+
+| | lateness above the floor: median / p90 / max | packets per batch, p90 |
+| --- | --- | --- |
+| 0.9.1 | 507 / 903 / 1327 ms | 60 |
+| 0.9.2 | 8.7 / 15.4 / 273 ms | 1 |
+
+The floor is the least late packet within a second and a half of each
+one. The maximum after is one stall upstream of the reader in the run;
+the comparison above, which has a native reader beside it, shows none
+in subscribe.
+
+What is left on Windows is the publisher's: its sidecar's timers tick at
+15.6 ms too, so its packets reach the relay on that grid, and the native
+reader sees the same 15.6 ms sawtooth.
+
+`tests/live_chain.py` measures a node of a tree end to end: a source
+publishing 1080p60 H.264 and AAC to relay A with the wall clock drawn into
+every picture, a query that reads it with `subscribe`, re-encodes it and
+publishes it with `publish` to relay B, relay A dropped for four seconds
+50 seconds in, and each picture's clock read back at three readers: a
+native reader of the source, `subscribe` stream-copying the source, and a
+native reader of the republished broadcast. Medians, p90 and max in ms
+from the clock in the picture to its decoded picture, over 150 seconds
+with the join and the 45 seconds after the drop left out, libx264
+veryfast, GOP 120, 8 Mbit/s:
+
+| | native, the source on A | subscribe | the copy on B |
+| --- | --- | --- | --- |
+| 0.9.1 | 384 / 407 / 541 | 1663 / 2312 / 2610 | 2011 / 2626 / 3023 |
+| 0.9.2 | 396 / 417 / 551 | 402 / 427 / 578 | 656 / 696 / 849 |
+| 0.9.1, B-frames | 1211 / 1235 / 1393 | 2772 / 3574 / 5562 | 3900 / 4506 / 5368 |
+| 0.9.2, B-frames | 1220 / 1253 / 1329 | 1225 / 1258 / 1401 | 2308 / 2351 / 2434 |
+| 0.9.1, `backlog` reader | 384 / 406 / 531 | 1692 / 2355 / 3995 | 1995 / 2600 / 2876 |
+| 0.9.2, `backlog` reader | 401 / 425 / 577 | 398 / 418 / 571 | 668 / 706 / 1008 |
+
+The B-frame rows encode with two B-frames and x264's `film` tuning, whose
+lookahead costs about 800 ms an encode. The node itself, from the source
+on A to its copy on B, went from 1.6 s to 260 ms, which is now a decode,
+an encode, a publish and a second relay. With the subscribe reader at
+`backlog` the chain still joins live: a chain that re-encodes and joins a
+live source at `backlog` stops on ffrwd's own pipe check
+(`BUFFER_OVERFLOW`) on 0.9.1 and 0.9.2 alike.
+
+On the Linux box, with h264_nvenc at `p1`, GOP 120 and 8 Mbit/s for
+both encoders, 60 seconds without a drop: subscribe sat 1504 ms behind
+the native reader at 60 fps and 2548 ms at 30 before, and 2.3 and 1.8 ms
+behind it after; the copy on B followed the source by 1681 and 3070 ms
+before and by 228 and 504 ms after. That box is a six-core laptop part,
+and the whole chain ran on it at once.
+
+The republished broadcast keeps its catalog, its init segments and a group
+per GOP (keyframes 120 frames apart, and the one gap the drop left), hang's
+own stack reads it and decodes it without an error, and B-frames go
+through as B-frames. Its sound sits against its picture where the
+source's does, read off a click every second against the clock in the
+pictures: within 2.5 ms, before the drop and after it, in every Windows
+run on either version but one, a B-frame run of 0.9.2 a frame (11 to
+18 ms) off, which four repeats did not show.
+
+### The group pacer and a relay that keeps several groups
+
+`moq_core::delivery::Pacer` holds each new group on a track until the
+relay has acknowledged the one before it and 10 ms have passed (see "One
+group at a time"). That is what keeps a relay that holds only a track's
+newest group, Cloudflare's, from losing the older one, and it is not
+changed here. A relay that keeps several groups (moq-relay, which this
+package's loops and foundmeat's ingest run) loses nothing either way, and
+there the hold is only delay: the ingest proof's native reader saw the
+first frames of each group arrive 50 to 80 ms late and catch up.
+
+Making it optional would take:
+
+- a mode on `Pacer` in which `release` treats the last group as settled,
+  the way it already does for a track nobody is subscribed to, so every
+  group goes onto the wire when it is cut and `wait_max_ms` stays 0;
+- a way to choose it: a `publish` argument after `hold_s` (positional,
+  defaulting to paced, so no existing query changes), and the same switch
+  wherever else a `Pacer` is built (foundmeat's gateway builds its own);
+- the rows to say which mode a track ran in, since `unpaced` would no
+  longer mean a group at risk;
+- measurements before it is offered: `tests/live_pacing.py` with the mode
+  on, to show the per-group wait gone and nothing lost against moq-relay,
+  and the same against Cloudflare with the mode off, to show the default
+  still holds there. The default stays paced.
 
 ### A dropped session
 
@@ -550,7 +709,13 @@ begin in; not a loss, since nothing had started, but not silent
 either), `fetches` and `fetches_refused` (groups asked for outright,
 and the ones the relay would not serve), `hold_max_groups` and
 `hold_max_bytes`, `reorder_max` (the widest the hold ever had to
-stretch in sequence), and `first` and `last`.
+stretch in sequence), and `first` and `last`. Since 0.9.2 it also
+carries `gap_max_ms` and `call_max_ms` over the window, as the
+publisher's rows do: the longest the session lay undriven between two
+pulls, and the longest one pull lasted, most of which is waiting for
+something to hand on. The session runs only while a pull is on the
+executor, so `gap_max_ms` is what a host that stops calling costs the
+wire.
 
 Beside them, a row per incident: a HOLE row for every hole given up on
 (`from`, `to`, `reason`, and what was held at the time), a LATE row for
@@ -650,8 +815,12 @@ with video, audio and 43 messages over 98.5 seconds, and a reader
 under the sidecar timing each packet as it leaves. Every message
 arrives byte for byte, at the publisher's pts to the microsecond, and
 ahead of the first picture at or past its pts. The margin is a second
-to two and a half against a local relay, since a picture waits for its
-group to end and a message does not. Held to moq-transport 16
+to two and a half against a local relay before 0.9.2, since a picture
+waited for its group to end and a message did not. A picture now goes
+on as it arrives too, and a message follows the picture of its own pts
+by up to the publisher's own lag: its host hands a message to publish on
+its clock's tick after that picture, 15 to 48 ms later at 30 fps.
+`tests/live_data.py` bounds that at 100 ms. Held to moq-transport 16
 (`--relay-version`), the same holds, the pts coming out of the frame;
 with the relay taken away mid-run (`--reconnect`), what is lost is only
 what went out while the reader had no session.
@@ -818,6 +987,19 @@ COPY's TO, writes a node's rows and keeps a node source's pts at a file:
   `tests/data/messages.nut` went out as 43 groups of the 612 published
   and came back whole, as on 0.9.0.
 
+0.9.2 is subscribe's latency (see "Latency") and the loops under `tests/`
+on the node world. The ones that ran the module straight under the
+sidecar, with a NUT output per track and its rows on stderr, did not run
+on ffrwd 0.29: a node's outputs are now the streams of one NUT, named
+after the catalog's tracks in a `-filter_complex`, and its rows are
+NDJSON on stdout. `common.start_subscribe_node` runs it that way, and
+`live_subscribe`, `live_edge`, `live_reconnect`, `live_data`,
+`live_pacing` and `live_backlog` pass on ffrwd 0.29.4 against 0.9.1 and
+0.9.2 alike. `live_ladder` (its recipe finds no audio in the source it
+makes) and `live_burst` (it calls an `audio` export the installed
+ffrwd/switch no longer has) fail on both for reasons outside this
+package's modules.
+
 ## License
 
 This package is **MIT OR Apache-2.0**, and so is everything vendored
@@ -854,4 +1036,7 @@ CC_wasm32_wasip2=<wasi-sdk>/bin/clang cargo build --target wasm32-wasip2 --relea
 
 The live pub/sub loops under `tests/` need moq-relay on the machine,
 and wasmtime for the ones that drive a guest directly. They run only
-when invoked directly.
+when invoked directly. `tests/fast.py` is the tier to run after a
+change, in about two minutes: `cargo test` and the short forms of
+`live_latency.py` and `live_chain.py`. Their `--long` forms and the other
+loops are for before a push.
