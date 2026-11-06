@@ -39,6 +39,12 @@ fragmented MP4: one `moof`+`mdat` fragment per each frame, a new MoQ
 group at every keyframe. Audio rides beside the video as AAC, cut on
 frame edges.
 
+Each rendition's catalog entry states its `bitrate`, hang's own field,
+when its encoder is set to one: `video_bitrate` and `audio_bitrate`, in
+bits a second. A reader picks a rung by it, as a player does or an
+egress worker reading `rung: {under: 6M}`. A rung encoded to a quality
+(`crf`) states none.
+
 A subscription starts at the latest group, so the first media is held
 for a first subscriber, up to `hold_s` seconds (10 by default), to keep
 a file's opening from being lost to a reader that arrives a moment
@@ -278,6 +284,9 @@ COPY (
   WHERE s.height = 720
 ) TO 'rung.mp4'
 ```
+
+A row's `bandwidth` is its catalog `bitrate`: its video's, or its
+audio's on a row with no video, and null where the catalog states none.
 
 The catalog is read at compile time, the way ffprobe reads a file, so
 the broadcast must be on the relay before the query compiles: the node's
