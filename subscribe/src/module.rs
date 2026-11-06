@@ -134,6 +134,8 @@ struct SourceTrack {
 struct RenditionMeta {
 	name: Option<String>,
 	codecs: Option<String>,
+	/// Bits a second, where the catalog states it.
+	bandwidth: Option<u64>,
 }
 
 /// Every track the catalog names, in its order.
@@ -436,6 +438,7 @@ fn data_track(
 		rendition: RenditionMeta {
 			name: Some(rendition.name.clone()),
 			codecs: Some(rendition.codec.clone()),
+			bandwidth: None,
 		},
 	})
 }
@@ -526,6 +529,7 @@ fn source_track(
 			rendition: RenditionMeta {
 				name: Some(rendition.name.clone()),
 				codecs: Some(rendition.codec.clone()),
+				bandwidth: rendition.bitrate,
 			},
 		},
 		Body::Media(track),
@@ -633,6 +637,7 @@ fn legacy_track(rendition: &moq_core::catalog::Rendition) -> Result<(SourceTrack
 			rendition: RenditionMeta {
 				name: Some(rendition.name.clone()),
 				codecs: Some(rendition.codec.clone()),
+				bandwidth: rendition.bitrate,
 			},
 		},
 		Body::Legacy(codec),
@@ -1251,8 +1256,10 @@ fn ports(catalog: &Catalog) -> Vec<String> {
 	names
 }
 
-/// The catalog's relation: a row per rendition row, with the name and
-/// codecs of the media on it, and each track's index into it.
+/// The catalog's relation: a row per rendition row, with the name, the
+/// codecs and the bandwidth of the media on it, and each track's index
+/// into it. A row's name and bandwidth are its first media track's, which
+/// is its video when it has one: the bitrate a reader picks a rung by.
 fn relation(catalog: &Catalog) -> (Vec<String>, Vec<u32>) {
 	let mut rows: Vec<u32> = catalog.tracks.iter().map(|track| track.row).collect();
 	rows.sort_unstable();
@@ -1273,6 +1280,7 @@ fn relation(catalog: &Catalog) -> (Vec<String>, Vec<u32>) {
 			serde_json::json!({
 				"name": named.and_then(|t| t.rendition.name.clone()),
 				"codecs": (!codecs.is_empty()).then(|| codecs.join(",")),
+				"bandwidth": named.and_then(|t| t.rendition.bandwidth),
 			})
 			.to_string()
 		})
@@ -1635,4 +1643,3 @@ async fn read_groups(
 		}
 	}
 }
-

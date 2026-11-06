@@ -319,6 +319,8 @@ struct Rendition {
 	muxer: Option<ffrwd_bmff::mux::Muxer>,
 	time_base: (i32, i32),
 	length_size: usize,
+	/// What its catalog entry states, in bits a second.
+	bitrate: Option<u64>,
 	init_bytes: u64,
 	groups: u64,
 	packets: u64,
@@ -509,8 +511,8 @@ impl Rendition {
 		.expect("a track row serializes")
 	}
 
-	/// The catalog entry naming this track: its decoder configuration
-	/// and its init segment inside.
+	/// The catalog entry naming this track: its decoder configuration,
+	/// its init segment inside and its bitrate where the query stated one.
 	fn catalog_entry(&mut self) -> moq_core::catalog::Track {
 		if let Media::Data { timescale } = self.media {
 			return moq_core::catalog::Track::data(self.name.clone(), self.codec.clone(), timescale);
@@ -518,7 +520,7 @@ impl Rendition {
 		let init = self.muxer().init_segment();
 		self.init_bytes = init.len() as u64;
 		let muxer = self.muxer.as_ref().expect("a media track has a muxer");
-		match self.media {
+		let track = match self.media {
 			Media::Video { width, height } => moq_core::catalog::Track::video(
 				self.name.clone(),
 				self.codec.clone(),
@@ -539,7 +541,8 @@ impl Rendition {
 				init,
 			),
 			Media::Data { .. } => unreachable!("a data track returned above"),
-		}
+		};
+		track.with_bitrate(self.bitrate)
 	}
 }
 
@@ -1398,11 +1401,13 @@ fn open(streams: Vec<InputStream>, params: Params) -> Result<State, String> {
 		Ok::<_, String>((origin, broadcast, catalog, tracks, connected))
 	})?;
 
+	let bitrates: Vec<Option<u64>> = streams.iter().map(|stream| stream.bitrate).collect();
 	let renditions = built
 		.into_iter()
 		.zip(names)
 		.zip(tracks)
-		.map(|((built, name), track)| Rendition {
+		.zip(bitrates)
+		.map(|(((built, name), track), bitrate)| Rendition {
 			name,
 			codec: built.codec,
 			media: built.media,
@@ -1421,6 +1426,7 @@ fn open(streams: Vec<InputStream>, params: Params) -> Result<State, String> {
 			muxer: built.muxer,
 			time_base: built.time_base,
 			length_size: built.length_size,
+			bitrate,
 			init_bytes: 0,
 			groups: 0,
 			packets: 0,
@@ -1477,6 +1483,9 @@ struct InputStream {
 	coded: CodedStream,
 	row: u32,
 	name: Option<String>,
+	/// The pad's bitrate as the query states it, its rendition's
+	/// bandwidth, in bits a second: what the catalog entry says.
+	bitrate: Option<u64>,
 }
 
 /// `publish` as the host runs it: the session, and the streams it reads
@@ -1537,6 +1546,7 @@ impl Node for Publish {
 				coded,
 				row: stream.row.unwrap_or(0),
 				name: stream.rendition.name.clone(),
+				bitrate: stream.rendition.bandwidth,
 			});
 		}
 		Ok(Publish {

@@ -19,6 +19,12 @@
 //! track filed under `video` or `audio` would fail hang's validation and
 //! take the whole broadcast off the player.
 //!
+//! A video or audio rendition states its `bitrate`, hang's own field, in
+//! bits a second, when the publisher knows it: the rate its encoder was
+//! set to. A reader choosing a rendition by bitrate reads it there, as a
+//! player does. Without one the key is left out, and the document is the
+//! one this package always wrote.
+//!
 //! Built by hand against hang 0.20.7's `catalog` module rather than by
 //! depending on the crate: this side compiles to wasm32-wasip2 inside
 //! the publish module, and the document is plain serde. The live test's
@@ -79,6 +85,9 @@ pub struct VideoRendition {
 	pub description: String,
 	pub coded_width: u32,
 	pub coded_height: u32,
+	/// Bits a second, where the publisher knows it.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub bitrate: Option<u64>,
 	pub container: Container,
 }
 
@@ -92,6 +101,9 @@ pub struct AudioRendition {
 	pub description: String,
 	pub sample_rate: u32,
 	pub number_of_channels: u32,
+	/// Bits a second, where the publisher knows it.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub bitrate: Option<u64>,
 	/// Capture bursts become latency, not gaps.
 	pub jitter: u32,
 	pub container: Container,
@@ -178,6 +190,7 @@ impl Track {
 				description: hex(config),
 				coded_width: width,
 				coded_height: height,
+				bitrate: None,
 				container: Container { init },
 			},
 		)
@@ -200,6 +213,7 @@ impl Track {
 				description: hex(config),
 				sample_rate,
 				number_of_channels: channels,
+				bitrate: None,
 				jitter: AUDIO_JITTER_MS,
 				container: Container { init },
 			},
@@ -217,6 +231,17 @@ impl Track {
 				timescale,
 			},
 		)
+	}
+
+	/// The track with the bitrate its rendition states, in bits a second.
+	/// A data track states none, and is returned as it was.
+	pub fn with_bitrate(mut self, bitrate: Option<u64>) -> Self {
+		match &mut self {
+			Track::Video(_, entry) => entry.bitrate = bitrate,
+			Track::Audio(_, entry) => entry.bitrate = bitrate,
+			Track::Data(..) => {}
+		}
+		self
 	}
 
 	/// The track's name, whichever kind it is.
@@ -323,6 +348,8 @@ pub struct Rendition {
 	/// How its frames carry their samples.
 	pub packaging: Packaging,
 	pub kind: Kind,
+	/// Bits a second, where the catalog states it; never for data.
+	pub bitrate: Option<u64>,
 	/// Which relation row it belongs to; see [`rows`].
 	pub row: u32,
 }
@@ -422,6 +449,7 @@ pub fn parse(document: &str) -> Result<Vec<Rendition>, String> {
 				init,
 				packaging,
 				kind,
+				bitrate: entry.get("bitrate").and_then(|rate| rate.as_u64()),
 				row: 0,
 			});
 		}
@@ -465,6 +493,7 @@ fn data_rendition(name: &str, entry: &serde_json::Value) -> Result<Rendition, St
 		kind: Kind::Data {
 			timescale: timescale as u32,
 		},
+		bitrate: None,
 		row: 0,
 	})
 }
@@ -935,6 +964,33 @@ mod tests {
 	}
 
 	#[test]
+	fn a_rendition_with_a_bitrate_states_it_and_one_without_leaves_the_key_out() {
+		let catalog = Catalog::new(vec![
+			Track::video("1080p".into(), "avc1.64002a".into(), &[1], 1920, 1080, vec![0])
+				.with_bitrate(Some(6_000_000)),
+			Track::video("720p".into(), "avc1.64001f".into(), &[1], 1280, 720, vec![0]),
+			Track::audio("1080p.audio".into(), "mp4a.40.2".into(), &[0x11, 0x90], 48000, 2, vec![0])
+				.with_bitrate(Some(160_000)),
+			Track::data("cues".into(), "json".into(), 1000).with_bitrate(Some(1)),
+		]);
+		let document = String::from_utf8(catalog.document().expect("serializes")).unwrap();
+		assert_eq!(
+			document,
+			r#"{"video":{"renditions":{"1080p":{"codec":"avc1.64002a","description":"01","codedWidth":1920,"codedHeight":1080,"bitrate":6000000,"container":{"kind":"cmaf","init":"AA=="}},"720p":{"codec":"avc1.64001f","description":"01","codedWidth":1280,"codedHeight":720,"container":{"kind":"cmaf","init":"AA=="}}}},"audio":{"renditions":{"1080p.audio":{"codec":"mp4a.40.2","description":"1190","sampleRate":48000,"numberOfChannels":2,"bitrate":160000,"jitter":600,"container":{"kind":"cmaf","init":"AA=="}}}},"data":{"renditions":{"cues":{"codec":"json","container":{"kind":"legacy"},"timescale":1000}}}}"#
+		);
+		let read = parse(&document).expect("the document parses");
+		assert_eq!(
+			read.iter().map(|r| (r.name.as_str(), r.bitrate)).collect::<Vec<_>>(),
+			vec![
+				("1080p", Some(6_000_000)),
+				("720p", None),
+				("1080p.audio", Some(160_000)),
+				("cues", None)
+			]
+		);
+	}
+
+	#[test]
 	fn an_audio_rendition_says_its_rate_and_channels() {
 		let catalog = Catalog::new(vec![Track::audio(
 			"audio".into(),
@@ -1285,6 +1341,7 @@ mod tests {
 		assert_eq!(audio.name, "0.aac");
 		assert_eq!(audio.kind, Kind::Audio { sample_rate: 48000, channels: 2 });
 		assert_eq!(audio.config, vec![0x11, 0x90, 0x56, 0xe5, 0x00]);
+		assert_eq!((video.bitrate, audio.bitrate), (Some(2_500_000), Some(182_912)));
 		// One programme: the audio joins the video's row.
 		assert_eq!((video.row, audio.row), (0, 0));
 	}
