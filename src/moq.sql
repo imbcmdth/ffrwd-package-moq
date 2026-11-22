@@ -161,17 +161,34 @@ RETURNS sink
 -- sessions now and then, every one at once; the reader opens a new
 -- session, reads the catalog again and takes its tracks up at the live
 -- edge, so what is lost is the stretch the relay was away and the run
--- goes on. The tracks have to come back under the same names with the
--- same init segments, and a broadcast whose group numbers started again
--- - a publisher that restarted, its clock with it - stops the run
--- instead. A row with kind 'reconnect' says when it is back. 0 ends the
--- run on the first drop.
+-- goes on. The tracks have to come back under the same names, carrying
+-- what a decoder reads unchanged. A row with kind 'reconnect' says when
+-- it is back. 0 ends the run on the first drop.
+--
+-- A publisher sometimes starts again: its process is lost and a new one
+-- started, or its run ends and the next run of the same query begins.
+-- The new publisher publishes the same broadcast name with its
+-- timestamps and group numbers starting over. The reader follows it: it takes the tracks up
+-- on the new publisher's broadcast and shifts the new media, every track
+-- by the same amount, so that it follows the last packet before the gap
+-- by as long as the stream was away and no timestamp goes back. A row
+-- with kind 'restart' says so.
+--
+-- restart_s is how long a reader whose publisher finished its tracks
+-- waits for a new one, in seconds, 0 by default: a program that starts
+-- again finishes its tracks first when its run ends, and a file
+-- published to its end does the same, so 0 ends the run there as it
+-- always did. A live egress sets it to how long its program may take to
+-- come back. A broadcast the relay dropped with its tracks unfinished,
+-- which is what a publisher lost outright leaves, is waited for as long
+-- as restart_s or reconnect_s allows, whichever is longer.
 CREATE FUNCTION subscribe(relay text, broadcast text,
                           cert text DEFAULT '', token text DEFAULT '',
                           start text DEFAULT 'live',
                           hold_ms number DEFAULT NULL,
                           hold_mib number DEFAULT 64,
                           join_ms number DEFAULT 2000,
-                          reconnect_s number DEFAULT 60)
+                          reconnect_s number DEFAULT 60,
+                          restart_s number DEFAULT 0)
 RETURNS source
   AS 'target/wasm32-wasip2/release/subscribe.wasm', 'subscribe' LANGUAGE wasm;

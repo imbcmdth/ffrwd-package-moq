@@ -634,6 +634,69 @@ pub fn unbase64(text: &str) -> Result<Vec<u8>, String> {
 	Ok(out)
 }
 
+/// What a rendition read again off a broadcast that came back changed
+/// that a decoder set up for it as it was would notice: its codec, its
+/// decoder configuration (the `avcC`, the `esds`), its geometry, its
+/// timescale, its sample rate or its channels. None when it changed none
+/// of them.
+///
+/// A publisher that starts again with the same query and settings
+/// writes the same init segment byte for byte, which is the common case.
+/// One that differs only where no decoder looks (a track number, a
+/// creation time, a handler's name, the fragment defaults) is the same
+/// stream, and its fragments are read by the new init segment from then
+/// on. A legacy rendition has no init segment, and a data rendition is
+/// its codec and timescale.
+pub fn changed(was: &Rendition, now: &Rendition) -> Option<&'static str> {
+	if was.packaging != now.packaging {
+		return Some("its packaging");
+	}
+	if was.codec != now.codec {
+		return Some("its codec");
+	}
+	if was.config != now.config {
+		return Some("its decoder configuration");
+	}
+	if std::mem::discriminant(&was.kind) != std::mem::discriminant(&now.kind) {
+		return Some("what it carries");
+	}
+	if was.kind != now.kind {
+		return Some(match now.kind {
+			Kind::Video { .. } => "its geometry",
+			Kind::Audio { .. } => "its sample rate or channels",
+			Kind::Data { .. } => "its timescale",
+		});
+	}
+	if was.packaging != Packaging::Cmaf || was.init == now.init {
+		return None;
+	}
+	let (Ok(old), Ok(new)) = (
+		ffrwd_bmff::track::Track::from_init(&was.init),
+		ffrwd_bmff::track::Track::from_init(&now.init),
+	) else {
+		return Some("its init segment, which no longer reads");
+	};
+	if old.handler != new.handler {
+		return Some("what it carries");
+	}
+	if old.entry.kind != new.entry.kind {
+		return Some("its codec");
+	}
+	if old.entry.config != new.entry.config {
+		return Some("its decoder configuration");
+	}
+	if old.timescale != new.timescale {
+		return Some("its timescale");
+	}
+	if old.entry.visual != new.entry.visual {
+		return Some("its geometry");
+	}
+	if old.entry.audio != new.entry.audio {
+		return Some("its sample rate or channels");
+	}
+	None
+}
+
 /// The track names a broadcast's renditions publish under.
 ///
 /// ONE stream keeps the base name as written, so a broadcast that
@@ -777,6 +840,129 @@ pub fn aac_codec(asc: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use ffrwd_bmff::mux::{Audio, Muxer, Video};
+
+	/// A cmaf video rendition the way this package publishes one, its init
+	/// segment built by the muxer the publisher uses.
+	fn video(config: &[u8], width: u32, timescale: i32, track_id: u32) -> Rendition {
+		let muxer = Muxer::video(
+			Video {
+				kind: *b"avc1",
+				width,
+				height: 360,
+				config: config.to_vec(),
+			},
+			1,
+			timescale,
+		)
+		.expect("a video muxer")
+		.with_track_id(track_id);
+		Rendition {
+			name: "360p".into(),
+			codec: "avc1.64001e".into(),
+			config: config.to_vec(),
+			init: muxer.init_segment(),
+			packaging: Packaging::Cmaf,
+			kind: Kind::Video { width, height: 360 },
+			bitrate: None,
+			row: 0,
+		}
+	}
+
+	fn audio(config: &[u8], sample_rate: u32, channels: u32) -> Rendition {
+		let muxer = Muxer::audio(
+			Audio {
+				sample_rate,
+				channels,
+				config: config.to_vec(),
+			},
+			1,
+			sample_rate as i32,
+		)
+		.expect("an audio muxer");
+		Rendition {
+			name: "360p.audio".into(),
+			codec: "mp4a.40.2".into(),
+			config: config.to_vec(),
+			init: muxer.init_segment(),
+			packaging: Packaging::Cmaf,
+			kind: Kind::Audio {
+				sample_rate,
+				channels,
+			},
+			bitrate: None,
+			row: 0,
+		}
+	}
+
+	const AVCC: &[u8] = &[
+		1, 0x64, 0, 0x1e, 0xff, 0xe1, 0, 4, 0x67, 0x64, 0, 0x1e, 1, 0, 2, 0x68, 0xee,
+	];
+	const ASC: &[u8] = &[0x11, 0x90];
+
+	#[test]
+	fn the_same_init_segment_carries_on() {
+		assert_eq!(
+			changed(&video(AVCC, 640, 90_000, 1), &video(AVCC, 640, 90_000, 1)),
+			None
+		);
+		assert_eq!(
+			changed(&audio(ASC, 48_000, 2), &audio(ASC, 48_000, 2)),
+			None
+		);
+	}
+
+	#[test]
+	fn an_init_segment_that_differs_where_no_decoder_looks_carries_on() {
+		let was = video(AVCC, 640, 90_000, 1);
+		let now = video(AVCC, 640, 90_000, 2);
+		assert_ne!(
+			was.init, now.init,
+			"the track number is in the init segment"
+		);
+		assert_eq!(changed(&was, &now), None);
+	}
+
+	#[test]
+	fn what_a_decoder_reads_is_refused_by_name() {
+		let was = video(AVCC, 640, 90_000, 1);
+		let mut other = AVCC.to_vec();
+		other[3] = 0x1f;
+		let mut config = video(&other, 640, 90_000, 1);
+		config.codec = was.codec.clone();
+		assert_eq!(changed(&was, &config), Some("its decoder configuration"));
+		assert_eq!(
+			changed(&was, &video(AVCC, 854, 90_000, 1)),
+			Some("its geometry")
+		);
+		assert_eq!(
+			changed(&was, &video(AVCC, 640, 30_000, 1)),
+			Some("its timescale")
+		);
+		let mut codec = was.clone();
+		codec.codec = "avc1.640020".into();
+		assert_eq!(changed(&was, &codec), Some("its codec"));
+		let sound = audio(ASC, 48_000, 2);
+		assert_eq!(
+			changed(&sound, &audio(ASC, 48_000, 1)),
+			Some("its sample rate or channels")
+		);
+		assert_eq!(
+			changed(&sound, &audio(&[0x11, 0x88], 48_000, 2)),
+			Some("its decoder configuration")
+		);
+		assert_eq!(changed(&was, &sound), Some("its codec"));
+	}
+
+	#[test]
+	fn a_geometry_the_catalog_keeps_but_the_sample_entry_changes_is_refused() {
+		// The catalog says the same size, the init segment another: the
+		// decoder reads the init segment.
+		let was = video(AVCC, 640, 90_000, 1);
+		let mut now = video(AVCC, 704, 90_000, 1);
+		now.kind = was.kind;
+		assert_eq!(changed(&was, &now), Some("its geometry"));
+	}
 
 	#[test]
 	fn one_stream_keeps_the_track_name_as_written() {

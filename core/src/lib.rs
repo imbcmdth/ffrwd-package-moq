@@ -25,6 +25,9 @@
 //! - [`delivery`] is how every track's groups leave: one at a time,
 //!   the next held in the track's queue until the relay has the one
 //!   before it, and never in the host's call.
+//! - [`restart`] is a reader's timestamps across a publisher that
+//!   started again: one shift for every track, so the new media follows
+//!   the old after a gap as long as the stream was away.
 //! - [`subscribe`] is the receiving side before the media: the
 //!   subscription shape, the catalog read, and [`subscribe::FrameStream`]
 //!   pulling groups and frames off a track in arrival order.
@@ -47,6 +50,7 @@ pub mod message;
 pub mod order;
 pub mod prefixes;
 pub mod relay;
+pub mod restart;
 pub mod subscribe;
 
 #[cfg(target_os = "wasi")]

@@ -40,13 +40,15 @@ use serde::Serialize;
 
 /// What subscribe reports, as rows on the run's rows output: kept here as
 /// they happen until the node hands them over ([`take_rows`]), one object
-/// a row. `kind` says which of the five shapes it is: a TRACK row every [`REPORT_EVERY`] and once more when
+/// a row. `kind` says which of the six shapes it is: a TRACK row every [`REPORT_EVERY`] and once more when
 /// the track ends (`final`), a HOLE row for every hole given up on, a
 /// LATE row for every group that arrived below the cursor and could not
 /// be used, and a SKIPPED row for every group a live join stepped over
-/// on its way to one a decoder can start at, and a RECONNECT row each
-/// time a session the relay dropped was replaced by a new one.
-pub const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","enum":["track","hole","late","skipped","reconnect"]},"track":{"type":"string"},"received":{"type":"integer"},"delivered":{"type":"integer"},"repeated":{"type":"integer"},"bytes":{"type":"integer"},"holes_opened":{"type":"integer"},"holes_filled":{"type":"integer"},"holes_abandoned_gone":{"type":"integer"},"holes_abandoned_budget":{"type":"integer"},"holes_abandoned_restart":{"type":"integer"},"holes_abandoned_end":{"type":"integer"},"dropped_late":{"type":"integer"},"skipped_join":{"type":"integer"},"fetches":{"type":"integer"},"fetches_refused":{"type":"integer"},"hold_max_groups":{"type":"integer"},"hold_max_bytes":{"type":"integer"},"reorder_max":{"type":"integer"},"first":{"type":["integer","null"]},"last":{"type":["integer","null"]},"gap_max_ms":{"type":"integer"},"call_max_ms":{"type":"integer"},"final":{"type":"boolean"},"from":{"type":"integer"},"to":{"type":"integer"},"reason":{"type":"string","enum":["gone","budget","restart","end"]},"held_groups":{"type":"integer"},"held_bytes":{"type":"integer"},"group":{"type":"integer"},"cursor":{"type":"integer"},"attempts":{"type":"integer"},"down_ms":{"type":"integer"},"error":{"type":"string"}},"additionalProperties":false}"#;
+/// on its way to one a decoder can start at, a RECONNECT row each
+/// time a session the relay dropped was replaced by a new one, and a
+/// RESTART row each time the broadcast's publisher started again and
+/// the reader followed it.
+pub const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","enum":["track","hole","late","skipped","reconnect","restart"]},"track":{"type":"string"},"received":{"type":"integer"},"delivered":{"type":"integer"},"repeated":{"type":"integer"},"bytes":{"type":"integer"},"holes_opened":{"type":"integer"},"holes_filled":{"type":"integer"},"holes_abandoned_gone":{"type":"integer"},"holes_abandoned_budget":{"type":"integer"},"holes_abandoned_restart":{"type":"integer"},"holes_abandoned_end":{"type":"integer"},"dropped_late":{"type":"integer"},"skipped_join":{"type":"integer"},"fetches":{"type":"integer"},"fetches_refused":{"type":"integer"},"hold_max_groups":{"type":"integer"},"hold_max_bytes":{"type":"integer"},"reorder_max":{"type":"integer"},"first":{"type":["integer","null"]},"last":{"type":["integer","null"]},"gap_max_ms":{"type":"integer"},"call_max_ms":{"type":"integer"},"final":{"type":"boolean"},"from":{"type":"integer"},"to":{"type":"integer"},"reason":{"type":"string","enum":["gone","budget","restart","end"]},"held_groups":{"type":"integer"},"held_bytes":{"type":"integer"},"group":{"type":"integer"},"cursor":{"type":"integer"},"attempts":{"type":"integer"},"down_ms":{"type":"integer"},"error":{"type":"string"},"behind":{"type":"integer"},"seen":{"type":"string","enum":["finished","replaced","renumbered","rewound"]},"away_ms":{"type":"integer"},"shift_us":{"type":"integer"}},"additionalProperties":false}"#;
 
 /// How long a hole in a track's group sequence is held open for the
 /// group that would fill it, and how much one track holds meanwhile.
@@ -214,6 +216,10 @@ pub struct Counters {
 	/// host that stops calling costs the wire.
 	gap_max_ms: u64,
 	call_max_ms: u64,
+	/// Media packets dropped because they would have gone out at or before
+	/// this track's last packet, and the packets after them until a sync
+	/// sample; see [`crate::restart::Timeline`].
+	behind: u64,
 }
 
 /// What a held frame weighs against the hold's budget ([`HOLD_BYTES`]):
@@ -362,6 +368,28 @@ pub fn report_reconnect(attempts: u64, down_ms: u64, error: &str) {
 	});
 }
 
+/// A publisher that started again, followed: what showed it, how long
+/// the stream was away, and the shift its timestamps get from here on,
+/// in microseconds.
+#[derive(Serialize)]
+struct RestartRow {
+	kind: &'static str,
+	seen: &'static str,
+	away_ms: u64,
+	shift_us: i64,
+}
+
+/// Says that the reader followed a publisher that started again; see
+/// [`RestartRow`] and [`crate::restart`].
+pub fn report_restart(restart: &crate::restart::Restart) {
+	row(&RestartRow {
+		kind: "restart",
+		seen: restart.seen.as_str(),
+		away_ms: restart.away.as_millis() as u64,
+		shift_us: restart.shift_us,
+	});
+}
+
 thread_local! {
 	static ROWS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
@@ -476,6 +504,35 @@ impl<F: Weigh> Queue<F> {
 				held.again = Some(0);
 			}
 		}
+	}
+
+	/// The track's publisher started again, and numbers its groups from
+	/// nothing. What is still held under the old numbering is handed back
+	/// in sequence, as at the end of a track: the group being read when
+	/// the publisher went counts as delivered, and a hole it never filled
+	/// is named in a HOLE row, reason `end`. Then the cursor goes, and the
+	/// track joins the new numbering as a live join does: at the first
+	/// group a decoder can start at. The new subscription starts at the
+	/// live edge whatever end this reader first joined at.
+	pub fn rejoin(&mut self, hold: Hold) -> Vec<(u64, Vec<F>)> {
+		let mut ask = Vec::new();
+		let mut old = Vec::new();
+		while let Some(taken) = self.take(hold, true, &mut ask) {
+			old.push(taken);
+		}
+		self.start = crate::subscribe::Start::Live;
+		self.pending.clear();
+		self.pending_bytes = 0;
+		self.cursor = None;
+		self.join_low = None;
+		self.join_ready = None;
+		self.gap_since = None;
+		self.fetching = None;
+		self.gone = None;
+		self.fetched.clear();
+		self.passing.clear();
+		self.restarted = false;
+		old
 	}
 
 	/// Files frames of one group: all of it when `complete` and `frames`
@@ -801,6 +858,12 @@ impl<F: Weigh> Queue<F> {
 		});
 		self.counters.gap_max_ms = 0;
 		self.counters.call_max_ms = 0;
+	}
+
+	/// How many of this track's packets have been dropped in all because
+	/// they would have gone back; see [`Counters::behind`].
+	pub fn note_behind(&mut self, total: u64) {
+		self.counters.behind = total;
 	}
 
 	/// One pull: how long the session lay undriven before it, when there
@@ -1289,6 +1352,64 @@ mod tests {
 		assert_eq!(queue.counters.holes_abandoned_restart, 1);
 		assert_eq!(queue.counters.delivered, 1);
 		assert_eq!(queue.cursor(), Some(11));
+	}
+
+	#[test]
+	fn a_publisher_that_started_again_is_joined_afresh_at_its_own_numbering() {
+		// The old publisher had got to group 40. The new one numbers from
+		// nothing, and its groups would all be late against the old
+		// cursor.
+		let mut queue = Queue::new("v0".into(), Start::Backlog);
+		for sequence in 38..41 {
+			queue.push(sequence, group(sequence), true);
+		}
+		assert_eq!(drain(&mut queue, now(), false), vec![38, 39, 40]);
+		assert!(queue.rejoin(now()).is_empty());
+		assert_eq!(queue.cursor(), None);
+		// It joins as a live join does, at the first group a decoder can
+		// start at, and waits for no lower one.
+		queue.push(2, group(2), false);
+		queue.push(3, group(3), true);
+		assert_eq!(drain(&mut queue, patient(), false), vec![3]);
+		queue.push(4, group(4), true);
+		assert_eq!(drain(&mut queue, patient(), false), vec![4]);
+		assert_eq!(queue.counters.dropped_late, 0);
+		assert_eq!(queue.counters.skipped_join, 1);
+		assert_eq!(queue.counters.delivered, 5);
+		assert_eq!(queue.counters.last, Some(4));
+	}
+
+	#[test]
+	fn what_is_still_held_when_the_publisher_starts_again_is_handed_back_and_counted() {
+		// The group at the cursor half read, a hole after it, and a group
+		// behind the hole, when the publisher goes.
+		let mut queue = Queue::new("a0".into(), Start::Live);
+		queue.push(10, group(10), true);
+		assert_eq!(drain(&mut queue, now(), false), vec![10]);
+		queue.frame(11, piece(11, 0), Some(true));
+		assert_eq!(frames_out(&mut queue, now(), false), vec![(11, 0)]);
+		queue.push(13, vec![piece(13, 0)], true);
+		take_rows();
+		let old = queue.rejoin(patient());
+		let sequences: Vec<u64> = old.iter().map(|(sequence, _)| *sequence).collect();
+		assert_eq!(sequences, vec![11, 13], "what was held, in sequence");
+		assert_eq!(old[1].1, vec![piece(13, 0)]);
+		let counters = &queue.counters;
+		assert_eq!(
+			counters.received,
+			counters.delivered + counters.dropped_late + counters.skipped_join + counters.repeated,
+			"every group received is accounted for"
+		);
+		assert_eq!(counters.holes_abandoned_end, 1);
+		let rows = take_rows();
+		assert!(
+			rows.iter().any(|row| row.contains(r#""kind":"hole""#)
+				&& row.contains(r#""from":12,"to":12"#)
+				&& row.contains(r#""reason":"end""#)),
+			"{rows:?}"
+		);
+		queue.push(0, group(0), true);
+		assert_eq!(drain(&mut queue, now(), false), vec![0]);
 	}
 
 	#[test]

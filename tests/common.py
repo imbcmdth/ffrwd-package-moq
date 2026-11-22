@@ -144,7 +144,7 @@ def run(argv: list[str], deadline: int, **kwargs) -> subprocess.CompletedProcess
 
 
 # What a subscribe row's `kind` is; see moq_core::order::ROWS_SCHEMA.
-SUBSCRIBE_ROWS = ("track", "hole", "late", "skipped", "reconnect")
+SUBSCRIBE_ROWS = ("track", "hole", "late", "skipped", "reconnect", "restart")
 
 
 class Tail:

@@ -154,6 +154,49 @@ impl crate::order::Weigh for Received {
 	}
 }
 
+/// The first frame of the last group a reader started handing on: what
+/// tells that group served again from one of the same number that is not
+/// the same group.
+#[derive(Clone, Debug)]
+pub struct FirstFrame {
+	pub group: u64,
+	payload: Bytes,
+}
+
+impl FirstFrame {
+	pub fn of(frame: &Received) -> Self {
+		Self {
+			group: frame.group,
+			payload: frame.payload.clone(),
+		}
+	}
+
+	/// Whether `frame` is this group's first frame again, byte for byte.
+	pub fn again(&self, frame: &Received) -> bool {
+		frame.group == self.group && frame.frame_in_group == 0 && frame.payload == self.payload
+	}
+}
+
+/// Whether the first frame a track brings once it is taken up again, with
+/// nothing else showing whether its publisher carried on, is a publisher
+/// numbering its groups from nothing. One that carried on counts on from
+/// where it was: the next group, or the group it was in the middle of or
+/// had just finished, served again from its first frame. A group below
+/// that, or one of the same number whose first frame is not the one this
+/// reader had, belongs to a publisher that started again.
+pub fn started_again(cursor: Option<u64>, last: Option<&FirstFrame>, frame: &Received) -> bool {
+	let Some(cursor) = cursor else {
+		return false;
+	};
+	if frame.group + 1 < cursor {
+		return true;
+	}
+	match last {
+		Some(last) if frame.group == last.group && frame.frame_in_group == 0 => !last.again(frame),
+		_ => false,
+	}
+}
+
 /// What a subscription hands over next: one frame, or word that the
 /// group being read is whole.
 #[derive(Clone, Debug)]
@@ -230,5 +273,79 @@ impl FrameStream {
 				None => return Ok(None),
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn frame(group: u64, index: u64, payload: &'static [u8]) -> Received {
+		Received {
+			group,
+			frame_in_group: index,
+			timestamp_us: 0,
+			payload: Bytes::from_static(payload),
+		}
+	}
+
+	#[test]
+	fn a_publisher_that_carried_on_counts_on() {
+		let last = FirstFrame::of(&frame(40, 0, b"forty"));
+		// The next group, and the group it had got to, served again.
+		assert!(!started_again(
+			Some(41),
+			Some(&last),
+			&frame(41, 0, b"forty-one")
+		));
+		assert!(!started_again(
+			Some(41),
+			Some(&last),
+			&frame(40, 0, b"forty")
+		));
+		assert!(!started_again(
+			Some(40),
+			Some(&last),
+			&frame(40, 0, b"forty")
+		));
+		assert!(!started_again(
+			Some(41),
+			Some(&last),
+			&frame(90, 0, b"ninety")
+		));
+	}
+
+	#[test]
+	fn a_publisher_numbering_from_nothing_started_again() {
+		let last = FirstFrame::of(&frame(40, 0, b"forty"));
+		assert!(started_again(Some(41), Some(&last), &frame(3, 0, b"three")));
+		// The number the reader had just finished, or was in the middle of,
+		// but not the frame it had: another publisher's group 40.
+		assert!(started_again(
+			Some(41),
+			Some(&last),
+			&frame(40, 0, b"another")
+		));
+		assert!(started_again(
+			Some(40),
+			Some(&last),
+			&frame(40, 0, b"another")
+		));
+		// Nothing to compare a frame past the first with, and no cursor yet.
+		assert!(!started_again(
+			Some(41),
+			Some(&last),
+			&frame(40, 2, b"another")
+		));
+		assert!(!started_again(None, Some(&last), &frame(3, 0, b"three")));
+	}
+
+	#[test]
+	fn a_finished_group_served_again_is_known_by_its_first_frame() {
+		let last = FirstFrame::of(&frame(15, 0, b"fifteen"));
+		assert!(last.again(&frame(15, 0, b"fifteen")));
+		assert!(!last.again(&frame(15, 0, b"another")));
+		assert!(!last.again(&frame(16, 0, b"fifteen")));
+		assert!(!last.again(&frame(15, 1, b"fifteen")));
 	}
 }

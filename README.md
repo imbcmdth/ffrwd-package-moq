@@ -667,14 +667,15 @@ The subscriber notices when the session's protocol task ends, or when
 a track cannot be subscribed to again on it. It dials again, a doubling
 wait apart (half a second up to five), waits for the broadcast to be
 announced, reads the catalog again and takes every track up at the live
-edge. The tracks have to come back under the same names with the same
-init segments, or what follows is not the stream this run described,
-and that stops it. So does a track whose first group on the new session
-is numbered below where the reader had got: that publisher started
-again, and its timestamps went back with it. Otherwise each hold is
-told its track restarted, which gives up the hole between the two
-sessions at once, and a video track waits for a sync sample again,
-since the frames it would have referred back to went with that hole.
+edge. The tracks have to come back under the same names, carrying what
+a decoder reads unchanged, or what follows is not the stream this run
+described, and that stops it. A track whose first group on the new
+session is numbered below where the reader had got belongs to a
+publisher that started again, which the next section is about.
+Otherwise each hold is told its track restarted, which gives up the
+hole between the two sessions at once, and a video track waits for a
+sync sample again, since the frames it would have referred back to went
+with that hole.
 
 The publisher keeps its broadcast in the module rather than the
 session, so groups go on being written while a new session is dialed
@@ -697,6 +698,148 @@ back on the first dial, and the reader's video and audio go on after a
 gap of the idle timeout plus the time the relay was away, the first
 video packet after it a keyframe.
 
+### A publisher that starts again
+
+A program that publishes a broadcast is sometimes replaced. Its process
+is lost and a new one is started on another machine, or its run ends,
+its input having ended, and the next run of the same query starts. Each
+time, a new publisher publishes the same broadcast name with the same
+query and settings, and its timestamps and group numbers start over. A
+reader that copies the broadcast on, to an RTMP push, an HLS output or a
+file, carries on across that with a gap rather than ending.
+
+What a subscriber sees depends on how the publisher went. Against
+moq-relay 0.14.13:
+
+- A publisher killed outright says nothing, and the relay hears it gone
+  only at its QUIC idle timeout, 30 seconds. A new publisher that
+  announces the name before then takes it over at once: the relay
+  replaces a live broadcast from another publisher rather than wait out
+  the old session. The subscriber's subscriptions are reset, and on its
+  own session, which stays up, the broadcast is unannounced and
+  announced again, its route now starting at the new publisher's origin.
+  With nobody to take over, the relay fails the tracks at its idle
+  timeout and drops the broadcast once its linger, 5 seconds, is over.
+- A publisher whose run ends finishes its tracks, and the subscriber's
+  tracks end. The relay goes on announcing the finished broadcast until
+  the publisher's session closes and the linger after it is over, 7 to 8
+  seconds in all, unless a new publisher takes the name first. A
+  subscriber that dials in that time is handed the finished broadcast,
+  its catalog and its last group again.
+- Either way the new publisher numbers its groups from 0, and its
+  timestamps start at 0.
+
+So the reader watches what its session's relay announces at the
+broadcast's path. When the broadcast it reads goes away, its tracks
+finished or the broadcast closed under a session that is still up, it
+waits for the path to be announced again, reads the catalog and takes
+every track up at the live edge. A session that ends meanwhile is dialed
+again. A broadcast the reader has already read to its end is passed
+over, since the relay goes on announcing it for a few seconds. The
+reader knows it as the same broadcast on the same session, by a route
+that starts at the same origin on a new session, and, where the wire
+carries no route, by its last group arriving again byte for byte. That
+last case is said on stderr, and the group is dropped.
+
+Whether that is the same publisher decides the rest. A publisher keeps
+its origin across its own sessions and a new process does not, so a route
+that starts at another origin is a new publisher. A publisher that
+finished its tracks does not come back. Where the wire carries no route,
+as moq-transport up to draft 16 does not (Cloudflare's relay speaks
+draft 16), the reader takes it as a publisher that started again when:
+
+- a track's first group is numbered below where the reader had got;
+- a track's first group has the number the reader had just reached, but
+  its first frame is not the frame the reader had;
+- the first media packet the new subscription brings is behind the last
+  one handed on. What a track still held of the old publisher and lets go
+  of before then goes out under the old shift and says nothing either way.
+
+A publisher that carried on is taken up as after a dropped session, its
+packets going out as they come. For one that started again:
+
+- What a track still holds of the old publisher, groups kept behind a
+  hole it never filled, goes out first, and the hole is named in a HOLE
+  row. Then each track joins the new numbering at the first group a
+  decoder can start at, so the first video packet after the gap is a
+  keyframe.
+- Every track has to carry what a decoder reads unchanged: its codec,
+  its decoder configuration (the `avcC`, the `esds`), its geometry, its
+  timescale, its sample rate and its channels. A real ffrwd program
+  started again with the same query writes the same init segments byte
+  for byte. One that differs only where no decoder looks (a track
+  number, a creation time, the fragment defaults) carries on, its
+  fragments read by the init segment that came back. Anything else stops
+  the run, naming what changed.
+- Every track's timestamps get the same shift, so the sound keeps its
+  place against the picture. The shift makes the gap in the output as
+  long as the stream was away by the wall clock, and no timestamp goes
+  back. Every later packet of that publisher gets the same shift, and the
+  next restart works out a new one.
+- The shift is worked out from packets that arrived when they were made.
+  A live join hands each track the group in progress all at once (for
+  video a GOP that began up to a GOP ago, for audio its newest group),
+  and then the publisher's new frames one at a time. So the reader holds
+  what the tracks bring in for at least 300 ms, which reaches past that
+  burst, and until every media track has a packet, for 2 seconds at most
+  after the first one. The packet in the hold that waited least decides
+  the shift. Messages are held with the media and get the same shift, but
+  decide nothing while the reader has media tracks: a message alone waits
+  for the media, for 2 seconds at most, and with no media by then the
+  shift is read off the messages. A media track whose first packet comes
+  after the shift is fixed gets the same shift, and a media packet that
+  would go out at or before its track's last one is dropped, as is what
+  follows it until a sync sample past that point.
+- The gap is measured against each track's own pace before it. For every
+  packet of the track's last two seconds, the reader takes the packet's
+  end and carries it forward by the wall-clock time since the packet
+  arrived, which says where the output had got when the last packet
+  before the gap went out; the median of those is the track's pace. Each
+  track has its own, because a publisher whose input ends hands on its
+  encoder's delay at once: in the loop below, the last 11 pictures of a
+  run that ended, a third of a second of them, arrived within 10 ms,
+  while the sound stayed paced.
+
+`restart_s` is how long a reader whose publisher finished its tracks
+waits for a new one, in seconds. A run that ends and a file published to
+its end look the same on the wire when they finish, and a file must
+still end its run, so the default, 0, ends it there as before. A live
+egress sets it to how long its program may take to come back.
+
+A lost publisher leaves a broadcast dropped with its tracks unfinished,
+and the relay fails those tracks some seconds before it drops the
+broadcast. Either one is waited for as long as `restart_s` or
+`reconnect_s` allows, whichever is longer, since a broadcast that went
+away under a reader was already waited for as long as a dropped session.
+
+`tests/live_restart.py` is the loop that holds this. It runs a local
+relay and three publishers of one rung, its audio and a track of
+messages, one after another:
+
+- the first is killed outright 15 seconds in, every process of it at
+  once, so nothing closes its session;
+- the second starts 3 seconds later and runs to the end of its file;
+- the third starts 4 seconds after that.
+
+The reader is in the egress shape: `subscribe` stream-copied to an FLV
+under `ffrwd run`, with `restart_s` at 20. Every source has a white frame
+and a click on each of its own whole seconds, so the loop can measure
+each gap and the sound's place against the picture. The egress shape
+reads no messages, so a second reader takes the picture, the sound and
+the messages into a NUT beside it.
+
+Against moq-relay 0.14.13 the reader follows both restarts, `replaced`
+and then `finished`. Each gap in the FLV is within 20 ms of how long the
+stream was away by the publishers' own clocks. The first video packet
+after each gap is a keyframe, and the clicks stay within a millisecond of
+where they were against the white frames. The reader ends `restart_s`
+after the last publisher's tracks finish. With each new publisher started
+45 seconds after the last one went, past the relay's idle timeout, the
+gaps are still within 20 ms of the time away, and `ffrwd run` does not
+stop a reader that hands on nothing for that long. The second reader's
+messages never go back, and every one after a gap is a message of the
+publisher's own at its own pts under the shift its reader's row states.
+
 ### What a subscriber says
 
 The subscriber's rows are the node's rows, beside its outputs, in the
@@ -718,7 +861,10 @@ begin in; not a loss, since nothing had started, but not silent
 either), `fetches` and `fetches_refused` (groups asked for outright,
 and the ones the relay would not serve), `hold_max_groups` and
 `hold_max_bytes`, `reorder_max` (the widest the hold ever had to
-stretch in sequence), and `first` and `last`. Since 0.9.2 it also
+stretch in sequence), `first` and `last`, and `behind` (media packets
+that would have gone out at or before the track's last packet, and the
+packets after them until a sync sample, dropped; see "A publisher that
+starts again"). Since 0.9.2 it also
 carries `gap_max_ms` and `call_max_ms` over the window, as the
 publisher's rows do: the longest the session lay undriven between two
 pulls, and the longest one pull lasted, most of which is waiting for
@@ -731,7 +877,18 @@ Beside them, a row per incident: a HOLE row for every hole given up on
 every group that arrived too late to use, and a SKIPPED row, the same
 shape, for every group a live join stepped over on its way to one a
 decoder can start at. A RECONNECT row says a dropped session was
-replaced (`attempts`, `down_ms`, `error`, as the publisher's). None of
+replaced (`attempts`, `down_ms`, `error`, as the publisher's). A RESTART
+row says the reader followed a publisher that started again: `seen`
+(`finished`, its tracks finished and a broadcast came after; `replaced`,
+another publisher announced it; `renumbered` or `rewound`, a track's
+first group or first timestamp came back behind where the reader had
+got), `away_ms` (how long the stream was away, as the output shows it:
+from the end of the last packet before the gap to the newest of the
+first packets after it) and `shift_us` (what that publisher's
+timestamps get from then on, in microseconds). The reader says the same
+in one line on its stderr. A publisher that started again before the
+reader had handed anything on leaves no gap and loses nothing, so it has
+no RESTART row. None of
 them is ever silent, so a run that lost something says which groups by
 sequence. The first 256
 of each per track are spelled out and the rest are only counted.
@@ -1049,14 +1206,16 @@ carried for wasm32-wasip2 fixes upstream does not ship yet).
   beside it, a track of messages apiece.
 - `subscribe(relay, broadcast, cert DEFAULT '', token DEFAULT '',
   start DEFAULT 'live', hold_ms DEFAULT NULL, hold_mib DEFAULT 64,
-  join_ms DEFAULT 2000, reconnect_s DEFAULT 60)`
+  join_ms DEFAULT 2000, reconnect_s DEFAULT 60, restart_s DEFAULT 0)`
   returns `source`: a FROM relation, one row per rendition of the
   broadcast's catalog, a video cell and an audio cell, either NULL,
   and the catalog's data tracks as data cells of the first row.
   Unbounded. `start` is which end of a running broadcast to join at,
   `'live'` or `'backlog'`; the three numbers after it are the hold the
-  groups are put back in order in, and `reconnect_s` how long a dropped
-  session is tried again for. See above.
+  groups are put back in order in, `reconnect_s` how long a dropped
+  session is tried again for, and `restart_s` how long a reader whose
+  publisher finished its tracks waits for one that starts again. See
+  above.
 
 ## Building
 
