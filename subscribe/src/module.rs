@@ -135,6 +135,8 @@ struct SourceTrack {
 	coded: CodedStream,
 	row: u32,
 	rendition: RenditionMeta,
+	/// Whether its rows are cues read off a text track.
+	text: bool,
 }
 
 struct RenditionMeta {
@@ -248,6 +250,13 @@ enum Body {
 	/// One message per group: the frame is the message's pts in
 	/// microseconds, then its bytes, handed on in `1/timescale` ticks.
 	Data { timescale: u32 },
+	/// A WebVTT track: each fragment a sample of the cues shown over its
+	/// span, read by the track its init segment describes and handed on as
+	/// cue rows; see [`moq_core::text`].
+	Text {
+		track: ffrwd_bmff::track::Track,
+		cues: moq_core::text::Reassembly,
+	},
 }
 
 /// One rendition being read: how to take its fragments apart, where its
@@ -295,6 +304,7 @@ impl Rendition {
 			Body::Media(track) => track.timescale,
 			Body::Legacy(_) => 1_000_000,
 			Body::Data { timescale } => *timescale,
+			Body::Text { track, .. } => track.timescale,
 		}
 	}
 
@@ -581,7 +591,48 @@ fn data_track(
 			codecs: Some(rendition.codec.clone()),
 			bandwidth: None,
 		},
+		text: false,
 	})
+}
+
+/// One catalog text rendition as the track a source publishes: cue rows,
+/// in the ticks its init segment counts in, read out of a `wvtt` track.
+fn text_track(rendition: &moq_core::catalog::Rendition) -> Result<(SourceTrack, Body), String> {
+	let track = ffrwd_bmff::track::Track::from_init(&rendition.init)
+		.map_err(|err| format!("rendition '{}': init segment: {err}", rendition.name))?;
+	if &track.entry.kind != b"wvtt" {
+		return Err(format!(
+			"rendition '{}' is packaged as '{}', and a text track reads wvtt",
+			rendition.name,
+			String::from_utf8_lossy(&track.entry.kind)
+		));
+	}
+	Ok((
+		SourceTrack {
+			coded: CodedStream {
+				codec: "json".to_string(),
+				time_base: Rational {
+					num: 1,
+					den: track.timescale as i32,
+				},
+				format: CodedFormat::Data,
+				extradata: Vec::new(),
+				profile: None,
+				level: None,
+			},
+			row: rendition.row,
+			rendition: RenditionMeta {
+				name: Some(rendition.name.clone()),
+				codecs: Some(rendition.codec.clone()),
+				bandwidth: None,
+			},
+			text: true,
+		},
+		Body::Text {
+			track,
+			cues: moq_core::text::Reassembly::default(),
+		},
+	))
 }
 
 /// One catalog rendition as the track a source publishes: its coded
@@ -592,6 +643,9 @@ fn source_track(
 ) -> Result<(SourceTrack, Body), String> {
 	if let moq_core::catalog::Kind::Data { timescale } = rendition.kind {
 		return Ok((data_track(rendition, timescale)?, Body::Data { timescale }));
+	}
+	if let moq_core::catalog::Kind::Text = rendition.kind {
+		return text_track(rendition);
 	}
 	if rendition.packaging == moq_core::catalog::Packaging::Legacy {
 		return legacy_track(rendition);
@@ -672,6 +726,7 @@ fn source_track(
 				codecs: Some(rendition.codec.clone()),
 				bandwidth: rendition.bitrate,
 			},
+			text: false,
 		},
 		Body::Media(track),
 	))
@@ -780,6 +835,7 @@ fn legacy_track(rendition: &moq_core::catalog::Rendition) -> Result<(SourceTrack
 				codecs: Some(rendition.codec.clone()),
 				bandwidth: rendition.bitrate,
 			},
+			text: false,
 		},
 		Body::Legacy(codec),
 	))
@@ -1061,13 +1117,18 @@ impl Reader {
 
 	/// What a track still holds of a publisher that started again, out in
 	/// sequence under the shift it was made under, before the track joins
-	/// the new numbering at a sync sample.
+	/// the new numbering at a sync sample. A text track's cues still on
+	/// screen end there, where that publisher last had them.
 	fn let_out_old(&mut self, index: usize) -> Result<(), String> {
 		let rendition = &mut self.renditions[index];
 		let old = rendition.queue.rejoin(self.hold);
 		let mut packets = Vec::new();
 		for (_, frames) in old {
 			demux(rendition, index, frames, &mut packets)?;
+		}
+		if let Body::Text { track, cues } = &mut rendition.body {
+			let timescale = track.timescale;
+			packets.extend(cues.finish().iter().map(|row| text_packet(row, timescale)));
 		}
 		rendition.begin_again();
 		for packet in packets {
@@ -1346,7 +1407,7 @@ impl Reader {
 			// by the init segment that came back, which may number its track
 			// or lay out its defaults otherwise.
 			if entry.init != rendition.entry.init {
-				if let Body::Media(_) = rendition.body {
+				if let Body::Media(_) | Body::Text { .. } = rendition.body {
 					let track =
 						ffrwd_bmff::track::Track::from_init(&entry.init).map_err(|err| {
 							Resume::Refused(format!(
@@ -1354,7 +1415,10 @@ impl Reader {
 								rendition.name
 							))
 						})?;
-					rendition.body = Body::Media(track);
+					match &mut rendition.body {
+						Body::Text { track: was, .. } => *was = track,
+						body => *body = Body::Media(track),
+					}
 				}
 			}
 			rendition.entry = entry;
@@ -1410,6 +1474,11 @@ impl Reader {
 				demux(rendition, index, frames, packets)?;
 			}
 			asking.extend(ask.drain(..).map(|sequence| (index, sequence)));
+			// At the end every cue still on screen has its final row.
+			if let (true, Body::Text { track, cues }) = (last, &mut rendition.body) {
+				let timescale = track.timescale;
+				packets.extend(cues.finish().iter().map(|row| text_packet(row, timescale)));
+			}
 		}
 		let now = std::time::Instant::now();
 		for (index, packets) in demuxed.into_iter().enumerate() {
@@ -1442,6 +1511,14 @@ impl Reader {
 		let out = self.timeline.take_ready();
 		let any = !out.is_empty();
 		for (index, stamp, mut packet) in out {
+			// A cue row carries its times inside it as well, and they move
+			// with the shift its pts gets.
+			if let Body::Text { track, .. } = &self.renditions[index].body {
+				if stamp.pts != packet.pts {
+					let seconds = (stamp.pts - packet.pts) as f64 / f64::from(track.timescale.max(1));
+					packet.data = moq_core::text::shifted(&packet.data, seconds)?;
+				}
+			}
 			packet.pts = stamp.pts;
 			packet.dts = packet.dts.map(|_| stamp.dts);
 			pads[index].push(packet);
@@ -1475,7 +1552,7 @@ fn decodable(rendition: &Rendition, frames: &[Received]) -> bool {
 /// alone - says nothing. A frame that cannot be read says no.
 fn frame_decides(rendition: &Rendition, frame: &Received) -> Option<bool> {
 	match &rendition.body {
-		Body::Data { .. } => Some(true),
+		Body::Data { .. } | Body::Text { .. } => Some(true),
 		Body::Legacy(codec) => match legacy_sample(rendition, *codec, &frame.payload) {
 			Ok(Some((_, _, keyframe))) => Some(!rendition.video || keyframe),
 			Ok(None) => None,
@@ -1513,6 +1590,7 @@ fn demux(
 		}
 		match rendition.body {
 			Body::Data { timescale } => take_message(timescale, index, frame, packets)?,
+			Body::Text { .. } => take_text(rendition, index, &frame, packets)?,
 			Body::Media(_) => take_fragment(rendition, index, &frame.payload, packets)?,
 			Body::Legacy(codec) => take_legacy(rendition, codec, index, frame, packets)?,
 		};
@@ -1638,6 +1716,47 @@ fn take_legacy(
 		data,
 	});
 	Ok(true)
+}
+
+/// One text fragment's cue rows onto a pad: each sample's cues, followed
+/// from the samples before it, as the rows [`moq_core::text::Reassembly`]
+/// makes of them, each at the time it applies in the track's own ticks.
+fn take_text(
+	rendition: &mut Rendition,
+	index: usize,
+	frame: &Received,
+	pad: &mut Vec<Packet>,
+) -> Result<bool, String> {
+	let Body::Text { track, cues } = &mut rendition.body else {
+		unreachable!("a text track's frames are text fragments");
+	};
+	let timescale = track.timescale;
+	let mut any = false;
+	for sample in track
+		.fragment_samples(&frame.payload)
+		.map_err(|err| format!("track {index}, group {}: {err}", frame.group))?
+	{
+		let bytes = ffrwd_bmff::fragment::sample_bytes(&frame.payload, 0, &sample)
+			.map_err(|err| format!("track {index}, group {}: {err}", frame.group))?;
+		let shown = ffrwd_bmff::webvtt::cues(bytes)
+			.map_err(|err| format!("track {index}, group {}: {err}", frame.group))?;
+		for row in cues.sample(sample.pts, sample.duration, shown) {
+			pad.push(text_packet(&row, timescale));
+			any = true;
+		}
+	}
+	Ok(any)
+}
+
+/// One cue row as the packet its port hands on.
+fn text_packet(row: &moq_core::text::Out, timescale: u32) -> Packet {
+	Packet {
+		pts: row.pts,
+		dts: Some(row.pts),
+		duration: None,
+		keyframe: true,
+		data: row.json(0, timescale),
+	}
 }
 
 /// One message onto a pad: the bytes after the frame's pts as they
@@ -1767,6 +1886,9 @@ impl Node for Subscribe {
 		}
 		for ((track, name), row) in catalog.tracks.iter().zip(&names).zip(rows) {
 			let output = match track.coded.format {
+				CodedFormat::Data if track.text => {
+					Output::rows(name).schema_json(moq_core::text::ROW_SCHEMA)
+				}
 				CodedFormat::Data => Output::rows(name),
 				_ => Output::packets(name).coded(track.coded.clone()),
 			};
@@ -1837,7 +1959,7 @@ impl Node for Subscribe {
 				})
 				.collect();
 			let timeline = Timeline::new(renditions.iter().map(|rendition| {
-				let media = !matches!(rendition.body, Body::Data { .. });
+				let media = !matches!(rendition.body, Body::Data { .. } | Body::Text { .. });
 				(rendition.timescale(), media)
 			}));
 			Ok::<_, String>((

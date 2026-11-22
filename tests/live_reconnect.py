@@ -9,10 +9,13 @@ minutes, their one resubscribe on the dead session failed, and both runs
 ended. Since 0.6.6 both halves of this package open a new session instead,
 for as long as `reconnect_s` allows (60s by default).
 
-The shape of a run: a local moq-relay, a PACED publisher (one rung and its
-audio, a row per published group), and the subscribe module under the
-sidecar reading both tracks on one session into one NUT, split into a .nut
-file per track afterwards. After `--warmup`
+The shape of a run: a local moq-relay, a PACED publisher (one rung, its
+audio and a text track of the cue rows in `tests/data/cue-track.nut`, a row
+per published group), and the subscribe module under the sidecar reading
+every track on one session into one NUT, its picture and sound split into a
+.nut file each afterwards. The publisher is publish.wasm under the sidecar
+fed as `ffrwd run` feeds a node sink (see `common.start_publish_node`),
+since a query cannot bind a column to its text input yet. After `--warmup`
 seconds of media the relay is killed - a process gone, which says nothing
 to either side, so each finds out from the QUIC idle timeout - and after
 `--down` seconds it is started again on the same port. Then the run goes on
@@ -26,11 +29,16 @@ What it owes:
     the end of the broadcast, exit 0;
   - both .nut files carry media from after the relay came back, their
     timestamps never going backwards across the gap, and the first video
-    packet after the gap is a keyframe.
+    packet after the gap is a keyframe;
+  - the text track's rows never go back, and come from both sides of the
+    gap: every cue of the fixture the reader was there for on either side
+    comes back as it went in, and a cue on screen when the reader lost the
+    session or took it up again comes back as a piece of itself, cut where
+    the gap is.
 
 Never collected by any suite: it needs moq-relay, ffmpeg, ffprobe, cargo
 with the wasm32-wasip2 target and a wasi-sdk clang, and the sidecar. It
-starts a relay and a reader of its own and stops those alone.
+starts a relay, a publisher and a reader of its own and stops those alone.
 """
 
 from __future__ import annotations
@@ -39,7 +47,6 @@ import argparse
 import json
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -50,13 +57,13 @@ from common import (
     SIDECAR,
     Tail,
     build_guests,
-    ffrwd_argv,
     free_udp_port,
     guest,
     kill_tree,
+    nut_rows,
     run,
-    spawn,
     split_streams,
+    start_publish_node,
     start_relay,
     start_subscribe_node,
 )
@@ -74,40 +81,61 @@ TOOL_DEADLINE = 120
 # start, with room.
 MEND_DEADLINE = 90.0
 
-PUBLISH_QUERY = """
-COPY (
-  SELECT scale(f.video[1], 640, -2), f.audio[1]
-  FROM input(:'source', realtime => true) f
-) TO ffrwd.moq.publish(:'relay', :'broadcast', COALESCE(:'cert', ''), '', 200, 'groups')
-  WITH (video_bitrate '800k', gop 30, preset 'veryfast', tune 'zerolatency',
-        audio_bitrate '128k')
-"""
+CUES = PACKAGE / "tests" / "data" / "cue-track.nut"
+CUE_SOURCE = PACKAGE / "tests" / "data" / "cue-track.txt"
+# How far behind its picture the publisher holds the text track, which is
+# how far behind the reader's text runs.
+TEXT_HOLD = 3.0
 
 
-def make_source(path: Path, seconds: int) -> None:
+def make_program(path: Path, seconds: int) -> None:
+    """The program's picture and sound as an encoder hands them to publish:
+    640x360 H.264 at a keyframe a second, AAC beside it."""
     done = run([
         "ffmpeg", "-v", "error", "-y",
         "-f", "lavfi", "-i", f"testsrc2=size=640x360:rate={RATE}",
         "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate={SAMPLE_RATE}",
-        "-ac", "2", "-c:a", "aac",
-        "-t", str(seconds), "-c:v", "libx264", "-preset", "ultrafast",
-        "-g", str(GOP), "-pix_fmt", "yuv420p", str(path),
+        "-t", str(seconds), "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+        "-b:v", "800k", "-g", str(GOP), "-pix_fmt", "yuv420p",
+        "-ac", "2", "-c:a", "aac", "-b:a", "128k", "-f", "nut", str(path),
     ], TOOL_DEADLINE, capture_output=True, text=True)
     if done.returncode != 0:
         sys.exit(f"building the source failed:\n{done.stderr[-800:]}")
 
 
-def start_publisher(query: Path, source: Path, port: int, cert_hex: str) -> Tail:
-    env = dict(os.environ)
-    env.setdefault("FFRWD_WASM", str(SIDECAR))
-    argv = ffrwd_argv("run", "-f", str(query),
-                      "-v", f"source={source}",
-                      "-v", f"relay=moqt://127.0.0.1:{port}",
-                      "-v", f"broadcast={BROADCAST}",
-                      "-v", f"cert={cert_hex}", "-q")
-    print("+ publisher:", " ".join(argv[:6]), "...", flush=True)
-    return Tail(spawn(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                      text=True, env=env, cwd=PACKAGE))
+def cut_cues(path: Path, seconds: int) -> None:
+    """The fixture's cue rows up to two seconds short of `seconds`, so they
+    end with the picture."""
+    done = run(["ffmpeg", "-v", "error", "-y", "-i", str(CUES), "-map", "0", "-c", "copy",
+                "-t", str(seconds - 2), str(path)], TOOL_DEADLINE, capture_output=True, text=True)
+    if done.returncode != 0:
+        sys.exit(f"cutting the cues failed:\n{done.stderr[-800:]}")
+
+
+def fixture_cues(seconds: int) -> list[dict]:
+    """The fixture's cues a publisher of `seconds` writes."""
+    out = []
+    for line in CUE_SOURCE.read_text().split("\n"):
+        if line.strip():
+            pts, row = line.split("\t", 1)
+            if int(pts) / 1e6 < seconds - 2:
+                out.append(json.loads(row))
+    return out
+
+
+def start_publisher(work: Path, source: Path, cues: Path, port: int,
+                    cert_hex: str) -> tuple[Tail, list]:
+    params = {"relay": f"moqt://127.0.0.1:{port}", "broadcast": BROADCAST, "cert": cert_hex,
+              "rows": "groups", "hold_s": 0, "text_hold_ms": int(TEXT_HOLD * 1000)}
+    rung = {"row": 0, "rendition": {"name": "360p"}}
+    feeds = [
+        {"port": "video", "source": source, "stream": "0:v:0",
+         "rate": {"num": RATE, "den": 1}, "pad": rung},
+        {"port": "audio", "source": source, "stream": "0:a:0",
+         "rate": {"num": SAMPLE_RATE, "den": 1}, "pad": rung},
+        {"port": "text", "source": cues, "stream": "0:d:0", "rate": None, "pad": None},
+    ]
+    return start_publish_node(guest("publish"), params, feeds, work, "publisher")
 
 
 def start_reader(port: int, cert_hex: str, nut: Path) -> Tail:
@@ -200,31 +228,87 @@ def running_max(times: list[float], upto: int) -> float:
     return max(times[:upto])
 
 
+def judge_text(found: list[dict], fixture: list[dict]) -> list[str]:
+    """What the text track owes across the gap: rows that never go back, and
+    every cue the reader was there for, whole or cut where the gap is."""
+    problems = []
+    if not found:
+        return ["text: no rows"]
+    times = [row["time"] for row in found]
+    if any(b < a for a, b in zip(times, times[1:])):
+        problems.append("text: a row went back")
+    jumps = [(b - a, index) for index, (a, b) in enumerate(zip(times, times[1:]), start=1)]
+    widest, at = max(jumps)
+    lost, back = times[at - 1], times[at]
+    print(f"  text: {len(found)} rows, {times[0]:.3f}s to {times[-1]:.3f}s, gap from "
+          f"{lost:.3f}s to {back:.3f}s", flush=True)
+    if widest < 10.0:
+        problems.append(f"text: no gap where the relay was down (widest {widest:.3f}s)")
+        return problems
+    by_text = {cue["text"]: cue for cue in fixture}
+    finals = [row["row"] for row in found if row["row"].get("final")]
+    whole, pieces = [], []
+    for row in finals:
+        cue = by_text.get(row["text"])
+        if cue is None or row.get("voice") != cue.get("voice"):
+            problems.append(f"text: {row} is none of the fixture's cues")
+            continue
+        exact = (abs(row["start_t"] - cue["start_t"]) < 0.002
+                 and abs(row["end_t"] - cue["end_t"]) < 0.002)
+        inside = (cue["start_t"] - 0.002 <= row["start_t"]
+                  and row["end_t"] <= cue["end_t"] + 0.002)
+        if exact:
+            whole.append(cue["text"])
+        elif inside:
+            pieces.append(row)
+        else:
+            problems.append(f"text: {row} runs outside its cue {cue}")
+    # Every cue the reader was there for on either side of the gap, whole.
+    owed = [cue["text"] for cue in fixture
+            if (times[0] <= cue["start_t"] and cue["end_t"] <= lost)
+            or back <= cue["start_t"]]
+    missing = [text for text in owed if text not in whole]
+    print(f"  text: {len(whole)} cues whole, {len(pieces)} cut at the gap; "
+          f"{len(missing)} of {len(owed)} owed missing", flush=True)
+    for row in pieces:
+        print(f"  text: cut at the gap: {json.dumps(row)}", flush=True)
+    if missing:
+        problems.append(f"text: the cues {missing[:4]} did not come back whole")
+    if len([text for text in whole if by_text[text]["start_t"] >= back]) < 5:
+        problems.append("text: under five cues after the gap")
+    return problems
+
+
 def one_run(args: argparse.Namespace) -> None:
     work = Path(tempfile.mkdtemp(prefix="moq-reconnect-", dir=args.work))
     relay = None
     publisher = reader = None
-    query = PACKAGE / ".live-reconnect-publish.sql"
+    feeders: list = []
     try:
         if args.build:
             certgen = build_guests(BUILD_DEADLINE)[2]
         else:
             certgen = (PACKAGE / "harness" / "certgen" / "target" / "release"
                        / ("certgen.exe" if os.name == "nt" else "certgen"))
-        made = run([certgen, work], TOOL_DEADLINE, capture_output=True, text=True)
+        # moq-relay reloads its certificate whenever the directory it sits in
+        # changes, so it sits apart from what the run writes.
+        certs = work / "certs"
+        certs.mkdir()
+        made = run([certgen, certs], TOOL_DEADLINE, capture_output=True, text=True)
         if made.returncode != 0:
             sys.exit(f"certgen failed:\n{made.stderr[-400:]}")
         cert_hex = made.stdout.strip()
 
-        source = work / "source.mp4"
-        make_source(source, args.seconds)
-        query.write_text(PUBLISH_QUERY)
+        source = work / "source.nut"
+        make_program(source, args.seconds)
+        cues = work / "cues.nut"
+        cut_cues(cues, args.seconds)
 
         port = free_udp_port()
-        relay = start_relay(port, work / "cert.pem", work / "key.pem", work / "relay.log")
+        relay = start_relay(port, certs / "cert.pem", certs / "key.pem", work / "relay.log")
         print(f"moq-relay pid {relay.pid} on 127.0.0.1:{port}", flush=True)
 
-        publisher = start_publisher(query, source, port, cert_hex)
+        publisher, feeders = start_publisher(work, source, cues, port, cert_hex)
         outputs = [work / "video.nut", work / "audio.nut"]
         reader = start_reader(port, cert_hex, work / "read.nut")
 
@@ -234,7 +318,7 @@ def one_run(args: argparse.Namespace) -> None:
         print(f"killing the relay at media {killed_at:.1f}s", flush=True)
         kill_tree(relay)
         time.sleep(args.down)
-        relay = start_relay(port, work / "cert.pem", work / "key.pem", work / "relay2.log")
+        relay = start_relay(port, certs / "cert.pem", certs / "key.pem", work / "relay2.log")
         print(f"moq-relay back, pid {relay.pid}, after {args.down:.1f}s", flush=True)
 
         def publisher_mended() -> bool:
@@ -259,7 +343,7 @@ def one_run(args: argparse.Namespace) -> None:
         print("--- reader stderr (tail) ---")
         print(reader.module_stderr()[-2500:])
         for row in publisher.rows:
-            if row.get("event") == "reconnect":
+            if row.get("event") == "reconnect" or "tracks" in row:
                 print("publisher row:", json.dumps(row))
         for row in reader.counters():
             if row.get("kind") == "reconnect":
@@ -273,19 +357,18 @@ def one_run(args: argparse.Namespace) -> None:
             problems.append(f"the reader exited {read}")
         problems += judge("video", packets(outputs[0]), True, killed_at)
         problems += judge("audio", packets(outputs[1]), False, killed_at)
+        problems += judge_text(nut_rows(work / "read.nut", "d:0"), fixture_cues(args.seconds))
         if problems:
             print("=== FAIL ===")
             for problem in problems:
                 print(" -", problem)
             sys.exit(1)
-        print("=== PASS: both halves reconnected and the media went on ===")
+        print("=== PASS: both halves reconnected and the media and the text went on ===")
     finally:
-        for child in (reader, publisher):
-            if child is not None:
-                kill_tree(child.child)
+        for child in [*feeders, *(c.child for c in (reader, publisher) if c is not None)]:
+            kill_tree(child)
         if relay is not None:
             kill_tree(relay)
-        query.unlink(missing_ok=True)
         if not args.keep:
             shutil.rmtree(work, ignore_errors=True)
         else:

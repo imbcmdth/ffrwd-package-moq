@@ -80,6 +80,15 @@ longest one call held it: the session runs only while a host call is
 on the executor, so the first is what a loaded machine costs, or on a
 host that calls only as packets arrive, how far apart they do).
 
+A text track's row also counts what it made of its cue rows: `cues`
+(finished cues written), `growing` (rows of an utterance still growing,
+passed over), `clipped` (cues written from where the track had got,
+since they arrived after part of them had gone out; counted in `cues`
+too), `late` (cues that ended before the track had got that far, which
+are dropped) and `empty` (rows with no span, no text or that do not
+read). The trailing row carries the same five over every text track. See
+"Text tracks".
+
 A session the relay dropped is replaced rather than the run ended; see
 "A dropped session" below. The publisher says so in a row of its own,
 whatever `rows` asks for: `event` is `reconnect`, with `attempts` (the
@@ -162,8 +171,9 @@ the backlog from the wait for a first reader; `unpaced` is the whole
 run. No row fell behind real time.
 
 Tracks carry hang's own delivery priorities, higher sent first:
-`catalog.json` at 100, audio at 80, video at 60, and a data track, which
-hang has no number for, at 90 (see "Data tracks"). They break the tie on
+`catalog.json` at 100, audio at 80, video at 60, and a data track and a
+text track, which hang has no number for, at 90 and 85 (see "Data
+tracks" and "Text tracks"). They break the tie on
 a session whose subscriber - a relay reading the whole broadcast -
 asks for every track alike, so a video keyframe cannot sit in the send
 queue in front of a sound.
@@ -291,7 +301,7 @@ audio's on a row with no video, and null where the catalog states none.
 The catalog is read at compile time, the way ffprobe reads a file, so
 the broadcast must be on the relay before the query compiles: the node's
 shape is the catalog, a packets output per media track and a data output
-per data track, grouped into relation rows, and only the outputs the
+per data track and per text track, grouped into relation rows, and only the outputs the
 query reads are subscribed to. A shape that sees no announce within 15 seconds asks again on a new session
 before it refuses the query: Cloudflare's relay has been seen not to
 announce a broadcast that was up to a fresh session, and a second one
@@ -991,6 +1001,142 @@ its clock's tick after that picture, 15 to 48 ms later at 30 fps.
 with the relay taken away mid-run (`--reconnect`), what is lost is only
 what went out while the reader had no session.
 
+## Text tracks
+
+Captions travel as a text track beside the picture and the sound: WebVTT
+in fragmented MP4 (ISO/IEC 14496-30), which is the text track CMAF
+defines and the one DASH and HLS players read as
+`application/mp4; codecs="wvtt"`. `publish` writes one from a column of
+cue rows, and `subscribe` hands one back as cue rows.
+
+### Publishing captions
+
+A column of cue rows beside the media becomes a text track:
+
+```pgsql
+COPY (
+  SELECT f.video[1], f.audio[1], ffrwd.parakeet.transcribe(f.audio[1]) AS captions
+  FROM input(:'source', realtime => true) f
+) TO ffrwd.moq.publish(:'relay', :'broadcast')
+```
+
+A cue row is what ffrwd's transcribers write and its caption consumers
+read:
+
+| field | |
+| --- | --- |
+| `text` | the cue's text, WebVTT cue text: `<i>`, `<b>`, `<c.class>` and the rest are its own |
+| `start_t`, `end_t` | where it shows, in seconds on the program's timeline |
+| `final` | false on each row of an utterance still growing, true on the row that ends it; a row without it is a whole cue |
+| `voice` | who is speaking, written as a `<v Name>` span around the text |
+
+ffrwd binds the column by its fields: a column whose rows carry `text`,
+`start_t` and `end_t` goes to the text track, and any other data column
+to a data track (see "Data tracks"). The track is named after the
+column's rendition, or `text`, `text.1`, ... in the order the query names
+them.
+
+Only finished cues are written. Each growing row of an utterance would
+otherwise be another cue over the same words, so rows with `final` false
+are passed over and counted. A cue is known only once it has finished,
+after it started, so the track's timeline is held `text_hold_ms` behind
+the newest time the publisher has seen on any input, 3000 by default. A
+cue that arrives within the hold is placed at its own start. One that
+arrives later starts where the track had got, and one that ended before
+that is dropped; the track's rows count both. The text track runs that
+far behind the picture.
+
+The default is measured. Over ffrwd/parakeet's `transcribe` on four
+LibriSpeech recordings and seven clips of synthesized commentary, 25
+final rows in all, a final row is written 0.40 to 1.28 s after its last
+word (median 0.80 s), and 1.2 to 16.8 s after its first (median 4.0 s),
+since parakeet ends an utterance at a pause. A row reaches publish once
+the 160 ms it was heard in has run, so the latest arrives 1.44 s after
+its cue ends, and 3000 drops none with 1.5 s to spare. How much is
+clipped depends on how long an utterance runs. At 3000, 15 of the 25
+cues start late, by a median of 1.5 s and at most 14 s, the long read
+sentences of the LibriSpeech recordings by 4 to 11 s, and a clipped cue
+keeps 1.6 to 2.4 s on screen. At 2000, 18 start late, by a median of
+2.2 s, and a clipped cue keeps 0.6 to 1.4 s.
+
+A cue's text is made safe for a `.vtt` file made from the track: a cue
+ends at an empty line there and a timing line is anything with `-->` in
+it. So lines that are empty or only white space are dropped, every line
+ends in a line feed whatever ended it before, and `-->` is written
+`--&gt;`, which a WebVTT reader shows as `-->`. A row whose text is
+nothing once its empty lines are gone is counted as `empty`. Tags and
+character references pass through as written.
+
+What goes on the wire:
+
+- The catalog names the track in a `text` section of this package's own,
+  beside `data`, with its init segment inside the entry as a media
+  rendition's is, and the language its rendition states:
+
+  ```json
+  "text": {"renditions": {"captions": {"codec": "wvtt", "container": {"kind": "cmaf", "init": "<base64>"}, "language": "en"}}}
+  ```
+
+  The init segment is one `trak`: a `text` handler, a `wvtt` sample entry
+  whose `vttC` is the WebVTT header, and the language in its `mdhd`. A
+  hang player reads past the section, as it does `data`.
+- The samples tile the track's timeline in milliseconds. Each covers a
+  span and carries every cue shown over it, a `vttc` box apiece with its
+  `vsid` and `payl`, or a `vtte` where nothing is shown. A cue that runs
+  across several samples is in each of them, so a reader that joins at
+  the newest group has the cues on screen from its first sample.
+- Samples are cut where a cue starts or ends and at least once a second.
+  A span with nothing shown that has settled for more than two seconds at
+  once, which a jump in the publisher's time leaves, goes out as one
+  sample.
+- Each sample is one `moof`+`mdat` fragment and one MoQ group of its own,
+  paced like every track's groups (see "One group at a time"). The track's
+  delivery priority is 85, between the data tracks' and the audio's.
+
+### Reading captions
+
+`subscribe` lists each track of the catalog's text section as a data cell
+of the first row, after its data tracks, so `s.data[1]` is the text track
+of a broadcast with no data track:
+
+```pgsql
+COPY (
+  SELECT s.data[1]
+  FROM ffrwd.moq.subscribe(:'relay', :'broadcast') s
+) TO 'captions.nut'
+```
+
+Its rows are cue rows with times in seconds, time base 1/1000, in the
+form a streaming transcriber writes: a row with `final` false for each
+sample that carries a cue, with the cue's own `start_t` each time and
+`end_t` the end of that sample, at the sample's start, and a row with
+`final` true at the cue's end. A consumer that reads streaming rows, such
+as ffrwd/cea608's `cues` or ffrwd/blitz's, has the text from the cue's
+first sample. The rows with `final` true are the cues that went in, their
+text as the track carries it, `voice` back out of its `<v>` span.
+
+A reader that joins with a cue on screen starts that cue at the sample it
+joined at. A session the relay dropped, and a publisher that started
+again, end every cue on screen where the samples stopped, under the
+timestamps that publisher had; the rows after the gap carry the shift
+every other track gets (see "A publisher that starts again").
+
+### What holds this
+
+`tests/live_text.py` publishes a picture and ten cue rows through a local
+relay: one growing row, a whole cue, markup, an empty line and a `-->`, a
+cue that ends before the track got there, one that starts before it, and
+a long one. A reader there from the start gets every finished cue back
+as it went in, the late one dropped and the early one clipped; a reader
+joining 22 s in has the long cue on screen from its first row; and
+`SELECT s.data[1]` under `ffrwd run` reads the same rows. Given
+`--hang-recv` and `--shaka`, it also takes the text track off the wire
+with hang's own stack and reads it with Shaka Player's WebVTT-in-MP4
+parser (`tests/shaka_cues.js`): Shaka shows each of the eight cues at the
+same times with the same text, the italic one italic and `--&gt;` as
+`-->`. `tests/live_restart.py` and `tests/live_reconnect.py` carry a text
+track across their gaps.
+
 ## Relay
 
 Both directions in one query is a relay, and whatever the query does
@@ -1200,16 +1346,20 @@ carried for wasm32-wasip2 fixes upstream does not ship yet).
 
 - `publish(relay, broadcast, cert DEFAULT '', token DEFAULT '',
   audio_group_ms DEFAULT 200, rows DEFAULT 'summary',
-  reconnect_s DEFAULT 60, hold_s DEFAULT 10)` returns `sink`: a COPY destination,
+  reconnect_s DEFAULT 60, hold_s DEFAULT 10, text_hold_ms DEFAULT 3000)`
+  returns `sink`: a COPY destination,
   nothing comes back. It reads the whole relation - a video cell, an
   audio cell, either NULL - one rendition per row, and any data columns
-  beside it, a track of messages apiece.
+  beside it, a track of messages apiece, or a text track for a column of
+  cue rows. `text_hold_ms` is how far a text track runs behind the
+  newest time seen; see "Text tracks".
 - `subscribe(relay, broadcast, cert DEFAULT '', token DEFAULT '',
   start DEFAULT 'live', hold_ms DEFAULT NULL, hold_mib DEFAULT 64,
   join_ms DEFAULT 2000, reconnect_s DEFAULT 60, restart_s DEFAULT 0)`
   returns `source`: a FROM relation, one row per rendition of the
   broadcast's catalog, a video cell and an audio cell, either NULL,
-  and the catalog's data tracks as data cells of the first row.
+  and the catalog's data tracks as data cells of the first row, its text
+  tracks after them, each a stream of cue rows.
   Unbounded. `start` is which end of a running broadcast to join at,
   `'live'` or `'backlog'`; the three numbers after it are the hold the
   groups are put back in order in, `reconnect_s` how long a dropped

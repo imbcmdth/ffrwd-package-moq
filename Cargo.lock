@@ -141,7 +141,7 @@ dependencies = [
 [[package]]
 name = "ffrwd-bmff"
 version = "0.1.1"
-source = "git+https://github.com/imbcmdth/ffrwd-bmff?tag=v0.1.1#44a169c5335dc99b3e8b922a6ac8440ac98073b4"
+source = "git+https://github.com/imbcmdth/ffrwd-bmff?rev=49635c071555e9162c81bdf9ffe2333542a46c8a#49635c071555e9162c81bdf9ffe2333542a46c8a"
 
 [[package]]
 name = "ffrwd-nal"

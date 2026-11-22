@@ -60,6 +60,12 @@ pub const PRIORITY_VIDEO: u8 = 60;
 /// waiting behind a queue of audio groups may not. hang has no number
 /// for it, and a player never asks for the track.
 pub const PRIORITY_DATA: u8 = 90;
+/// A text track's delivery priority: above the sound, below a data track's
+/// announcements. A text sample is a few dozen bytes a second, so it costs
+/// the media nothing, and it is already held behind the picture by the
+/// text track's own hold (see [`crate::text`]); it must not wait longer
+/// behind a queue of media groups.
+pub const PRIORITY_TEXT: u8 = 85;
 
 /// The buffer depth recommended to AUDIO readers, in milliseconds.
 /// Live capture hands the pipeline audio in bursts hundreds of
@@ -123,6 +129,20 @@ pub struct DataRendition {
 	pub timescale: u32,
 }
 
+/// One text rendition's entry, this package's own like the data section:
+/// a WebVTT track in fragmented MP4, its init segment inside the entry the
+/// way a media rendition's is. See [`crate::text`].
+#[derive(Debug, PartialEq, Serialize)]
+pub struct TextRendition {
+	/// `wvtt`, the sample entry's own name.
+	pub codec: String,
+	/// `cmaf`, the init segment a `wvtt` sample entry and its timescale.
+	pub container: Container,
+	/// The language of the text, BCP 47, where the publisher knows it.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub language: Option<String>,
+}
+
 /// hang's `legacy` container: a varint pts in microseconds ahead of the
 /// payload, with nothing to carry in the catalog but its name.
 #[derive(Debug, PartialEq)]
@@ -170,6 +190,7 @@ pub enum Track {
 	Video(String, VideoRendition),
 	Audio(String, AudioRendition),
 	Data(String, DataRendition),
+	Text(String, TextRendition),
 }
 
 impl Track {
@@ -233,13 +254,26 @@ impl Track {
 		)
 	}
 
+	/// A text track: a WebVTT track whose init segment rides inside the
+	/// entry, and the language its text is in where that is known.
+	pub fn text(name: String, codec: String, init: Vec<u8>, language: Option<String>) -> Self {
+		Track::Text(
+			name,
+			TextRendition {
+				codec,
+				container: Container { init },
+				language,
+			},
+		)
+	}
+
 	/// The track with the bitrate its rendition states, in bits a second.
-	/// A data track states none, and is returned as it was.
+	/// A data or text track states none, and is returned as it was.
 	pub fn with_bitrate(mut self, bitrate: Option<u64>) -> Self {
 		match &mut self {
 			Track::Video(_, entry) => entry.bitrate = bitrate,
 			Track::Audio(_, entry) => entry.bitrate = bitrate,
-			Track::Data(..) => {}
+			Track::Data(..) | Track::Text(..) => {}
 		}
 		self
 	}
@@ -247,7 +281,10 @@ impl Track {
 	/// The track's name, whichever kind it is.
 	pub fn name(&self) -> &str {
 		match self {
-			Track::Video(name, _) | Track::Audio(name, _) | Track::Data(name, _) => name,
+			Track::Video(name, _)
+			| Track::Audio(name, _)
+			| Track::Data(name, _)
+			| Track::Text(name, _) => name,
 		}
 	}
 }
@@ -261,6 +298,8 @@ pub struct Catalog {
 	// the document it always wrote.
 	#[serde(skip_serializing_if = "Renditions::is_empty")]
 	data: Renditions<DataRendition>,
+	#[serde(skip_serializing_if = "Renditions::is_empty")]
+	text: Renditions<TextRendition>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -281,6 +320,7 @@ impl Catalog {
 		let mut video = std::collections::BTreeMap::new();
 		let mut audio = std::collections::BTreeMap::new();
 		let mut data = std::collections::BTreeMap::new();
+		let mut text = std::collections::BTreeMap::new();
 		for track in tracks {
 			match track {
 				Track::Video(name, entry) => {
@@ -292,12 +332,16 @@ impl Catalog {
 				Track::Data(name, entry) => {
 					data.insert(name, entry);
 				}
+				Track::Text(name, entry) => {
+					text.insert(name, entry);
+				}
 			}
 		}
 		Catalog {
 			video: Renditions { renditions: video },
 			audio: Renditions { renditions: audio },
 			data: Renditions { renditions: data },
+			text: Renditions { renditions: text },
 		}
 	}
 
@@ -350,6 +394,8 @@ pub struct Rendition {
 	pub kind: Kind,
 	/// Bits a second, where the catalog states it; never for data.
 	pub bitrate: Option<u64>,
+	/// The language a text rendition states; never for the others.
+	pub language: Option<String>,
 	/// Which relation row it belongs to; see [`rows`].
 	pub row: u32,
 }
@@ -374,6 +420,8 @@ pub enum Kind {
 	Audio { sample_rate: u32, channels: u32 },
 	/// Messages, their pts counted in `timescale` units per second.
 	Data { timescale: u32 },
+	/// Cues: a WebVTT track, its timescale in its init segment.
+	Text,
 }
 
 /// The suffix a muxed row's audio track is qualified with, since MoQ
@@ -382,10 +430,10 @@ pub enum Kind {
 const AUDIO_SUFFIX: &str = ".audio";
 
 /// Reads a catalog document into its renditions, in the document's own
-/// order: the video section, the audio one, then the data one, each
-/// alphabetical - the order [`Catalog`] writes and the order a reader
-/// counts them in. A catalog without a data section, which is every
-/// catalog hang writes, reads exactly as it did.
+/// order: the video section, the audio one, the data one, then the text
+/// one, each alphabetical - the order [`Catalog`] writes and the order a
+/// reader counts them in. A catalog without a data or text section, which
+/// is every catalog hang writes, reads exactly as it did.
 ///
 /// Rows are assigned by [`rows`] on the way out, so a broadcast this
 /// package published reads back as the relation it was published from.
@@ -393,7 +441,7 @@ pub fn parse(document: &str) -> Result<Vec<Rendition>, String> {
 	let parsed: serde_json::Value =
 		serde_json::from_str(document).map_err(|err| format!("catalog: {err}"))?;
 	let mut found = Vec::new();
-	for section in ["video", "audio", "data"] {
+	for section in ["video", "audio", "data", "text"] {
 		let Some(renditions) = parsed
 			.get(section)
 			.and_then(|found| found.get("renditions"))
@@ -404,6 +452,10 @@ pub fn parse(document: &str) -> Result<Vec<Rendition>, String> {
 		for (name, entry) in renditions {
 			if section == "data" {
 				found.push(data_rendition(name, entry)?);
+				continue;
+			}
+			if section == "text" {
+				found.push(text_rendition(name, entry)?);
 				continue;
 			}
 			let kind = if section == "video" {
@@ -450,6 +502,7 @@ pub fn parse(document: &str) -> Result<Vec<Rendition>, String> {
 				packaging,
 				kind,
 				bitrate: entry.get("bitrate").and_then(|rate| rate.as_u64()),
+				language: None,
 				row: 0,
 			});
 		}
@@ -494,6 +547,37 @@ fn data_rendition(name: &str, entry: &serde_json::Value) -> Result<Rendition, St
 			timescale: timescale as u32,
 		},
 		bitrate: None,
+		language: None,
+		row: 0,
+	})
+}
+
+/// One entry of the text section: its codec and its container, which has
+/// to be `cmaf` since the init segment is what says how its samples are
+/// timed, and its language where it states one.
+fn text_rendition(name: &str, entry: &serde_json::Value) -> Result<Rendition, String> {
+	let container = entry
+		.get("container")
+		.ok_or_else(|| format!("rendition '{name}' names no container"))?;
+	let spelled = text(container, "kind", name)?;
+	if spelled != "cmaf" {
+		return Err(format!(
+			"rendition '{name}' travels in '{spelled}', and a text track reads cmaf"
+		));
+	}
+	Ok(Rendition {
+		name: name.to_string(),
+		codec: text(entry, "codec", name)?,
+		config: Vec::new(),
+		init: unbase64(&text(container, "init", name)?)
+			.map_err(|err| format!("rendition '{name}': {err}"))?,
+		packaging: Packaging::Cmaf,
+		kind: Kind::Text,
+		bitrate: None,
+		language: entry
+			.get("language")
+			.and_then(|language| language.as_str())
+			.map(str::to_string),
 		row: 0,
 	})
 }
@@ -518,7 +602,8 @@ fn data_rendition(name: &str, entry: &serde_json::Value) -> Result<Rendition, St
 /// A data rendition is no rendition's own: it rides beside the rows,
 /// as a publisher's data column does. It is put on row 0, so a query
 /// reading a broadcast's messages beside its picture and sound reads
-/// them off the one row (`s.video[1], s.audio[1], s.data[1]`).
+/// them off the one row (`s.video[1], s.audio[1], s.data[1]`). A text
+/// rendition is the broadcast's too, and goes on row 0 the same way.
 pub fn rows(renditions: &[Rendition]) -> Vec<u32> {
 	let mut row_of: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
 	let mut next = 0u32;
@@ -532,7 +617,7 @@ pub fn rows(renditions: &[Rendition]) -> Vec<u32> {
 				next += 1;
 				continue;
 			}
-			Kind::Data { .. } => {
+			Kind::Data { .. } | Kind::Text => {
 				out.push(0);
 				continue;
 			}
@@ -665,6 +750,7 @@ pub fn changed(was: &Rendition, now: &Rendition) -> Option<&'static str> {
 			Kind::Video { .. } => "its geometry",
 			Kind::Audio { .. } => "its sample rate or channels",
 			Kind::Data { .. } => "its timescale",
+			Kind::Text => "what it carries",
 		});
 	}
 	if was.packaging != Packaging::Cmaf || was.init == now.init {
@@ -731,7 +817,12 @@ pub enum RowKind {
 	Audio,
 	/// A data pad, which rides beside the rows rather than on one.
 	Data,
+	/// A pad of cue rows, which rides beside the rows the same way.
+	Text,
 }
+
+/// The name a text pad falls back to, numbered past the first as data is.
+pub const TEXT_BASE: &str = "text";
 
 /// One pad, in the order a packet sink's `init` receives it: which
 /// relation row it belongs to, and what the row's rendition-meta said
@@ -759,7 +850,8 @@ pub struct RowPad {
 /// pad's explicit name - it qualifies it with ".audio" instead.
 ///
 /// A data pad belongs to no row, so its name is its own or, without
-/// one, `data_base` numbered past the first exactly as audio is.
+/// one, `data_base` numbered past the first exactly as audio is. A text
+/// pad is named the same way from [`TEXT_BASE`].
 pub fn track_names_for_rows(
 	pads: &[RowPad],
 	video_base: &str,
@@ -784,6 +876,7 @@ pub fn track_names_for_rows(
 
 	let mut unnamed_audio_ordinal = 0u32;
 	let mut unnamed_data_ordinal = 0u32;
+	let mut unnamed_text_ordinal = 0u32;
 	pads
 		.iter()
 		.map(|pad| match pad.kind {
@@ -808,6 +901,13 @@ pub fn track_names_for_rows(
 				None => {
 					unnamed_data_ordinal += 1;
 					numbered(data_base, unnamed_data_ordinal)
+				}
+			},
+			RowKind::Text => match &pad.name {
+				Some(name) => name.clone(),
+				None => {
+					unnamed_text_ordinal += 1;
+					numbered(TEXT_BASE, unnamed_text_ordinal)
 				}
 			},
 		})
@@ -865,6 +965,7 @@ mod tests {
 			packaging: Packaging::Cmaf,
 			kind: Kind::Video { width, height: 360 },
 			bitrate: None,
+			language: None,
 			row: 0,
 		}
 	}
@@ -891,6 +992,7 @@ mod tests {
 				channels,
 			},
 			bitrate: None,
+			language: None,
 			row: 0,
 		}
 	}
@@ -1390,6 +1492,42 @@ mod tests {
 		assert_eq!(cues.kind, Kind::Data { timescale: 90_000 });
 		assert!(cues.config.is_empty() && cues.init.is_empty());
 		assert_eq!(read[4].kind, Kind::Data { timescale: 1_000_000 });
+	}
+
+	#[test]
+	fn a_text_track_is_a_section_of_its_own_and_reads_back_on_the_first_row() {
+		let init = ffrwd_bmff::mux::Muxer::text(
+			ffrwd_bmff::mux::Text {
+				config: crate::text::HEADER.to_vec(),
+			},
+			1,
+			crate::text::TIMESCALE as i32,
+		)
+		.expect("a text muxer")
+		.init_segment();
+		let catalog = Catalog::new(vec![
+			Track::video("720p".into(), "avc1.64001f".into(), &[1], 1280, 720, vec![0]),
+			Track::text("text".into(), "wvtt".into(), vec![1, 2], Some("en".into())),
+			Track::text("captions".into(), "wvtt".into(), init.clone(), None),
+		]);
+		let document = String::from_utf8(catalog.document().expect("serializes")).unwrap();
+		assert!(
+			document.contains(r#""text":{"renditions":{"captions":{"codec":"wvtt","container":{"kind":"cmaf","init":""#),
+			"{document}"
+		);
+		assert!(document.contains(r#""text":{"codec":"wvtt","container":{"kind":"cmaf","init":"AQI="},"language":"en"}"#), "{document}");
+		let read = parse(&document).expect("the document parses");
+		assert_eq!(
+			read.iter().map(|r| (r.name.as_str(), r.row, r.kind)).collect::<Vec<_>>(),
+			vec![("720p", 0, Kind::Video { width: 1280, height: 720 }), ("captions", 0, Kind::Text), ("text", 0, Kind::Text)]
+		);
+		assert_eq!(read[1].init, init);
+		assert_eq!(read[2].language.as_deref(), Some("en"));
+		let err = parse(r#"{"text":{"renditions":{"t":{"codec":"wvtt","container":{"kind":"legacy"}}}}}"#)
+			.expect_err("a refusal");
+		assert!(err.contains("'t'") && err.contains("cmaf"), "{err}");
+		// The same track again is the same stream.
+		assert_eq!(changed(&read[1], &read[1].clone()), None);
 	}
 
 	#[test]

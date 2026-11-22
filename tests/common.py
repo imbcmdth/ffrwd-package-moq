@@ -15,6 +15,11 @@ tracks and written as the streams of one NUT, and its rows as NDJSON on its
 stdout, which `Tail.counters` reads. `split_streams` gives a loop written for
 a file per track its files back.
 
+`start_publish_node` is the publish module the same way, for a loop whose
+publisher takes an input a query cannot bind yet: each input a paced copy of
+one stream of a file, through a FIFO, as `ffrwd run` feeds a node sink.
+`nut_rows` reads the rows a data stream of a NUT carries.
+
 Toolchain overrides: WASMTIME, MOQ_RELAY, WASI_SDK_PATH (or CC_wasm32_wasip2
 directly), FFRWD_WASM for the sidecar binary, FFRWD_CLI for an installed
 ffrwd, FFRWD_REPO for the checkout holding the compiler and the sidecar.
@@ -284,6 +289,80 @@ def start_node_reader(module: Path, params: dict, ports: list[str], nut: object,
     argv += ["-f", "nut", str(nut), "-map", f"[out{len(ports)}]", "-f", "ndjson", "pipe:1"]
     print(f"+ reader {label}: {SIDECAR.name} -m subscribe {' '.join(ports)}", flush=True)
     return Tail(spawn(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+
+
+def start_publish_node(module: Path, params: dict, feeds: list[dict], work: Path,
+                       label: str, tail: type = None) -> tuple["Tail", list[subprocess.Popen]]:
+    """publish.wasm under the sidecar as ffrwd runs a node sink: ONE instance,
+    each of `feeds` an input of it, and its rows as NDJSON on stdout.
+
+    A feed is `{"port", "source", "stream", "rate", "pad"}`: the input it
+    binds (`video`, `audio`, `data` or `text`), the file and the stream of it
+    (`0:v:0`) copied in real time through a FIFO of its own, the rate the
+    host would hint for it (None for rows), and the pad's row and rendition
+    meta, or None. One ffmpeg feeds every stream of one file. Returns the
+    sidecar and the ffmpegs, which a loop stops along with it."""
+    kinds = {"video": "v", "audio": "a"}
+    fifos = []
+    for index, _ in enumerate(feeds):
+        fifo = work / f"{label}-{index}.fifo"
+        if fifo.exists():
+            fifo.unlink()
+        os.mkfifo(fifo)
+        fifos.append(fifo)
+    feeders = []
+    for source in dict.fromkeys(str(feed["source"]) for feed in feeds):
+        argv = ["ffmpeg", "-hide_banner", "-v", "error", "-y", "-re", "-i", source]
+        for feed, fifo in zip(feeds, fifos):
+            if str(feed["source"]) != source:
+                continue
+            argv += ["-map", feed["stream"], "-c", "copy", "-f", "nut"]
+            if feed["port"] not in kinds:
+                argv += ["-flush_packets", "1", "-write_index", "0"]
+            argv.append(str(fifo))
+        feeders.append(spawn(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE))
+    network = "".join(f"[{feed['port']}={index}:{kinds.get(feed['port'], 'd')}]"
+                      for index, feed in enumerate(feeds))
+    network += "publish=" + ":".join(
+        f"{key}={filter_value(value)}" for key, value in params.items()) + "[@rows=out0]"
+    bound: dict[str, list] = {}
+    for feed in feeds:
+        bound.setdefault(feed["port"], []).append({"rate": feed.get("rate")})
+    argv = [str(SIDECAR)]
+    for feed, fifo in zip(feeds, fifos):
+        argv += ["-f", "nut", "-i", str(fifo)]
+        if feed.get("pad"):
+            argv += ["-pad", json.dumps(feed["pad"])]
+    argv += ["-http", str(module), "-udp", str(module), "-m", f"publish={module}",
+             "-filter_complex", network,
+             "-bound", "publish=" + json.dumps(
+                 [{"input": port, "streams": streams} for port, streams in bound.items()]),
+             "-map", "[out0]", "-f", "ndjson", "pipe:1"]
+    print(f"+ publisher {label}: {SIDECAR.name} -m publish "
+          + " ".join(feed["port"] for feed in feeds), flush=True)
+    sidecar = (tail or Tail)(spawn(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True))
+    return sidecar, feeders
+
+
+def nut_rows(path: Path, stream: str, deadline: int = 120) -> list[dict]:
+    """The rows one data stream of a NUT carries: each packet's pts, in the
+    stream's ticks, the same in seconds, and the JSON object it holds."""
+    done = run(["ffprobe", "-v", "error", "-select_streams", stream, "-show_packets",
+                "-show_data", "-show_entries", "packet=pts,pts_time,data", "-of", "json",
+                str(path)],
+               deadline, capture_output=True, text=True)
+    if done.returncode != 0:
+        sys.exit(f"ffprobe {path.name}:\n{done.stderr[-800:]}")
+    out = []
+    for packet in json.loads(done.stdout).get("packets", []):
+        data = bytearray()
+        for line in packet.get("data", "").strip().splitlines():
+            if ":" in line:
+                data += bytes.fromhex(line.split(":", 1)[1][:41].replace(" ", ""))
+        out.append({"pts": int(packet["pts"]), "time": float(packet["pts_time"]),
+                    "row": json.loads(data)})
+    return out
 
 
 def start_subscribe_node(module: Path, params: dict, nut: object, label: str,

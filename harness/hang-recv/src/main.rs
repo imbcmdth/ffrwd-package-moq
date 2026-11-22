@@ -23,7 +23,10 @@
 //! over once it has all of it, and is a reader of the `VIDEO` rendition's
 //! frames instead: the init segment off the catalog, then each frame's
 //! payload (one `moof`+`mdat` fragment) the moment moq-native has it. That
-//! is what a latency measurement wants from a native reader.
+//! is what a latency measurement wants from a native reader. `TEXT` names
+//! a rendition of the catalog's text section in `VIDEO`'s place, which
+//! hang's export does not read, so `FRAMES=1` is the one way to take it:
+//! the WebVTT track off the wire, for a reader of another stack to parse.
 
 use std::io::Write;
 
@@ -51,8 +54,9 @@ async fn main() -> anyhow::Result<()> {
 	TO_STDERR.store(output == "-", std::sync::atomic::Ordering::Relaxed);
 	let video = std::env::var("VIDEO").ok();
 	let audio = std::env::var("AUDIO").ok();
-	if video.is_none() && audio.is_none() {
-		anyhow::bail!("name a rendition: VIDEO, AUDIO or both");
+	let text = std::env::var("TEXT").ok();
+	if video.is_none() && audio.is_none() && text.is_none() {
+		anyhow::bail!("name a rendition: VIDEO, AUDIO or both, or TEXT");
 	}
 
 	let mut config = moq_native::ClientConfig::default();
@@ -86,14 +90,16 @@ async fn main() -> anyhow::Result<()> {
 		.ok_or_else(|| anyhow::anyhow!("broadcast never announced"))?;
 	say!("hang: {broadcast_path} announced, reading the catalog");
 	if std::env::var("FRAMES").is_ok_and(|on| on == "1") {
-		let name = video
-			.as_deref()
-			.ok_or_else(|| anyhow::anyhow!("FRAMES reads the VIDEO rendition; name one"))?;
+		let (section, name) = match (&video, &text) {
+			(Some(name), _) => ("video", name.as_str()),
+			(None, Some(name)) => ("text", name.as_str()),
+			_ => anyhow::bail!("FRAMES reads the VIDEO or the TEXT rendition; name one"),
+		};
 		let mut out: Box<dyn Write> = match output.as_str() {
 			"-" => Box::new(std::io::stdout().lock()),
 			path => Box::new(std::fs::File::create(path)?),
 		};
-		let count = frames(&broadcast, name, &mut out).await?;
+		let count = frames(&broadcast, section, name, &mut out).await?;
 		say!("hang: wrote {count} frames");
 		say!("hang: PASS");
 		return Ok(());
@@ -156,10 +162,12 @@ fn subscription() -> moq_net::track::Subscription {
 		.with_latency_max(std::time::Duration::from_secs(30))
 }
 
-/// The `name` video rendition's init segment, off the catalog, and then
-/// its frames as they arrive, until the track ends. Says how many frames.
+/// The `name` rendition's init segment, off the catalog's `section`, and
+/// then its frames as they arrive, until the track ends. Says how many
+/// frames.
 async fn frames(
 	broadcast: &moq_net::broadcast::Consumer,
+	section: &str,
 	name: &str,
 	out: &mut dyn Write,
 ) -> anyhow::Result<u64> {
@@ -177,7 +185,7 @@ async fn frames(
 		.await?
 		.ok_or_else(|| anyhow::anyhow!("the catalog group is empty"))?;
 	let document: serde_json::Value = serde_json::from_slice(&document.payload)?;
-	let init = document["video"]["renditions"][name]["container"]["init"]
+	let init = document[section]["renditions"][name]["container"]["init"]
 		.as_str()
 		.ok_or_else(|| anyhow::anyhow!("the catalog has no init segment for '{name}'"))?;
 	out.write_all(&base64::engine::general_purpose::STANDARD.decode(init)?)?;

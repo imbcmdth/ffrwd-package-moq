@@ -27,6 +27,17 @@
 -- names these tracks in a data section of its own, which players read
 -- past.
 --
+-- A column of cue rows (text, start_t and end_t in seconds on the
+-- program's timeline, and final and voice where it has them: what
+-- ffrwd/parakeet's and ffrwd/whisper's transcribe write) publishes as a
+-- text track: WebVTT in fragmented MP4, the init segment in the catalog's
+-- text section, each MoQ group one sample of the cues shown over its
+-- span. Only finished cues are written, a row with final false being an
+-- utterance still growing. A cue is placed at its own start when it
+-- arrives within text_hold_ms of the newest time the publisher has seen.
+-- ffrwd hands a column to this input when its rows match the cue row
+-- schema the module declares.
+--
 -- relay names the relay by URL, its host a name or an IP literal - a
 -- name is resolved over DNS-over-HTTPS (1.1.1.1, then 8.8.8.8), since
 -- the runner links no name lookup. cert is a private relay's own
@@ -77,12 +88,21 @@
 -- being lost to a reader that arrives a moment late. A live source loses
 -- nothing by starting at once: 0 publishes the first media straight
 -- away, which saves a head nobody watches yet those ten seconds.
+-- text_hold_ms is how far a text track's timeline is held behind the
+-- newest time the publisher has seen, in milliseconds, 3000 by default.
+-- A cue is known only once it has finished, after it started: one that
+-- arrives within the hold is placed at its own start, one that arrives
+-- later starts where the track had got, and one that ended before that
+-- is dropped, each counted in the text track's rows. The text track runs
+-- this far behind the picture, so a longer hold costs a reader of the
+-- text that much delay.
 CREATE FUNCTION publish(relay text, broadcast text,
                         cert text DEFAULT '', token text DEFAULT '',
                         audio_group_ms number DEFAULT 200,
                         rows text DEFAULT 'summary',
                         reconnect_s number DEFAULT 60,
-                        hold_s number DEFAULT 10)
+                        hold_s number DEFAULT 10,
+                        text_hold_ms number DEFAULT 3000)
 RETURNS sink
   AS 'target/wasm32-wasip2/release/publish.wasm', 'publish' LANGUAGE wasm;
 
@@ -101,6 +121,13 @@ RETURNS sink
 -- 1/timescale as the catalog names it). Each message is handed over at
 -- the pts its frame carries, never at the frame's own timestamp, which
 -- over an IETF draft of the wire is only the time it arrived.
+--
+-- Each track of the catalog's text section is a data cell after them, of
+-- cue rows: text, start_t, end_t, final and voice where the cue names
+-- one, times in seconds, time base 1/1000. A cue comes out as a streaming
+-- transcriber writes one: a row with final false for each sample that
+-- carries it, its own start_t each time, and a row with final true at its
+-- end. The rows with final true are the cues that went in.
 --
 -- The catalog is read at compile time, so the broadcast must be on
 -- the relay before the query compiles. Each rendition's init segment

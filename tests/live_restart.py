@@ -12,11 +12,15 @@ an RTMP push, an HLS output or a file, and its run has to carry on across
 the restart with a gap, rather than end.
 
 The shape of a run: a local moq-relay, a PACED publisher of one rung, its
-audio and a data track of messages (`tests/data/messages.nut`, cut to the
-length of the publisher's file), a reader in the egress shape (`subscribe`
-stream-copied to an FLV under `ffrwd run`, with `restart_s` set), and beside it
-a second reader of the picture, the sound and the messages into a NUT, which
-the egress shape does not read. The first publisher is killed
+audio, a data track of messages (`tests/data/messages.nut`) and a text track
+of cue rows (`tests/data/cue-track.nut`), both cut to the length of the
+publisher's file, a reader in the egress shape (`subscribe` stream-copied to
+an FLV under `ffrwd run`, with `restart_s` set), and beside it a second
+reader of the picture, the sound, the messages and the cues into a NUT,
+which the egress shape does not read. Each publisher is publish.wasm under
+the sidecar fed as `ffrwd run` feeds a node sink (see
+`common.start_publish_node`), since a query cannot bind a column to its
+text input yet. The first publisher is killed
 outright after `--warmup` seconds of media, every process of it at once, the
 way a lost pod goes: nothing closes its session, so the relay hears nothing
 until its idle timeout. A second is started `--kill-gap` seconds later and
@@ -48,7 +52,13 @@ What it owes:
     messages never going back either: each one after a gap is a message of
     the fixture under the shift its reader's row states, and every message a
     publisher that started again sent after its first media went out came
-    through.
+    through;
+  - the second reader's cue rows never go back either, and under each
+    stretch's shift every one is a cue of the fixture, whole or cut where
+    its publisher went or the reader took it up. The cue on screen when the
+    first publisher was killed ends there under that publisher's own shift,
+    and every cue a publisher showed while the reader had it comes back
+    whole.
 
 Never collected by any suite: it needs moq-relay, ffmpeg, ffprobe, cargo with
 the wasm32-wasip2 target and a wasi-sdk clang, and the sidecar. It starts a
@@ -79,8 +89,10 @@ from common import (
     guest,
     kill_tree,
     node_shape,
+    nut_rows,
     run,
     spawn,
+    start_publish_node,
     start_relay,
 )
 
@@ -106,15 +118,10 @@ AWAY_SLACK = 0.25
 
 MESSAGES = PACKAGE / "tests" / "data" / "messages.nut"
 MESSAGE_PTS = PACKAGE / "tests" / "data" / "messages.txt"
-
-PUBLISH_QUERY = """
-COPY (
-  SELECT scale(f.video[1], 640, -2), f.audio[1], d.data[1]
-  FROM input(:'source', realtime => true) f, input(:'messages', realtime => true) d
-) TO ffrwd.moq.publish(:'relay', :'broadcast', COALESCE(:'cert', ''), '', 200, 'groups', 60, 0)
-  WITH (video_bitrate '800k', gop 30, preset 'veryfast', tune 'zerolatency',
-        audio_bitrate '128k')
-"""
+CUES = PACKAGE / "tests" / "data" / "cue-track.nut"
+CUE_SOURCE = PACKAGE / "tests" / "data" / "cue-track.txt"
+# How far behind its picture each publisher holds the text track.
+TEXT_HOLD = 3.0
 
 # The egress shape: the program's broadcast stream-copied to a destination,
 # here a file.
@@ -127,10 +134,11 @@ COPY (
 """
 
 
-# Every track, the messages beside the picture and the sound, into a NUT.
+# Every track, the messages and the cues beside the picture and the sound,
+# into a NUT.
 ALL_QUERY = """
 COPY (
-  SELECT s.video[1], s.audio[1], s.data[1]
+  SELECT s.video[1], s.audio[1], s.data[1], s.data[2]
   FROM ffrwd.moq.subscribe(:'subscribe_relay', :'subscribe_broadcast', :'subscribe_cert',
                            restart_s => :restart_s) s
 ) TO :'destination'
@@ -162,7 +170,7 @@ class TimedTail(Tail):
 
 def make_source(path: Path, seconds: int) -> None:
     """A test pattern with a white frame at each whole second, and a click on
-    each whole second of the sound."""
+    each whole second of the sound, as an encoder hands them to publish."""
     graph = (
         "[0:v]drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill:"
         "enable='lt(mod(t\\,1)\\,0.02)'[v]"
@@ -173,8 +181,9 @@ def make_source(path: Path, seconds: int) -> None:
         "-f", "lavfi", "-i",
         f"aevalsrc=exprs='0.6*sin(2*PI*1000*t)*lt(mod(t\\,1)\\,0.03)':s={SAMPLE_RATE}:c=stereo",
         "-filter_complex", graph, "-map", "[v]", "-map", "1:a",
-        "-t", str(seconds), "-c:v", "libx264", "-preset", "ultrafast",
-        "-g", str(GOP), "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", str(path),
+        "-t", str(seconds), "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+        "-b:v", "800k", "-g", str(GOP), "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+        "-f", "nut", str(path),
     ], TOOL_DEADLINE, capture_output=True, text=True)
     if done.returncode != 0:
         sys.exit(f"building the source failed:\n{done.stderr[-800:]}")
@@ -189,23 +198,63 @@ def cut_messages(path: Path, seconds: int) -> None:
         sys.exit(f"cutting the messages failed:\n{done.stderr[-800:]}")
 
 
+def cut_cues(path: Path, seconds: int) -> None:
+    """The fixture's cue rows up to two seconds short of `seconds`."""
+    done = run(["ffmpeg", "-v", "error", "-y", "-i", str(CUES), "-map", "0", "-c", "copy",
+                "-t", str(seconds - 2), str(path)], TOOL_DEADLINE, capture_output=True, text=True)
+    if done.returncode != 0:
+        sys.exit(f"cutting the cues failed:\n{done.stderr[-800:]}")
+
+
+def fixture_cues(seconds: int) -> list[dict]:
+    """The fixture's cues a publisher of `seconds` writes."""
+    out = []
+    for line in CUE_SOURCE.read_text().split("\n"):
+        if line.strip():
+            pts, row = line.split("\t", 1)
+            if int(pts) / 1e6 < seconds - 2:
+                out.append(json.loads(row))
+    return out
+
+
 def fixture_pts() -> list[float]:
     """Every message's pts in the fixture, seconds."""
     return [int(line.split("\t", 1)[0]) / 1e6
             for line in MESSAGE_PTS.read_text().split("\n") if line.strip()]
 
 
-def start_publisher(query: Path, source: Path, messages: Path, port: int,
-                    cert_hex: str) -> TimedTail:
-    argv = ffrwd_argv("run", "-f", str(query),
-                      "-v", f"source={source}",
-                      "-v", f"messages={messages}",
-                      "-v", f"relay=moqt://127.0.0.1:{port}",
-                      "-v", f"broadcast={BROADCAST}",
-                      "-v", f"cert={cert_hex}", "-q")
-    print("+ publisher:", " ".join(argv[:6]), "...", flush=True)
-    return TimedTail(spawn(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           text=True, env=dict(os.environ), cwd=PACKAGE))
+class Publisher:
+    """One publisher: publish.wasm under the sidecar, and the ffmpegs that
+    feed it."""
+
+    def __init__(self, work: Path, index: int, source: Path, messages: Path, cues: Path,
+                 port: int, cert_hex: str) -> None:
+        params = {"relay": f"moqt://127.0.0.1:{port}", "broadcast": BROADCAST,
+                  "cert": cert_hex, "rows": "groups", "reconnect_s": 60, "hold_s": 0,
+                  "text_hold_ms": int(TEXT_HOLD * 1000)}
+        rung = {"row": 0, "rendition": {"name": "360p"}}
+        feeds = [
+            {"port": "video", "source": source, "stream": "0:v:0",
+             "rate": {"num": RATE, "den": 1}, "pad": rung},
+            {"port": "audio", "source": source, "stream": "0:a:0",
+             "rate": {"num": SAMPLE_RATE, "den": 1}, "pad": rung},
+            {"port": "data", "source": messages, "stream": "0:d:0", "rate": None, "pad": None},
+            {"port": "text", "source": cues, "stream": "0:d:0", "rate": None, "pad": None},
+        ]
+        self.tail, self.feeders = start_publish_node(
+            guest("publish"), params, feeds, work, f"publisher{index}", TimedTail)
+
+    def kill_outright(self) -> None:
+        """Every process of it at once, the way a lost pod goes: nothing
+        closes its session, and the sidecar does not see its input end."""
+        for child in [self.tail.child, *self.feeders]:
+            if child.poll() is None:
+                try:
+                    child.send_signal(signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        for child in [self.tail.child, *self.feeders]:
+            child.wait(timeout=30)
 
 
 def start_reader(query: Path, port: int, cert_hex: str, out: Path,
@@ -382,7 +431,7 @@ def phase(values: list[float]) -> float:
                                      for value in values)
 
 
-def judge(out: Path, publishers: list[TimedTail], reader: Tail, ended: dict) -> list[str]:
+def judge(out: Path, publishers: list[Publisher], reader: Tail, ended: dict) -> list[str]:
     problems: list[str] = []
     rows = [row for row in reader.counters() if row.get("kind") == "restart"]
     for row in rows:
@@ -414,7 +463,7 @@ def judge(out: Path, publishers: list[TimedTail], reader: Tail, ended: dict) -> 
     if problems:
         return problems
 
-    origins = [wall_origin(publisher) for publisher in publishers]
+    origins = [wall_origin(publisher.tail) for publisher in publishers]
     shifts = [0.0] + [row["shift_us"] / 1e6 for row in rows]
     flash, click = flashes(out), clicks(out)
     # Where each stretch's white frames sit in the second: the publishers'
@@ -483,9 +532,10 @@ def judge(out: Path, publishers: list[TimedTail], reader: Tail, ended: dict) -> 
     return problems
 
 
-def judge_all(nut: Path, reader: Tail, sources: list[int]) -> list[str]:
+def judge_all(nut: Path, reader: Tail, sources: list[int], killed_at: float) -> list[str]:
     """What the reader of every track owes: its media as the egress reader's,
-    and its messages in order, each after a gap under its reader's shift."""
+    its messages in order, each after a gap under its reader's shift, and its
+    cues the same way."""
     problems: list[str] = []
     rows = [row for row in reader.counters() if row.get("kind") == "restart"]
     for row in rows:
@@ -542,13 +592,66 @@ def judge_all(nut: Path, reader: Tail, sources: list[int]) -> list[str]:
         if missing:
             problems.append(f"second reader, stretch {index}: the messages at {missing[:3]} did "
                             f"not come through")
+    problems += judge_cues(nut_rows(nut, "d:1"), parts, shifts, sources, killed_at)
+    return problems
+
+
+def judge_cues(found: list[dict], parts: list[list[dict]], shifts: list[float],
+               sources: list[int], killed_at: float) -> list[str]:
+    """The second reader's cue rows: never back, and under each stretch's
+    shift each a cue of its publisher, whole or cut where the stretch ends or
+    begins. The long cue on screen when the first publisher was killed ends
+    there, under that publisher's shift."""
+    problems: list[str] = []
+    times = [row["time"] for row in found]
+    if not found or any(b < a for a, b in zip(times, times[1:])):
+        return [f"second reader: {len(found)} cue rows, or a cue row that went back"]
+    for index, stretch in enumerate(parts):
+        start = stretch[0]["dts"] - 0.5
+        end = parts[index + 1][0]["dts"] - 0.5 if index + 1 < len(parts) else float("inf")
+        rows = [row["row"] for row in found if start <= row["time"] < end]
+        finals = [row for row in rows if row.get("final")]
+        fixture = {cue["text"]: cue for cue in fixture_cues(sources[index])}
+        whole, pieces = [], []
+        for row in finals:
+            own = (row["start_t"] - shifts[index], row["end_t"] - shifts[index])
+            cue = fixture.get(row["text"])
+            if cue is None or row.get("voice") != cue.get("voice"):
+                problems.append(f"second reader, stretch {index}: {row} is none of the cues")
+                continue
+            if abs(own[0] - cue["start_t"]) < 0.002 and abs(own[1] - cue["end_t"]) < 0.002:
+                whole.append(cue["text"])
+            elif cue["start_t"] - 0.002 <= own[0] and own[1] <= cue["end_t"] + 0.002:
+                pieces.append((row["text"], round(own[0], 3), round(own[1], 3)))
+            else:
+                problems.append(f"second reader, stretch {index}: {row} runs outside its cue "
+                                f"under the shift {shifts[index]:+.3f}s")
+        # The cues its publisher showed while the reader had it: from its
+        # first media on, up to the text it had written when it went.
+        first = stretch[0]["dts"] - shifts[index]
+        last = (killed_at - TEXT_HOLD - 1.0) if index == 0 else sources[index]
+        owed = [text for text, cue in fixture.items()
+                if first <= cue["start_t"] and cue["end_t"] <= last]
+        missing = [text for text in owed if text not in whole]
+        print(f"  second reader, stretch {index}: {len(rows)} cue rows, {len(whole)} cues "
+              f"whole, {len(pieces)} cut {pieces}; {len(missing)} of {len(owed)} owed missing",
+              flush=True)
+        if missing:
+            problems.append(f"second reader, stretch {index}: the cues {missing[:4]} did not "
+                            f"come back whole")
+        if index == 0:
+            ended = [piece for piece in pieces if piece[0] == "a long one"]
+            if len(ended) != 1 or ended[0][1] != 12.0 or ended[0][2] > killed_at:
+                problems.append(f"second reader: the cue on screen when the first publisher "
+                                f"went ended as {ended}, not from 12.0s to where it went "
+                                f"(media {killed_at:.1f}s)")
     return problems
 
 
 def one_run(args: argparse.Namespace) -> None:
     work = Path(tempfile.mkdtemp(prefix="moq-restart-", dir=args.work))
     relay = None
-    publishers: list[TimedTail] = []
+    publishers: list[Publisher] = []
     reader = everything = None
     try:
         if args.build:
@@ -556,57 +659,66 @@ def one_run(args: argparse.Namespace) -> None:
         else:
             certgen = (PACKAGE / "harness" / "certgen" / "target" / "release"
                        / ("certgen.exe" if os.name == "nt" else "certgen"))
-        made = run([certgen, work], TOOL_DEADLINE, capture_output=True, text=True)
+        # moq-relay reloads its certificate whenever the directory it sits in
+        # changes, so it sits apart from what the run writes.
+        certs = work / "certs"
+        certs.mkdir()
+        made = run([certgen, certs], TOOL_DEADLINE, capture_output=True, text=True)
         if made.returncode != 0:
             sys.exit(f"certgen failed:\n{made.stderr[-400:]}")
         cert_hex = made.stdout.strip()
-        sources, messages = [], []
+        sources, messages, cues = [], [], []
         for index, seconds in enumerate(SECONDS):
-            sources.append(work / f"source{index}.mp4")
+            sources.append(work / f"source{index}.nut")
             make_source(sources[-1], seconds)
             messages.append(work / f"messages{index}.nut")
             cut_messages(messages[-1], seconds)
-        publish = work / "publish.sql"
-        publish.write_text(PUBLISH_QUERY)
+            cues.append(work / f"cues{index}.nut")
+            cut_cues(cues[-1], seconds)
+
+        def publisher(index: int) -> Publisher:
+            return Publisher(work, index, sources[index], messages[index], cues[index], port,
+                             cert_hex)
+
         subscribe = work / "subscribe.sql"
         subscribe.write_text(SUBSCRIBE_QUERY)
         every_track = work / "every-track.sql"
         every_track.write_text(ALL_QUERY)
 
         port = free_udp_port()
-        relay = start_relay(port, work / "cert.pem", work / "key.pem", work / "relay.log")
+        relay = start_relay(port, certs / "cert.pem", certs / "key.pem", work / "relay.log")
         print(f"moq-relay pid {relay.pid} on 127.0.0.1:{port}", flush=True)
 
-        publishers.append(start_publisher(publish, sources[0], messages[0], port, cert_hex))
+        publishers.append(publisher(0))
         # The reader compiles against the catalog, so the broadcast is up
         # first.
         params = {"relay": f"moqt://127.0.0.1:{port}", "broadcast": BROADCAST,
                   "cert": cert_hex}
         until = time.monotonic() + 120
         while node_shape(guest("subscribe"), params, strict=False) is None:
-            if publishers[0].child.poll() is not None or time.monotonic() > until:
-                sys.exit(f"the broadcast never came up:\n{publishers[0].text()[1][-1500:]}")
+            if publishers[0].tail.child.poll() is not None or time.monotonic() > until:
+                sys.exit(f"the broadcast never came up:\n{publishers[0].tail.text()[1][-1500:]}")
         out = work / "out.flv"
         reader = start_reader(subscribe, port, cert_hex, out, args.restart_s)
         everything = start_reader(every_track, port, cert_hex, work / "every-track.nut",
                                   args.restart_s)
 
-        wait_until(lambda: media_clock(publishers[0]) >= args.warmup, 120 + args.warmup,
-                   "warming up", publishers[0], reader, everything)
-        print(f"killing the first publisher outright at media "
-              f"{media_clock(publishers[0]):.1f}s", flush=True)
-        kill_outright(publishers[0])
+        wait_until(lambda: media_clock(publishers[0].tail) >= args.warmup, 120 + args.warmup,
+                   "warming up", publishers[0].tail, reader, everything)
+        killed_at = media_clock(publishers[0].tail)
+        print(f"killing the first publisher outright at media {killed_at:.1f}s", flush=True)
+        publishers[0].kill_outright()
         time.sleep(args.kill_gap)
-        publishers.append(start_publisher(publish, sources[1], messages[1], port, cert_hex))
-        done = publishers[1].finish(SECONDS[1] + 120)
+        publishers.append(publisher(1))
+        done = publishers[1].tail.finish(SECONDS[1] + 120)
         print(f"the second publisher ended, exit {done}", flush=True)
         for child in (reader, everything):
             if child.child.poll() is not None:
                 sys.exit(f"a reader ended with the second publisher:\n"
                          f"{child.module_stderr()[-3000:]}")
         time.sleep(args.end_gap)
-        publishers.append(start_publisher(publish, sources[2], messages[2], port, cert_hex))
-        done = publishers[2].finish(SECONDS[2] + 120)
+        publishers.append(publisher(2))
+        done = publishers[2].tail.finish(SECONDS[2] + 120)
         ended = {"last publisher": time.monotonic()}
         print(f"the third publisher ended, exit {done}", flush=True)
         for child in (reader, everything):
@@ -626,23 +738,26 @@ def one_run(args: argparse.Namespace) -> None:
         if read_all != 0:
             problems.append(f"the second reader exited {read_all}:\n"
                             f"{everything.module_stderr()[-1500:]}")
-        for index, publisher in enumerate(publishers[1:], start=1):
-            if publisher.child.returncode != 0:
-                problems.append(f"publisher {index} exited {publisher.child.returncode}")
+        for index, one in enumerate(publishers[1:], start=1):
+            if one.tail.child.returncode != 0:
+                problems.append(f"publisher {index} exited {one.tail.child.returncode}")
         problems += judge(out, publishers, reader, ended)
-        problems += judge_all(work / "every-track.nut", everything, list(SECONDS))
+        problems += judge_all(work / "every-track.nut", everything, list(SECONDS), killed_at)
         if problems:
             print("=== FAIL ===")
             for problem in problems:
                 print(" -", problem)
             sys.exit(1)
-        print("=== PASS: the reader followed both restarts, and the media went on ===")
+        print("=== PASS: the reader followed both restarts, and the media and the text went "
+              "on ===")
     finally:
         # Every process of a run still going, its ffmpeg and sidecar too,
         # which `ffrwd run` starts in sessions of their own.
-        for child in (reader, everything, *publishers):
+        for child in (reader, everything):
             if child is not None and child.child.poll() is None:
                 kill_outright(child)
+        for one in publishers:
+            one.kill_outright()
         if relay is not None:
             kill_tree(relay)
         if not args.keep:

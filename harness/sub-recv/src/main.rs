@@ -195,6 +195,7 @@ mod live {
 						channels,
 					} => format!("{sample_rate}Hz {channels}ch"),
 					moq_core::catalog::Kind::Data { timescale } => format!("data 1/{timescale}"),
+					moq_core::catalog::Kind::Text => "text".to_string(),
 				},
 				init: rendition.init,
 			})

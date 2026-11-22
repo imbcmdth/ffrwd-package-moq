@@ -7,7 +7,7 @@ use ffrwd_node::{
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"rows":{"type":"string","enum":["summary","groups","none"],"default":"summary","description":"what the sink reports: 'summary' is one row per track every 5s and a final total, 'groups' a row per published group, 'none' the final total alone"},"hold_s":{"type":"number","minimum":0,"default":10,"description":"how long the first media waits for a first subscriber before it goes out anyway, in seconds; a subscription starts at the latest group, so holding keeps a file's opening from being lost, and 0 publishes at once, which suits a live source nobody watches yet"},"reconnect_s":{"type":"integer","minimum":0,"default":60,"description":"how long a publisher whose session the relay dropped keeps trying to open a new one and announce the broadcast again, in seconds; groups are still written meanwhile, and 0 ends the run on the first drop"},"audio_group_ms":{"type":"integer","minimum":0,"default":200,"description":"how long an audio group runs, in milliseconds; a fifth of a second is ten AAC frames at 48kHz, and shorter groups have been seen losing whole groups through a public relay under load. 0 is one frame per group, which is what upstream hang writes and is experimental here"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"rows":{"type":"string","enum":["summary","groups","none"],"default":"summary","description":"what the sink reports: 'summary' is one row per track every 5s and a final total, 'groups' a row per published group, 'none' the final total alone"},"hold_s":{"type":"number","minimum":0,"default":10,"description":"how long the first media waits for a first subscriber before it goes out anyway, in seconds; a subscription starts at the latest group, so holding keeps a file's opening from being lost, and 0 publishes at once, which suits a live source nobody watches yet"},"reconnect_s":{"type":"integer","minimum":0,"default":60,"description":"how long a publisher whose session the relay dropped keeps trying to open a new one and announce the broadcast again, in seconds; groups are still written meanwhile, and 0 ends the run on the first drop"},"text_hold_ms":{"type":"integer","minimum":0,"default":3000,"description":"how far a text track's timeline is held behind the newest time the publisher has seen, in milliseconds; a cue row that arrives within it is placed at its own start, and one that arrives later loses what has already gone out"},"audio_group_ms":{"type":"integer","minimum":0,"default":200,"description":"how long an audio group runs, in milliseconds; a fifth of a second is ten AAC frames at 48kHz, and shorter groups have been seen losing whole groups through a public relay under load. 0 is one frame per group, which is what upstream hang writes and is experimental here"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
 
 /// The base name a video track falls back to when its row's rendition
 /// carries none, and the ladder holds only the one stream.
@@ -20,6 +20,9 @@ const DEFAULT_AUDIO_TRACK: &str = "audio";
 /// audio is.
 const DEFAULT_DATA_TRACK: &str = "data";
 
+/// The input a query's cue rows arrive on, beside its messages on `data`.
+const TEXT_INPUT: &str = "text";
+
 /// One schema covers the three row shapes, each leaving the others'
 /// fields out. A GROUP row (`rows => 'groups'`) carries `track` and
 /// `group`; a TRACK row (`rows => 'summary'`, every [`SUMMARY_EVERY`])
@@ -27,7 +30,7 @@ const DEFAULT_DATA_TRACK: &str = "data";
 /// the seconds of media published on it; the TRAILING row, which every
 /// run ends with, carries `tracks`. `pts_start`/`pts_end` are seconds
 /// of media time.
-const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"track":{"type":"string"},"group":{"type":"integer"},"packets":{"type":"integer"},"bytes":{"type":"integer"},"pts_start":{"type":"number"},"pts_end":{"type":"number"},"groups":{"type":"integer"},"media":{"type":"number"},"tracks":{"type":"integer"},"init_bytes":{"type":"integer"},"appended":{"type":"integer"},"closed":{"type":"integer"},"sub_latency_ms":{"type":"integer"},"sub_priority":{"type":"integer"},"sub_ordered":{"type":"boolean"},"gap_max_ms":{"type":"integer"},"call_max_ms":{"type":"integer"},"queued":{"type":"integer"},"queue_max":{"type":"integer"},"wait_max_ms":{"type":"integer"},"unpaced":{"type":"integer"},"event":{"type":"string","enum":["reconnect"]},"attempts":{"type":"integer"},"down_ms":{"type":"integer"},"error":{"type":"string"}},"additionalProperties":false}"#;
+const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"track":{"type":"string"},"group":{"type":"integer"},"packets":{"type":"integer"},"bytes":{"type":"integer"},"pts_start":{"type":"number"},"pts_end":{"type":"number"},"groups":{"type":"integer"},"media":{"type":"number"},"tracks":{"type":"integer"},"init_bytes":{"type":"integer"},"appended":{"type":"integer"},"closed":{"type":"integer"},"sub_latency_ms":{"type":"integer"},"sub_priority":{"type":"integer"},"sub_ordered":{"type":"boolean"},"gap_max_ms":{"type":"integer"},"call_max_ms":{"type":"integer"},"queued":{"type":"integer"},"queue_max":{"type":"integer"},"wait_max_ms":{"type":"integer"},"unpaced":{"type":"integer"},"cues":{"type":"integer"},"growing":{"type":"integer"},"clipped":{"type":"integer"},"late":{"type":"integer"},"empty":{"type":"integer"},"event":{"type":"string","enum":["reconnect"]},"attempts":{"type":"integer"},"down_ms":{"type":"integer"},"error":{"type":"string"}},"additionalProperties":false}"#;
 
 /// How long the session stays open after the last fragment, for the
 /// wire to drain: there is no delivered signal for a subscription.
@@ -139,6 +142,14 @@ pub(crate) struct Params {
 	/// see [`HOLD_MAX`].
 	#[serde(default = "default_hold_s")]
 	hold_s: f64,
+	/// How far a text track's timeline is held behind the newest time seen,
+	/// in milliseconds; see [`moq_core::text`].
+	#[serde(default = "default_text_hold_ms")]
+	text_hold_ms: u64,
+}
+
+fn default_text_hold_ms() -> u64 {
+	moq_core::text::HOLD_MS
 }
 
 fn default_reconnect_s() -> u64 {
@@ -234,6 +245,38 @@ struct TrackRow {
 	/// loaded machine costs and the second is what this module costs.
 	gap_max_ms: u64,
 	call_max_ms: u64,
+	/// A text track's rows so far: see [`TextCounts`].
+	#[serde(flatten, skip_serializing_if = "Option::is_none")]
+	text: Option<TextCounts>,
+}
+
+/// What a text track made of the cue rows it was handed: cues placed at
+/// their own start, rows of an utterance still growing passed over, cues
+/// placed from where the track had got since part of them had gone out,
+/// cues that ended before it and rows with no span at all.
+#[derive(Clone, Copy, Default, Serialize)]
+struct TextCounts {
+	cues: u64,
+	growing: u64,
+	clipped: u64,
+	late: u64,
+	empty: u64,
+}
+
+impl TextCounts {
+	fn count(&mut self, taken: moq_core::text::Taken) {
+		use moq_core::text::Taken;
+		match taken {
+			Taken::Placed => self.cues += 1,
+			Taken::Clipped => {
+				self.cues += 1;
+				self.clipped += 1;
+			}
+			Taken::Late => self.late += 1,
+			Taken::Growing => self.growing += 1,
+			Taken::Empty => self.empty += 1,
+		}
+	}
 }
 
 /// The trailing summary, once per run over every track.
@@ -258,6 +301,22 @@ struct SummaryRow {
 	queue_max: u64,
 	wait_max_ms: u64,
 	unpaced: u64,
+	/// Over every text track, what it made of its cue rows; see
+	/// [`TextCounts`]. Left out of a run with no text track.
+	#[serde(flatten, skip_serializing_if = "Option::is_none")]
+	text: Option<TextCounts>,
+}
+
+impl TextCounts {
+	fn add(self, other: TextCounts) -> TextCounts {
+		TextCounts {
+			cues: self.cues + other.cues,
+			growing: self.growing + other.growing,
+			clipped: self.clipped + other.clipped,
+			late: self.late + other.late,
+			empty: self.empty + other.empty,
+		}
+	}
 }
 
 /// The tokio floor the session runs on. Split from [`Session`] so a
@@ -283,6 +342,24 @@ enum Media {
 	/// JSON messages, their pts counted in `timescale` units per second
 	/// as the catalog says; see [`message_timescale`].
 	Data { timescale: u32 },
+	/// Cue rows, cut into the samples of a WebVTT track; see
+	/// [`moq_core::text`].
+	Text,
+}
+
+impl Media {
+	/// Whether the track carries rows rather than coded media.
+	fn rows(self) -> bool {
+		matches!(self, Media::Data { .. } | Media::Text)
+	}
+}
+
+/// A text track's cue rows on their way to samples: the cutter, the time
+/// base the rows' own pts count in, and what it made of them.
+struct TextTrack {
+	cutter: moq_core::text::Cutter,
+	rows_time_base: (i32, i32),
+	counts: TextCounts,
 }
 
 /// One stream packaged before the relay is dialed, waiting for the MoQ
@@ -296,6 +373,8 @@ struct Built {
 	/// The NAL length prefix this track's `avcC` declares; 0 for audio,
 	/// whose frames carry no framing of their own.
 	length_size: usize,
+	/// A text track's cue rows; None for every other kind.
+	text: Option<TextTrack>,
 }
 
 /// One track: one encoded stream, its own fmp4 muxer, and the MoQ track
@@ -321,6 +400,10 @@ struct Rendition {
 	length_size: usize,
 	/// What its catalog entry states, in bits a second.
 	bitrate: Option<u64>,
+	/// The language its rendition states, for a text track's entry.
+	language: Option<String>,
+	/// A text track's cue rows; None for every other kind.
+	text: Option<TextTrack>,
 	init_bytes: u64,
 	groups: u64,
 	packets: u64,
@@ -359,7 +442,7 @@ impl Rendition {
 				}
 				Ok(framed)
 			}
-			Media::Audio { .. } | Media::Data { .. } => Ok(data.to_vec()),
+			Media::Audio { .. } | Media::Data { .. } | Media::Text => Ok(data.to_vec()),
 		}
 	}
 
@@ -383,6 +466,35 @@ impl Rendition {
 		emit: bool,
 	) -> Result<Vec<String>, String> {
 		self.publish_frame(fragment.pts, fragment.keyframe, fragment.bytes, emit)
+	}
+
+	/// What a text track's cue rows have settled into: each sample one
+	/// fragment in a group of its own, and with `last` everything left, to
+	/// the end of the last cue.
+	fn publish_text(&mut self, last: bool, emit: bool) -> Result<Vec<String>, String> {
+		let Some(text) = self.text.as_mut() else {
+			return Ok(Vec::new());
+		};
+		let samples = text.cutter.ready(last);
+		let mut rows = Vec::new();
+		for sample in samples {
+			let bytes = ffrwd_bmff::webvtt::sample(&sample.cues);
+			let fragments = self
+				.muxer()
+				.push(ffrwd_bmff::mux::Packet {
+					pts: sample.start,
+					dts: Some(sample.start),
+					duration: Some(sample.duration),
+					keyframe: true,
+					data: &bytes,
+				})
+				.map_err(|err| format!("track '{}': the sample at {}ms: {err}", self.name, sample.start))?;
+			self.packets += 1;
+			for fragment in fragments {
+				rows.extend(self.publish_fragment(fragment, emit)?);
+			}
+		}
+		Ok(rows)
 	}
 
 	/// One MoQ frame at `pts`, in the open group or one the discipline
@@ -507,6 +619,7 @@ impl Rendition {
 			sub_ordered: asked.as_ref().is_some_and(|sub| sub.ordered),
 			gap_max_ms: gap_max.as_millis() as u64,
 			call_max_ms: call_max.as_millis() as u64,
+			text: self.text.as_ref().map(|text| text.counts),
 		})
 		.expect("a track row serializes")
 	}
@@ -519,6 +632,14 @@ impl Rendition {
 		}
 		let init = self.muxer().init_segment();
 		self.init_bytes = init.len() as u64;
+		if let Media::Text = self.media {
+			return moq_core::catalog::Track::text(
+				self.name.clone(),
+				self.codec.clone(),
+				init,
+				self.language.clone(),
+			);
+		}
 		let muxer = self.muxer.as_ref().expect("a media track has a muxer");
 		let track = match self.media {
 			Media::Video { width, height } => moq_core::catalog::Track::video(
@@ -540,10 +661,15 @@ impl Rendition {
 				channels,
 				init,
 			),
-			Media::Data { .. } => unreachable!("a data track returned above"),
+			Media::Data { .. } | Media::Text => unreachable!("a data or text track returned above"),
 		};
 		track.with_bitrate(self.bitrate)
 	}
+}
+
+/// A tick count in seconds, by a time base `num/den`.
+fn ticks_seconds(ticks: i64, (num, den): (i32, i32)) -> f64 {
+	ticks as f64 * f64::from(num) / f64::from(den.max(1))
 }
 
 /// The timescale a data track's catalog entry names: the stream's own
@@ -941,9 +1067,10 @@ impl Session {
 		// new is cut, and every turn of the session below looks again. See
 		// [`moq_core::delivery`].
 		let released = self.catch_up().await?;
-		let media = pads.iter().zip(&self.renditions).any(|(pad, rendition)| {
-			!pad.packets.is_empty() && !matches!(rendition.media, Media::Data { .. })
-		});
+		let media = pads
+			.iter()
+			.zip(&self.renditions)
+			.any(|(pad, rendition)| !pad.packets.is_empty() && !rendition.media.rows());
 		if media {
 			self.media_at = Some(std::time::Instant::now());
 		}
@@ -984,11 +1111,55 @@ impl Session {
 			self.flush().await?;
 		}
 
+		// Cue rows into the text tracks, and what has settled out to the
+		// wire. A text track's timeline follows the newest time this call
+		// carries on any input, media or rows, held behind it by the
+		// track's own hold; see [`moq_core::text`].
+		let newest = pads
+			.iter()
+			.zip(&self.renditions)
+			.flat_map(|(pad, rendition)| {
+				let time_base = match &rendition.text {
+					Some(text) => text.rows_time_base,
+					None => rendition.time_base,
+				};
+				pad.packets
+					.iter()
+					.map(move |packet| ticks_seconds(packet.pts, time_base))
+			})
+			.fold(None, |most: Option<f64>, at| Some(most.map_or(at, |most| most.max(at))));
 		for (index, pad) in pads.iter().enumerate() {
 			let Some(rendition) = self.renditions.get_mut(index) else {
 				continue;
 			};
-			if matches!(rendition.media, Media::Data { .. }) {
+			let Some(text) = rendition.text.as_mut() else {
+				continue;
+			};
+			if let Some(newest) = newest {
+				text.cutter.heard(newest);
+			}
+			for packet in &pad.packets {
+				match serde_json::from_slice::<moq_core::text::Row>(&packet.data) {
+					Ok(row) => {
+						let taken = text.cutter.row(&row);
+						text.counts.count(taken);
+					}
+					// A row that does not read is a caption lost, not a reason
+					// to end the broadcast.
+					Err(err) => {
+						text.counts.empty += 1;
+						eprintln!("publish: track '{}': a cue row skipped: {err}", rendition.name);
+					}
+				}
+			}
+			rows.extend(rendition.publish_text(false, per_group)?);
+		}
+
+		for (index, pad) in pads.iter().enumerate() {
+			let Some(rendition) = self.renditions.get_mut(index) else {
+				continue;
+			};
+			if rendition.media.rows() {
 				continue;
 			}
 			for packet in &pad.packets {
@@ -1096,6 +1267,8 @@ impl Session {
 			// it is over while its own tail is still queued loses that
 			// tail. The yield is what lets the driver move them.
 			for index in 0..self.renditions.len() {
+				// What a text track still holds goes out to its last cue's end.
+				rows.extend(self.renditions[index].publish_text(true, per_group)?);
 				// A data track's groups are closed as they are written, and
 				// it has no muxer holding anything back.
 				let flushed = match self.renditions[index].muxer.as_mut() {
@@ -1153,6 +1326,11 @@ impl Session {
 						.max()
 						.unwrap_or(0),
 					unpaced: held.iter().map(|s| s.unpaced).sum(),
+					text: self
+						.renditions
+						.iter()
+						.filter_map(|r| r.text.as_ref().map(|text| text.counts))
+						.reduce(TextCounts::add),
 				})
 				.expect("a summary row serializes"),
 			);
@@ -1167,6 +1345,7 @@ impl Session {
 
 fn open(streams: Vec<InputStream>, params: Params) -> Result<State, String> {
 	let audio_group_ms = params.audio_group_ms;
+	let text_hold_ms = params.text_hold_ms;
 	let reporting = Rows::parse(&params.rows)?;
 	if streams.is_empty() {
 		return Err("publish reads at least one stream".into());
@@ -1226,6 +1405,7 @@ fn open(streams: Vec<InputStream>, params: Params) -> Result<State, String> {
 					},
 					time_base: (coded.time_base.num, coded.time_base.den),
 					length_size,
+					text: None,
 				}
 			}
 			CodedFormat::Audio(audio) => {
@@ -1261,6 +1441,37 @@ fn open(streams: Vec<InputStream>, params: Params) -> Result<State, String> {
 					},
 					time_base: (coded.time_base.num, coded.time_base.den),
 					length_size: 0,
+					text: None,
+				}
+			}
+			CodedFormat::Data if stream.text => {
+				// Cue rows, cut into the samples of a WebVTT track that counts
+				// in milliseconds, which is a WebVTT timestamp's own unit.
+				let timescale = moq_core::text::TIMESCALE as i32;
+				let mut muxer = ffrwd_bmff::mux::Muxer::text(
+					ffrwd_bmff::mux::Text {
+						config: moq_core::text::HEADER.to_vec(),
+					},
+					1,
+					timescale,
+				)
+				.map_err(|err| format!("a text track: {err}"))?;
+				if let Some(language) = &stream.language {
+					muxer = muxer.with_language(language).map_err(|err| {
+						format!("a text track in language '{language}': {err}")
+					})?;
+				}
+				Built {
+					muxer: Some(muxer),
+					codec: moq_core::text::CODEC.to_string(),
+					media: Media::Text,
+					time_base: (1, timescale),
+					length_size: 0,
+					text: Some(TextTrack {
+						cutter: moq_core::text::Cutter::new(text_hold_ms),
+						rows_time_base: (coded.time_base.num, coded.time_base.den),
+						counts: TextCounts::default(),
+					}),
 				}
 			}
 			CodedFormat::Data => {
@@ -1279,6 +1490,7 @@ fn open(streams: Vec<InputStream>, params: Params) -> Result<State, String> {
 					},
 					time_base: (coded.time_base.num, coded.time_base.den),
 					length_size: 0,
+					text: None,
 				}
 			}
 		});
@@ -1299,6 +1511,7 @@ fn open(streams: Vec<InputStream>, params: Params) -> Result<State, String> {
 				Media::Video { height, .. } => moq_core::catalog::RowKind::Video { height },
 				Media::Audio { .. } => moq_core::catalog::RowKind::Audio,
 				Media::Data { .. } => moq_core::catalog::RowKind::Data,
+				Media::Text => moq_core::catalog::RowKind::Text,
 			},
 			name: stream.name.clone(),
 		})
@@ -1337,6 +1550,12 @@ fn open(streams: Vec<InputStream>, params: Params) -> Result<State, String> {
 				moq_core::catalog::PRIORITY_DATA,
 				true,
 				moq_net::Timescale::MICRO,
+			),
+			// A text sample's time rides inside its fragment, as media's does.
+			Media::Text => (
+				moq_core::catalog::PRIORITY_TEXT,
+				true,
+				moq_net::Timescale::default(),
 			),
 		})
 		.collect();
@@ -1404,12 +1623,13 @@ fn open(streams: Vec<InputStream>, params: Params) -> Result<State, String> {
 	})?;
 
 	let bitrates: Vec<Option<u64>> = streams.iter().map(|stream| stream.bitrate).collect();
+	let languages: Vec<Option<String>> = streams.iter().map(|stream| stream.language.clone()).collect();
 	let renditions = built
 		.into_iter()
 		.zip(names)
 		.zip(tracks)
-		.zip(bitrates)
-		.map(|(((built, name), track), bitrate)| Rendition {
+		.zip(bitrates.into_iter().zip(languages))
+		.map(|(((built, name), track), (bitrate, language))| Rendition {
 			name,
 			codec: built.codec,
 			media: built.media,
@@ -1418,7 +1638,7 @@ fn open(streams: Vec<InputStream>, params: Params) -> Result<State, String> {
 			group_open: false,
 			discipline: match built.media {
 				Media::Video { .. } => moq_core::group::Groups::video(),
-				Media::Data { .. } => moq_core::group::Groups::messages(),
+				Media::Data { .. } | Media::Text => moq_core::group::Groups::messages(),
 				Media::Audio { .. } => moq_core::group::Groups::audio(
 					built.time_base.0,
 					built.time_base.1,
@@ -1429,6 +1649,8 @@ fn open(streams: Vec<InputStream>, params: Params) -> Result<State, String> {
 			time_base: built.time_base,
 			length_size: built.length_size,
 			bitrate,
+			language,
+			text: built.text,
 			init_bytes: 0,
 			groups: 0,
 			packets: 0,
@@ -1488,6 +1710,10 @@ struct InputStream {
 	/// The pad's bitrate as the query states it, its rendition's
 	/// bandwidth, in bits a second: what the catalog entry says.
 	bitrate: Option<u64>,
+	/// The language its rendition states, which a text track's entry says.
+	language: Option<String>,
+	/// Whether it arrived on the `text` input: cue rows, not messages.
+	text: bool,
 }
 
 /// `publish` as the host runs it: the session, and the streams it reads
@@ -1520,6 +1746,13 @@ impl Node for Publish {
 					.codecs(&["aac"]),
 			)
 			.input(Input::rows("data").optional().many().arrival())
+			.input(
+				Input::rows(TEXT_INPUT)
+					.optional()
+					.many()
+					.arrival()
+					.schema_json(moq_core::text::ROW_SCHEMA),
+			)
 			.rate(Rational::new(TURNS, 1)))
 	}
 
@@ -1552,6 +1785,8 @@ impl Node for Publish {
 				row: stream.row.unwrap_or(0),
 				name: stream.rendition.name.clone(),
 				bitrate: stream.rendition.bandwidth,
+				language: stream.rendition.language.clone(),
+				text: stream.port == TEXT_INPUT,
 			});
 		}
 		Ok(Publish {

@@ -19,6 +19,9 @@
 //!   - and the names its renditions publish under.
 //! - [`message`] is a data track's frame: a message's pts ahead of its
 //!   bytes, the way hang's `legacy` container frames a sample.
+//! - [`text`] is a text rendition: cue rows cut into the samples of a
+//!   WebVTT track on the way out, and handed on again as cue rows on the
+//!   way in.
 //! - [`legacy`] is media in that container, which is what libmoq (the
 //!   moq-dev OBS plugin) publishes: the codec, the keyframes and the
 //!   decode times a frame does not spell out.
@@ -52,6 +55,7 @@ pub mod prefixes;
 pub mod relay;
 pub mod restart;
 pub mod subscribe;
+pub mod text;
 
 #[cfg(target_os = "wasi")]
 pub mod doh;

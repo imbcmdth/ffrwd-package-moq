@@ -1,0 +1,10 @@
+2200000	{"text":"he goes","start_t":2.0,"end_t":2.2,"final":false,"voice":"Mango"}
+3400000	{"text":"he goes for the flank","start_t":2.0,"end_t":3.2,"final":true,"voice":"Mango"}
+4600000	{"text":"what a read","start_t":3.0,"end_t":4.5,"final":true,"voice":"Ludwig"}
+6000000	{"text":"three to one","start_t":6.0,"end_t":9.5}
+11500000	{"text":"<i>and that is the game</i>","start_t":10.0,"end_t":11.5,"final":true}
+13200000	{"text":"first line\n\nsecond --> third","start_t":12.0,"end_t":13.0,"final":true}
+16000000	{"text":"too late","start_t":2.5,"end_t":3.5,"final":true}
+17000000	{"text":"partly late","start_t":8.0,"end_t":20.0,"final":true}
+18000000	{"text":"a long one","start_t":18.0,"end_t":38.0,"final":true}
+39500000	{"text":"that is all","start_t":39.0,"end_t":39.5,"final":true}
