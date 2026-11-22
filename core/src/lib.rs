@@ -34,6 +34,9 @@
 //!   wrapped as a raw-QUIC MoQ session.
 //! - [`dns`] is the wire codec under [`doh`], the DNS-over-HTTPS relay
 //!   lookup: encode a question, read the answer's addresses.
+//! - [`prefixes`] is what a host running other people's queries holds a
+//!   run to: the broadcast path prefixes its names have to fall under,
+//!   checked against the path the relay sees.
 
 pub mod catalog;
 pub mod delivery;
@@ -42,6 +45,7 @@ pub mod group;
 pub mod legacy;
 pub mod message;
 pub mod order;
+pub mod prefixes;
 pub mod relay;
 pub mod subscribe;
 

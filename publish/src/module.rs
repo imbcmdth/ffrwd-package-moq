@@ -629,6 +629,7 @@ async fn redial(
 	window: Duration,
 	why: String,
 ) -> Result<(moq_core::wasi::Connected, u64), String> {
+	moq_core::prefixes::check(&params.relay, &params.token, &params.broadcast)?;
 	let began = std::time::Instant::now();
 	let mut wait = RECONNECT_FIRST;
 	let mut attempts = 0u64;
@@ -670,6 +671,7 @@ fn check_params(params: &Params) -> Result<(), String> {
 	// disagree stop the run instead of publishing a broadcast nobody
 	// scoped to the token can find.
 	moq_core::relay::session_path(&params.relay, &params.token)?;
+	moq_core::prefixes::check(&params.relay, &params.token, &params.broadcast)?;
 	Rows::parse(&params.rows)?;
 	if !(params.hold_s.is_finite() && params.hold_s >= 0.0) {
 		return Err(format!(
@@ -1522,6 +1524,9 @@ impl Node for Publish {
 	}
 
 	fn init(params: Params, init: &Init) -> ffrwd_node::Result<Publish> {
+		// Checked again here: a broadcast named while the run goes on may
+		// not have been through `shape`.
+		check_params(&params)?;
 		let mut inputs = Vec::new();
 		let mut streams = Vec::new();
 		for stream in init.all() {

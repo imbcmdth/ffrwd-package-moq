@@ -1,0 +1,10 @@
+[package]
+name = "prefix-probe"
+version = "0.1.0"
+edition = "2021"
+description = "The prefix test's guest: publishes or subscribes under FFRWD_MODULE_MOQ_PREFIXES the way the modules do, and says what the relay announced"
+
+[dependencies]
+moq-core = { path = "../../core" }
+moq-net = "0.2.15"
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "time", "macros"] }

@@ -875,6 +875,30 @@ go out unauthenticated with a token in hand, and so is a `#` fragment,
 which reaches no relay at all. Nothing else in the URL is dropped on
 the way.
 
+## Names a host allows
+
+A host that runs other people's queries on shared relays sets
+`FFRWD_MODULE_MOQ_PREFIXES` in the modules' environment: broadcast path
+prefixes separated by commas, such as `jobs/4f2a,jobs/4f2a-preview`. A
+query cannot set it. While it is set, `publish` and `subscribe` refuse
+any broadcast that is not under one of the prefixes, when the query is
+compiled, when the run starts and on every reconnect. A list with no
+prefixes in it refuses every broadcast. Unset, nothing is checked.
+
+The name checked is the path the relay sees: the relay URL's path, or the
+token where the URL has none, then the broadcast. A relay opens a session
+under that path, so `moqt://relay.example/jobs/other` with broadcast
+`out` is `jobs/other/out`, and a run held to `jobs/4f2a` is refused it. A
+prefix matches whole segments: `jobs/4f2a` and `jobs/4f2a/` both cover
+`jobs/4f2a/out`, and neither covers `jobs/4f2ab`. A name with an empty,
+`.` or `..` segment is refused. The refusal names the path the relay
+would see and the prefixes allowed.
+
+A subscriber held to prefixes also asks the relay to announce only the
+broadcasts under them, so it does not learn the names other runs publish
+on the same relay. `tests/live_prefixes.py` checks all of this against a
+local relay.
+
 ## What the shared crates changed
 
 **moq-net is a branch of upstream 0.2.15.** Since 0.8.0 this package

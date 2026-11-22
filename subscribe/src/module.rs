@@ -118,6 +118,7 @@ fn check_params(params: &Params) -> Result<Start, String> {
 	// params are refused. `shape` reads these params at compile time, so
 	// a URL and a token that disagree stop the query rather than the run.
 	moq_core::relay::session_path(&params.relay, &params.token)?;
+	moq_core::prefixes::check(&params.relay, &params.token, &params.broadcast)?;
 	// And so is a start nobody spells: a typo stops the query rather
 	// than quietly reading the wrong end of the broadcast.
 	Start::parse(&params.start)
@@ -344,12 +345,22 @@ struct Opened {
 /// catalog. The session driver is spawned here and runs whenever a
 /// call blocks on the executor. A broadcast not announced within `wait`
 /// is asked for again on a new session, up to `dials` sessions in all.
+///
+/// Where the host holds the run to prefixes, the session asks the relay
+/// to announce only what is under them; see
+/// [`moq_core::prefixes::subscriber_origin`].
 async fn open_broadcast(params: &Params, wait: Duration, dials: u32) -> Result<Opened, String> {
 	let path = params.broadcast.as_str();
+	let prefixes = moq_core::prefixes::Prefixes::from_env();
 	let mut dialed = 0;
 	let (endpoint, session, driver, broadcast) = loop {
 		dialed += 1;
-		let origin = moq_net::Origin::random().produce();
+		let origin = moq_core::prefixes::subscriber_origin(
+			prefixes.as_ref(),
+			&params.relay,
+			&params.token,
+			path,
+		)?;
 		let moq_core::wasi::Connected {
 			endpoint,
 			session,
@@ -869,6 +880,12 @@ impl Reader {
 		if window.is_zero() {
 			return Err(why);
 		}
+		// A refusal is final, where a failure below is tried again.
+		moq_core::prefixes::check(
+			&self.params.relay,
+			&self.params.token,
+			&self.params.broadcast,
+		)?;
 		eprintln!("subscribe: the session ended: {why}; connecting again");
 		let began = std::time::Instant::now();
 		let mut wait = RECONNECT_FIRST;
