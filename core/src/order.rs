@@ -47,8 +47,9 @@ use serde::Serialize;
 /// on its way to one a decoder can start at, a RECONNECT row each
 /// time a session the relay dropped was replaced by a new one, and a
 /// RESTART row each time the broadcast's publisher started again and
-/// the reader followed it.
-pub const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","enum":["track","hole","late","skipped","reconnect","restart"]},"track":{"type":"string"},"received":{"type":"integer"},"delivered":{"type":"integer"},"repeated":{"type":"integer"},"bytes":{"type":"integer"},"holes_opened":{"type":"integer"},"holes_filled":{"type":"integer"},"holes_abandoned_gone":{"type":"integer"},"holes_abandoned_budget":{"type":"integer"},"holes_abandoned_restart":{"type":"integer"},"holes_abandoned_end":{"type":"integer"},"dropped_late":{"type":"integer"},"skipped_join":{"type":"integer"},"fetches":{"type":"integer"},"fetches_refused":{"type":"integer"},"hold_max_groups":{"type":"integer"},"hold_max_bytes":{"type":"integer"},"reorder_max":{"type":"integer"},"first":{"type":["integer","null"]},"last":{"type":["integer","null"]},"gap_max_ms":{"type":"integer"},"call_max_ms":{"type":"integer"},"final":{"type":"boolean"},"from":{"type":"integer"},"to":{"type":"integer"},"reason":{"type":"string","enum":["gone","budget","restart","end"]},"held_groups":{"type":"integer"},"held_bytes":{"type":"integer"},"group":{"type":"integer"},"cursor":{"type":"integer"},"attempts":{"type":"integer"},"down_ms":{"type":"integer"},"error":{"type":"string"},"behind":{"type":"integer"},"seen":{"type":"string","enum":["finished","replaced","renumbered","rewound"]},"away_ms":{"type":"integer"},"shift_us":{"type":"integer"}},"additionalProperties":false}"#;
+/// the reader followed it, with how long it held a still meanwhile when
+/// it did.
+pub const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","enum":["track","hole","late","skipped","reconnect","restart"]},"track":{"type":"string"},"received":{"type":"integer"},"delivered":{"type":"integer"},"repeated":{"type":"integer"},"bytes":{"type":"integer"},"holes_opened":{"type":"integer"},"holes_filled":{"type":"integer"},"holes_abandoned_gone":{"type":"integer"},"holes_abandoned_budget":{"type":"integer"},"holes_abandoned_restart":{"type":"integer"},"holes_abandoned_end":{"type":"integer"},"dropped_late":{"type":"integer"},"skipped_join":{"type":"integer"},"fetches":{"type":"integer"},"fetches_refused":{"type":"integer"},"hold_max_groups":{"type":"integer"},"hold_max_bytes":{"type":"integer"},"reorder_max":{"type":"integer"},"first":{"type":["integer","null"]},"last":{"type":["integer","null"]},"gap_max_ms":{"type":"integer"},"call_max_ms":{"type":"integer"},"final":{"type":"boolean"},"from":{"type":"integer"},"to":{"type":"integer"},"reason":{"type":"string","enum":["gone","budget","restart","end"]},"held_groups":{"type":"integer"},"held_bytes":{"type":"integer"},"group":{"type":"integer"},"cursor":{"type":"integer"},"attempts":{"type":"integer"},"down_ms":{"type":"integer"},"error":{"type":"string"},"behind":{"type":"integer"},"seen":{"type":"string","enum":["finished","replaced","renumbered","rewound","overtaken"]},"away_ms":{"type":"integer"},"shift_us":{"type":"integer"},"still_ms":{"type":"integer"},"stills":{"type":"integer"}},"additionalProperties":false}"#;
 
 /// How long a hole in a track's group sequence is held open for the
 /// group that would fill it, and how much one track holds meanwhile.
@@ -370,23 +371,31 @@ pub fn report_reconnect(attempts: u64, down_ms: u64, error: &str) {
 
 /// A publisher that started again, followed: what showed it, how long
 /// the stream was away, and the shift its timestamps get from here on,
-/// in microseconds.
+/// in microseconds. A reader that held a still across the gap says for
+/// how long and how many stills it handed on; see [`crate::still`].
 #[derive(Serialize)]
 struct RestartRow {
 	kind: &'static str,
 	seen: &'static str,
 	away_ms: u64,
 	shift_us: i64,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	still_ms: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	stills: Option<u64>,
 }
 
 /// Says that the reader followed a publisher that started again; see
-/// [`RestartRow`] and [`crate::restart`].
-pub fn report_restart(restart: &crate::restart::Restart) {
+/// [`RestartRow`] and [`crate::restart`]. `stills` is how long a still
+/// was held across the gap and how many went out, where one was.
+pub fn report_restart(restart: &crate::restart::Restart, stills: Option<(Duration, u64)>) {
 	row(&RestartRow {
 		kind: "restart",
 		seen: restart.seen.as_str(),
 		away_ms: restart.away.as_millis() as u64,
 		shift_us: restart.shift_us,
+		still_ms: stills.map(|(held, _)| held.as_millis() as u64),
+		stills: stills.map(|(_, count)| count),
 	});
 }
 

@@ -706,7 +706,9 @@ resets a session closes it, and that is heard at once.
 paced broadcast and starts it again on the same port: both halves come
 back on the first dial, and the reader's video and audio go on after a
 gap of the idle timeout plus the time the relay was away, the first
-video packet after it a keyframe.
+video packet after it a keyframe. A reader with `still` set hands a
+still on while it waits instead; see "A still while the publisher is
+away".
 
 ### A publisher that starts again
 
@@ -716,7 +718,9 @@ its input having ended, and the next run of the same query starts. Each
 time, a new publisher publishes the same broadcast name with the same
 query and settings, and its timestamps and group numbers start over. A
 reader that copies the broadcast on, to an RTMP push, an HLS output or a
-file, carries on across that with a gap rather than ending.
+file, carries on across that with a gap rather than ending, or with a
+still held across the gap when it has `still` set (see the next
+section).
 
 What a subscriber sees depends on how the publisher went. Against
 moq-relay 0.14.13:
@@ -850,6 +854,110 @@ stop a reader that hands on nothing for that long. The second reader's
 messages never go back, and every one after a gap is a message of the
 publisher's own at its own pts under the shift its reader's row states.
 
+### A still while the publisher is away
+
+An egress piece that pushes a broadcast on over RTMP feeds a connection
+that the service at the other end closes when nothing has come over it
+for a while. While a reader waits for its publisher it hands nothing
+on, so across a restart of the program the push can go quiet for longer
+than that; the program's media then meets a closed connection, the
+piece connects again, and the service starts a new broadcast. With
+`still` at 1 the reader keeps the push fed while the publisher is away,
+so the media that follows goes out on the same connection. Per track it
+hands on:
+
+- for a picture, the last sync sample the track handed on, again every
+  500 ms under new timestamps. The bytes are the same, so nothing is
+  encoded and the stream's decoder configuration holds; each still is a
+  keyframe a decoder can start at.
+- for sound, silent AAC frames of 1024 samples, one after another with
+  no hole between them. A silent frame is a single channel element for
+  mono (`01 40 20 07`) or a channel pair element for stereo
+  (`21 10 05 00 a0 1c`) whose window has no scale factor bands, so it
+  decodes to samples of zero at any sample rate. That covers AAC-LC with
+  1024-sample frames in mono or stereo; other sound (HE-AAC, 960-sample
+  frames, more channels) has no still, and the reader says so once on
+  stderr when it starts.
+- for messages and cues, nothing.
+
+The stills start at once while the reader waits for a publisher it
+knows has gone (its tracks finished, or its broadcast dropped) or for a
+dropped session to come back. A publisher lost outright says nothing a
+reader can hear until the relay times it out, so they also start once
+no media has come off the wire for a second; a live track's frames come
+a frame apart, and one that is late by less than that starts nothing.
+Each track's stills carry on from the last packet it handed on, at the
+pace of the wall clock: a still goes out once as much time has passed
+since that packet went out as its timestamp is past the packet's. So a
+still is never behind its track, and the stills run in real time. The
+waits for a publisher or a session go on across pulls, so the pulls in
+between hand the stills on.
+
+The stills stop when the publisher's media comes off the wire again, or
+with the run when the wait for it ends. A run whose publisher finishes
+its tracks with `restart_s` at 0 still ends there; the end of a track
+can reach the reader more than a second after its last media, so a
+second or so of stills can be the last thing the run hands on. A still
+counts as its track's
+last packet, so the shift a publisher that started again gets places
+its media after the stills on every track. The shift is read off the
+pace as before, and moved further on where that would land a track's
+first packet at or before its last still. It is one shift for every
+track, so the sound stays where it was against the picture. A new
+publisher's first keyframe can be up to a GOP older than its newest
+sound, so after a restart the output can run ahead of the wall clock by
+up to a GOP. Whatever is left between a track's last still and the
+publisher's first packet on it is filled before that packet goes out,
+to within 500 ms on a picture and within a frame on sound.
+
+A publisher whose clock carried on, after a stall or after its own
+session was replaced, comes back behind the stills, which ran on in
+real time meanwhile. Rather than drop its media as packets that would
+go back, the reader holds it and shifts it past the stills in the same
+way, and says so in a RESTART row with `seen` set to `overtaken`.
+After a still a picture starts again at a sync sample: a decoder that
+has just decoded the still no longer holds the pictures the publisher's
+next frames refer to.
+
+The reader says on stderr when the stills start, and when they stop how
+long they went out for and how many pictures and silent frames there
+were. A RESTART row for a gap the reader held a still across carries
+`still_ms` and `stills`, the same figures.
+
+`still` is a number, 1 or 0, rather than a boolean: ffrwd's compiler
+takes literals and NULL among a source's arguments, and `true` is
+neither to it. The module itself also takes `true` and `false`.
+
+`tests/live_still.py` is the loop that holds this. It is
+`tests/live_restart.py`'s shape with the reader in the egress shape and
+`still` at 1: a first publisher killed outright 12 seconds in, a second
+started 6 seconds later that runs its file to the end, a third started
+5 seconds after that, and `restart_s` at 8. Each source marks its
+frames with the publisher that made them and puts its keyframes half a
+second off its white frames, so a still is told by being the last
+keyframe again, byte for byte. Against moq-relay 0.14.13, in the FLV the
+reader writes:
+
+- decode times never go back, no two video packets are more than
+  500 ms apart, and the largest hole in the sound is 2.7 ms, under a
+  frame;
+- each of the three times the publisher was away is a run of stills
+  500 ms apart (13, 19 and 19 pictures) beside a run of silent frames
+  (329, 442 and 468), as many as the reader's stderr says, and the
+  silence decodes to samples of zero;
+- the stills start a second after the last media and run at the pace of
+  the wall clock. They cover 7.02 s of media over the 7.1 s since the
+  first publisher's last packet; 9.43 s over the 9.7 s since the
+  second's, less the moment the third publisher's first packets are held
+  while its shift is read; and 9.98 s over the 10.0 s after the last
+  publisher's, until `restart_s` was spent;
+- the next publisher's first keyframe follows the last still by 33 ms
+  and 73 ms, and its sound the last silent frame by 2.7 ms and 0.7 ms,
+  and none of its media is dropped behind a still;
+- the clicks sit within 0.3 ms of where they were against the white
+  frames across both gaps, and the RESTART rows say `replaced` and
+  `finished`, each with the still it held.
+
 ### What a subscriber says
 
 The subscriber's rows are the node's rows, beside its outputs, in the
@@ -892,10 +1000,13 @@ row says the reader followed a publisher that started again: `seen`
 (`finished`, its tracks finished and a broadcast came after; `replaced`,
 another publisher announced it; `renumbered` or `rewound`, a track's
 first group or first timestamp came back behind where the reader had
-got), `away_ms` (how long the stream was away, as the output shows it:
-from the end of the last packet before the gap to the newest of the
-first packets after it) and `shift_us` (what that publisher's
-timestamps get from then on, in microseconds). The reader says the same
+got; `overtaken`, its first media came back behind the stills the reader
+handed on meanwhile), `away_ms` (how long the stream was away, as the
+output shows it: from the end of the publisher's last packet before the
+gap to the newest of the first packets after it), `shift_us` (what that
+publisher's timestamps get from then on, in microseconds) and, where
+the reader held a still across the gap, `still_ms` and `stills` (how
+long it held it, and how many stills went out). The reader says the same
 in one line on its stderr. A publisher that started again before the
 reader had handed anything on leaves no gap and loses nothing, so it has
 no RESTART row. None of
@@ -1355,7 +1466,8 @@ carried for wasm32-wasip2 fixes upstream does not ship yet).
   newest time seen; see "Text tracks".
 - `subscribe(relay, broadcast, cert DEFAULT '', token DEFAULT '',
   start DEFAULT 'live', hold_ms DEFAULT NULL, hold_mib DEFAULT 64,
-  join_ms DEFAULT 2000, reconnect_s DEFAULT 60, restart_s DEFAULT 0)`
+  join_ms DEFAULT 2000, reconnect_s DEFAULT 60, restart_s DEFAULT 0,
+  still DEFAULT 0)`
   returns `source`: a FROM relation, one row per rendition of the
   broadcast's catalog, a video cell and an audio cell, either NULL,
   and the catalog's data tracks as data cells of the first row, its text
@@ -1363,8 +1475,9 @@ carried for wasm32-wasip2 fixes upstream does not ship yet).
   Unbounded. `start` is which end of a running broadcast to join at,
   `'live'` or `'backlog'`; the three numbers after it are the hold the
   groups are put back in order in, `reconnect_s` how long a dropped
-  session is tried again for, and `restart_s` how long a reader whose
-  publisher finished its tracks waits for one that starts again. See
+  session is tried again for, `restart_s` how long a reader whose
+  publisher finished its tracks waits for one that starts again, and
+  `still` whether it hands a still on while its publisher is away. See
   above.
 
 ## Building

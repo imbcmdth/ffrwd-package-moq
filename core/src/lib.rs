@@ -31,6 +31,9 @@
 //! - [`restart`] is a reader's timestamps across a publisher that
 //!   started again: one shift for every track, so the new media follows
 //!   the old after a gap as long as the stream was away.
+//! - [`still`] is what a reader hands on while its publisher is away: a
+//!   picture's last sync sample again and silent sound, at the pace of
+//!   the wall clock.
 //! - [`subscribe`] is the receiving side before the media: the
 //!   subscription shape, the catalog read, and [`subscribe::FrameStream`]
 //!   pulling groups and frames off a track in arrival order.
@@ -54,6 +57,7 @@ pub mod order;
 pub mod prefixes;
 pub mod relay;
 pub mod restart;
+pub mod still;
 pub mod subscribe;
 pub mod text;
 

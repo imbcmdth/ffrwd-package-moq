@@ -209,6 +209,21 @@ RETURNS sink
 -- come back. A broadcast the relay dropped with its tracks unfinished,
 -- which is what a publisher lost outright leaves, is waited for as long
 -- as restart_s or reconnect_s allows, whichever is longer.
+--
+-- still is 1 for a reader that goes on handing media on while its
+-- publisher is away, and 0, the default, for one that hands nothing on
+-- meanwhile. A destination that closes a connection carrying nothing, an
+-- RTMP push for one, then never goes without, and the next publisher's
+-- media lands on the same connection. With still at 1 each picture's
+-- last keyframe goes out again every 500 ms under new timestamps, the
+-- same bytes, and AAC-LC sound in mono or stereo gets silent frames with
+-- no hole between them; other sound, messages and cues get nothing. The
+-- stills start a second after the last media, or at once while the
+-- reader waits for a publisher it knows has gone, and carry on from each
+-- track's last packet at the pace of the wall clock. They stop when the
+-- publisher's media comes again, which lands after them on every track
+-- under one shift, or when the wait for it ends. A row with kind
+-- 'restart' says how long the still was held across the gap.
 CREATE FUNCTION subscribe(relay text, broadcast text,
                           cert text DEFAULT '', token text DEFAULT '',
                           start text DEFAULT 'live',
@@ -216,6 +231,7 @@ CREATE FUNCTION subscribe(relay text, broadcast text,
                           hold_mib number DEFAULT 64,
                           join_ms number DEFAULT 2000,
                           reconnect_s number DEFAULT 60,
-                          restart_s number DEFAULT 0)
+                          restart_s number DEFAULT 0,
+                          still number DEFAULT 0)
 RETURNS source
   AS 'target/wasm32-wasip2/release/subscribe.wasm', 'subscribe' LANGUAGE wasm;

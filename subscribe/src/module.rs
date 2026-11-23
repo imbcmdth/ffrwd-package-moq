@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ffrwd_node::{
 	Bound, CodedAudio, CodedFormat, CodedStream, CodedVideo, Init, Node, Out, Output, Packet,
@@ -6,12 +6,13 @@ use ffrwd_node::{
 };
 use moq_core::order::{Hold, Queue};
 use moq_core::restart::{Seen, Stamp, Timeline};
+use moq_core::still::{self, Stills};
 use moq_core::subscribe::{Received, Start, Step};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use tokio::sync::mpsc;
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"hold_ms":{"type":"integer","minimum":0,"description":"how long a hole in a track's group sequence is held open for the group that would fill it before the relay is asked for it, in milliseconds; left out, 1000 on a live join, which has given up the past already, and 30000 on a backlog join, the subscription's own latency window"},"hold_mib":{"type":"integer","minimum":1,"default":64,"description":"how much one track holds meanwhile, in MiB; 64 covers a 30s window up to about 17 Mbit/s"},"join_ms":{"type":"integer","minimum":0,"default":2000,"description":"how long a joining reader waits for a lower group sequence before it fixes its cursor on a backlog join, in milliseconds; 0 starts at the first group that arrives, and a live join never waits at all"},"reconnect_s":{"type":"integer","minimum":0,"default":60,"description":"how long a reader whose session the relay dropped keeps trying to open a new one and take its tracks up again at the live edge, in seconds; 0 ends the run on the first drop"},"restart_s":{"type":"integer","minimum":0,"default":0,"description":"how long a reader whose publisher finished its tracks waits for a publisher of the same broadcast to take it up again, in seconds; a program that starts again finishes its tracks first when its run ends. 0 ends the run when the tracks finish, as at the end of a file. A broadcast the relay dropped without its tracks finishing is waited for as long as this or reconnect_s allows, whichever is longer"},"start":{"type":"string","enum":["live","backlog"],"default":"live","description":"where to join a broadcast already running: 'live' at the publisher's newest group, starting at the first group a decoder can begin at - a keyframe group for video, any group for audio - or 'backlog' at the oldest group the relay still holds, which reads the whole cache before the first packet comes out"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"hold_ms":{"type":"integer","minimum":0,"description":"how long a hole in a track's group sequence is held open for the group that would fill it before the relay is asked for it, in milliseconds; left out, 1000 on a live join, which has given up the past already, and 30000 on a backlog join, the subscription's own latency window"},"hold_mib":{"type":"integer","minimum":1,"default":64,"description":"how much one track holds meanwhile, in MiB; 64 covers a 30s window up to about 17 Mbit/s"},"join_ms":{"type":"integer","minimum":0,"default":2000,"description":"how long a joining reader waits for a lower group sequence before it fixes its cursor on a backlog join, in milliseconds; 0 starts at the first group that arrives, and a live join never waits at all"},"reconnect_s":{"type":"integer","minimum":0,"default":60,"description":"how long a reader whose session the relay dropped keeps trying to open a new one and take its tracks up again at the live edge, in seconds; 0 ends the run on the first drop"},"restart_s":{"type":"integer","minimum":0,"default":0,"description":"how long a reader whose publisher finished its tracks waits for a publisher of the same broadcast to take it up again, in seconds; a program that starts again finishes its tracks first when its run ends. 0 ends the run when the tracks finish, as at the end of a file. A broadcast the relay dropped without its tracks finishing is waited for as long as this or reconnect_s allows, whichever is longer"},"still":{"type":["integer","boolean"],"minimum":0,"maximum":1,"default":0,"description":"1 (or true) to go on handing media on while the publisher the reader reads is away, so that a destination which closes a connection that carries nothing, an RTMP push for one, never goes without: each picture's last keyframe again every 500 ms and silent AAC frames with no hole between them, from a second after the last media, or at once while the reader waits for a publisher it knows has gone, until the publisher's media is back or the wait ends. Data and text tracks get nothing. 0, the default, hands nothing on meanwhile"},"start":{"type":"string","enum":["live","backlog"],"default":"live","description":"where to join a broadcast already running: 'live' at the publisher's newest group, starting at the first group a decoder can begin at - a keyframe group for video, any group for audio - or 'backlog' at the oldest group the relay still holds, which reads the whole cache before the first packet comes out"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
 
 /// How long the relay gets to announce the broadcast, and then to hand
 /// over its catalog, before the call gives up.
@@ -86,6 +87,30 @@ pub(crate) struct Params {
 	/// to take the broadcast up again, in seconds; see [`Reader::follow`].
 	#[serde(default)]
 	restart_s: u64,
+	/// Whether the reader hands on a still while its publisher is away;
+	/// see [`Holding`].
+	#[serde(default, deserialize_with = "flag")]
+	still: bool,
+}
+
+/// A switch written as 1 or 0, or as true or false. A query writes 1 or 0:
+/// ffrwd's compiler takes literals and NULL among a source's arguments,
+/// and `true` is neither to it.
+fn flag<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+	#[derive(Deserialize)]
+	#[serde(untagged)]
+	enum Flag {
+		Bool(bool),
+		Number(f64),
+	}
+	match Flag::deserialize(deserializer)? {
+		Flag::Bool(on) => Ok(on),
+		Flag::Number(0.0) => Ok(false),
+		Flag::Number(1.0) => Ok(true),
+		Flag::Number(number) => Err(serde::de::Error::custom(format!(
+			"a switch is 1 or 0, not {number}"
+		))),
+	}
 }
 
 fn default_reconnect_s() -> u64 {
@@ -308,6 +333,12 @@ impl Rendition {
 		}
 	}
 
+	/// Whether its packets are media, a picture or sound, rather than
+	/// messages or cues.
+	fn media(&self) -> bool {
+		!matches!(self.body, Body::Data { .. } | Body::Text { .. })
+	}
+
 	/// The track was taken up on a fresh subscription at the live edge:
 	/// what its hold waits for is not coming, and a picture has to start
 	/// again at a sync sample, since the frames it would have referred
@@ -411,8 +442,9 @@ struct Reader {
 	/// The session's protocol task, which ends when the session does.
 	driver: tokio::task::JoinHandle<Result<(), moq_net::Error>>,
 	/// What the session's relay announces at the broadcast's path: where a
-	/// broadcast that went away shows up again.
-	announced: moq_net::announce::Consumer,
+	/// broadcast that went away shows up again. A wait for it reads it on a
+	/// task of its own meanwhile; see [`Wait`].
+	announced: Option<moq_net::announce::Consumer>,
 	/// Why the session has to be opened again, when a track has said so.
 	lost: Option<String>,
 	/// What the session was opened with, to open it again.
@@ -439,6 +471,194 @@ struct Reader {
 	/// When the last pull returned, which is when the session last stopped
 	/// turning.
 	left: Option<std::time::Instant>,
+	/// The tracks being taken up again, a wait that goes on across pulls.
+	wait: Option<Wait>,
+	/// The stills the query asked for, handed on while the publisher is
+	/// away.
+	holding: Option<Holding>,
+}
+
+/// A wait for the tracks to be taken up again: after a publisher that went
+/// away ([`Reader::follow`]), or a session that ended
+/// ([`Reader::reconnect`]). It goes on across pulls, so that a reader that
+/// holds a still hands it on meanwhile. What it looks for is looked for by
+/// a task of its own on the instance's runtime, which runs whenever a pull
+/// waits, and each pull looks at where it has got; see [`Reader::advance`].
+struct Wait {
+	/// What took the tracks away.
+	why: String,
+	/// What a window spent with nothing found does: end the run, after a
+	/// publisher that finished its tracks, or fail it.
+	ends: bool,
+	began: std::time::Instant,
+	window: Duration,
+	stage: Stage,
+}
+
+/// What a search for the broadcast announced again hands back: the
+/// announcements to read on, and the broadcast, None once nothing more
+/// will be announced on the session.
+type Searched = (
+	Option<moq_net::announce::Consumer>,
+	Option<moq_net::broadcast::Consumer>,
+);
+
+/// Where a wait has got to.
+enum Stage {
+	/// Waiting on this session for the broadcast to be announced again; see
+	/// [`announced_again`].
+	Announced {
+		ended: Ended,
+		search: tokio::task::JoinHandle<Searched>,
+	},
+	/// Reading the catalog of the broadcast announced again.
+	Catalog {
+		ended: Ended,
+		broadcast: moq_net::broadcast::Consumer,
+		search: tokio::task::JoinHandle<Result<Vec<moq_core::catalog::Rendition>, String>>,
+	},
+	/// Opening a new session, the try `attempts` counts; see [`dial`].
+	Dial {
+		ended: Option<Ended>,
+		attempts: u64,
+		backoff: Duration,
+		search: tokio::task::JoinHandle<Result<Opened, String>>,
+	},
+}
+
+impl Stage {
+	/// Stops what the wait was looking for.
+	fn abort(&self) {
+		match self {
+			Stage::Announced { search, .. } => search.abort(),
+			Stage::Catalog { search, .. } => search.abort(),
+			Stage::Dial { search, .. } => search.abort(),
+		}
+	}
+}
+
+/// The stills a reader hands on while its publisher is away, when the query
+/// asks for them (`still`): each picture's last sync sample again, and
+/// silent sound. They go out while the reader waits for a publisher it
+/// knows has gone, and once it has heard no media for [`still::QUIET`],
+/// which is all a publisher lost outright says until the relay times it
+/// out. They stop when the publisher's media comes again. When and with
+/// what timestamps is [`moq_core::still`]'s; the timeline places the
+/// publisher's media after them (see [`Timeline::still`]).
+struct Holding {
+	stills: Stills,
+	/// Each picture's last sync sample, the bytes its stills carry.
+	sync: Vec<Option<Vec<u8>>>,
+	/// Each sound track's silent frame, where it has one.
+	silent: Vec<Option<&'static [u8]>>,
+	/// When media last came off the wire.
+	heard: Option<std::time::Instant>,
+	/// The stills going out since the publisher's media last did.
+	spell: Option<Spell>,
+}
+
+/// One stretch of stills: when the first went out, and how many of each.
+struct Spell {
+	began: std::time::Instant,
+	pictures: u64,
+	frames: u64,
+}
+
+impl Spell {
+	/// One line saying the stills are over, how long they went out for and
+	/// how many there were, with what ended them.
+	fn say(&self, ended: &str) {
+		eprintln!(
+			"subscribe: {ended} after {:.1}s of stills: {} pictures, {} silent frames",
+			self.began.elapsed().as_secs_f64(),
+			self.pictures,
+			self.frames
+		);
+	}
+}
+
+impl Holding {
+	/// The stills of the tracks the reader pulls, in its order. Sound with no
+	/// silent frame says so here, once.
+	fn new(renditions: &[Rendition]) -> Self {
+		let mut kinds = Vec::with_capacity(renditions.len());
+		let mut silent = Vec::with_capacity(renditions.len());
+		for rendition in renditions {
+			let (kind, frame) = match rendition.kind {
+				_ if !rendition.media() => (still::Kind::Nothing, None),
+				moq_core::catalog::Kind::Video { .. } => (still::Kind::Picture, None),
+				moq_core::catalog::Kind::Audio { sample_rate, .. } => {
+					match still::silent_aac(&rendition.entry.config) {
+						Ok(frame) if sample_rate > 0 => {
+							(still::Kind::Sound { rate: sample_rate }, Some(frame))
+						}
+						Ok(_) => {
+							eprintln!(
+								"subscribe: track '{}' states no sample rate, so its sound has no \
+								 still",
+								rendition.name
+							);
+							(still::Kind::Nothing, None)
+						}
+						Err(why) => {
+							eprintln!(
+								"subscribe: track '{}': {why}, so its sound has no still",
+								rendition.name
+							);
+							(still::Kind::Nothing, None)
+						}
+					}
+				}
+				_ => (still::Kind::Nothing, None),
+			};
+			kinds.push((rendition.timescale(), kind));
+			silent.push(frame);
+		}
+		Holding {
+			stills: Stills::new(kinds),
+			sync: (0..renditions.len()).map(|_| None).collect(),
+			silent,
+			heard: None,
+			spell: None,
+		}
+	}
+
+	/// The still of `track` at `stamp`, counted in the spell.
+	fn packet(&mut self, track: usize, stamp: Stamp) -> Packet {
+		let picture = self.stills.kind(track) == still::Kind::Picture;
+		if let Some(spell) = self.spell.as_mut() {
+			match picture {
+				true => spell.pictures += 1,
+				false => spell.frames += 1,
+			}
+		}
+		let data = match picture {
+			true => self.sync[track].clone().unwrap_or_default(),
+			false => self.silent[track].unwrap_or_default().to_vec(),
+		};
+		Packet {
+			pts: stamp.pts,
+			dts: Some(stamp.dts),
+			duration: Some(stamp.duration),
+			keyframe: true,
+			data,
+		}
+	}
+
+	/// A packet of the publisher's about to go out on `track`'s pad at
+	/// `now`. The stills that fit between the track's last still and it go
+	/// first, and the track's stills carry on from it from here on.
+	fn carry_on(&mut self, track: usize, packet: &Packet, pad: &mut Vec<Packet>, now: Instant) {
+		let stamp = stamp_of(packet);
+		for still in self.stills.bridge(track, stamp.dts) {
+			let filled = self.packet(track, still);
+			pad.push(filled);
+		}
+		self.stills.handed_on(track, stamp, packet.keyframe, now);
+		if packet.keyframe && self.stills.kind(track) == still::Kind::Picture {
+			self.sync[track] = Some(packet.data.clone());
+		}
+	}
 }
 
 /// The reader the instance's runtime drives.
@@ -545,6 +765,61 @@ async fn open_broadcast(params: &Params, wait: Duration, dials: u32) -> Result<O
 		renditions: moq_core::catalog::parse(&document)
 			.map_err(|err| format!("broadcast '{path}': {err}"))?,
 	})
+}
+
+/// The next broadcast a session's relay announces at `path` that the
+/// tracks are not on already (`current`), and that is not `tried`. After a
+/// publisher finished its tracks the relay goes on announcing that
+/// broadcast for a while (moq-relay does until its publisher's session
+/// closes and the linger after it), and a new session would be handed it
+/// again, so one from the same publisher is passed over. None once nothing
+/// more will be announced. The announcements are handed back, to be read
+/// on.
+async fn announced_again(
+	mut announced: moq_net::announce::Consumer,
+	path: String,
+	current: moq_net::broadcast::Consumer,
+	publisher: Option<u64>,
+	ended: Ended,
+	tried: Option<moq_net::broadcast::Consumer>,
+) -> Searched {
+	loop {
+		let Some(update) = announced.next().await else {
+			return (Some(announced), None);
+		};
+		let Some(broadcast) = update.broadcast else {
+			continue;
+		};
+		let same_finished = ended == Ended::Finished
+			&& publisher.is_some()
+			&& publisher_of(&broadcast) == publisher;
+		if update.path.as_str() == path
+			&& !broadcast.is_closed()
+			&& !broadcast.is_clone(&current)
+			&& !tried
+				.as_ref()
+				.is_some_and(|tried| broadcast.is_clone(tried))
+			&& !same_finished
+		{
+			return (Some(announced), Some(broadcast));
+		}
+	}
+}
+
+/// One try at a new session after `pause`: dialed, the broadcast announced
+/// on it and its catalog read, each within what is left of `window` since
+/// `began`, and never less than [`RECONNECT_FIRST`].
+async fn dial(
+	params: Params,
+	pause: Duration,
+	began: std::time::Instant,
+	window: Duration,
+) -> Result<Opened, String> {
+	if !pause.is_zero() {
+		tokio::time::sleep(pause).await;
+	}
+	let left = window.saturating_sub(began.elapsed());
+	open_broadcast(&params, left.max(RECONNECT_FIRST), 1).await
 }
 
 /// The catalog of a broadcast announced again on a session already up.
@@ -920,87 +1195,196 @@ impl Reader {
 		tokio::task::yield_now().await;
 		let mut produced = false;
 		loop {
-			while let Ok(wire) = self.frames.try_recv() {
-				self.hold(wire)?;
-				// A burst can bring more than a track's hold may keep, a
-				// backlog hundreds of groups deep in one go. The budget is
-				// held to as it fills, not once the burst is in.
-				let hold = self.hold;
-				if self.renditions.iter().any(|rendition| rendition.queue.full(hold)) {
-					produced |= self.release(&mut pads, false)?;
+			if let Some(ends) = self.wait.as_ref().map(|wait| wait.ends) {
+				// The tracks are being taken up again. The wire they were on
+				// is left alone meanwhile: nothing of it reaches the holds.
+				match self.advance().await {
+					Ok(true) => continue,
+					Ok(false) => {}
+					Err(Mend::Spent(why)) if ends => {
+						eprintln!("subscribe: {why}; ending");
+						return Ok(self.end());
+					}
+					Err(mend) => {
+						self.end_stills();
+						return Err(mend.message());
+					}
+				}
+			} else {
+				while let Ok(wire) = self.frames.try_recv() {
+					self.hold(wire)?;
+					// A burst can bring more than a track's hold may keep, a
+					// backlog hundreds of groups deep in one go. The budget is
+					// held to as it fills, not once the burst is in.
+					let hold = self.hold;
+					if self
+						.renditions
+						.iter()
+						.any(|rendition| rendition.queue.full(hold))
+					{
+						produced |= self.release(&mut pads, false)?;
+					}
+				}
+				// The session ended under the tracks, or one of them could not
+				// be taken up again on it: open a new one before anything else.
+				// A broadcast closed under a session that is still up is the
+				// publisher gone, not the session: another may already be
+				// announced on it.
+				if self.driver.is_finished() || self.lost.is_some() {
+					let alive = !self.driver.is_finished();
+					let why = match self.lost.take() {
+						Some(why) => why,
+						None => match (&mut self.driver).await {
+							Ok(Ok(())) => "the relay closed the session".to_string(),
+							Ok(Err(err)) => err.to_string(),
+							Err(err) => err.to_string(),
+						},
+					};
+					// A track lost under a session that is still up may be its
+					// publisher gone, which a relay drops some seconds after it
+					// fails the tracks: waited for as long as either window
+					// allows, whether or not the broadcast is closed yet.
+					let reconnect = Duration::from_secs(self.params.reconnect_s);
+					let restart = reconnect.max(Duration::from_secs(self.params.restart_s));
+					let waiting = if alive && self.broadcast.is_closed() {
+						self.follow(why, Ended::Vanished, restart, false)
+					} else {
+						let window = if alive { restart } else { reconnect };
+						self.reconnect(why, window, None, false)
+					};
+					if let Err(mend) = waiting {
+						self.end_stills();
+						return Err(mend.message());
+					}
+					continue;
+				}
+				produced |= self.release(&mut pads, self.over())?;
+				self.ask();
+				self.report();
+				if !produced && self.over() {
+					// Every track has finished and no answer is outstanding:
+					// whatever was held has just gone out. A publisher that
+					// finished may be followed by one that takes the broadcast
+					// up again, for as long as `restart_s` allows; otherwise
+					// this is the end of the run.
+					let window = Duration::from_secs(self.params.restart_s);
+					match self.follow(
+						"its tracks finished".to_string(),
+						Ended::Finished,
+						window,
+						true,
+					) {
+						Ok(()) => continue,
+						Err(Mend::Refused(err)) => return Err(err),
+						Err(Mend::Spent(_)) => return Ok(self.end()),
+					}
 				}
 			}
-			// The session ended under the tracks, or one of them could not
-			// be taken up again on it: open a new one before anything else.
-			// A broadcast closed under a session that is still up is the
-			// publisher gone, not the session: another may already be
-			// announced on it.
-			if self.driver.is_finished() || self.lost.is_some() {
-				let alive = !self.driver.is_finished();
-				let why = match self.lost.take() {
-					Some(why) => why,
-					None => match (&mut self.driver).await {
-						Ok(Ok(())) => "the relay closed the session".to_string(),
-						Ok(Err(err)) => err.to_string(),
-						Err(err) => err.to_string(),
-					},
-				};
-				// A track lost under a session that is still up may be its
-				// publisher gone, which a relay drops some seconds after it
-				// fails the tracks: waited for as long as either window
-				// allows, whether or not the broadcast is closed yet.
-				let reconnect = Duration::from_secs(self.params.reconnect_s);
-				let restart = reconnect.max(Duration::from_secs(self.params.restart_s));
-				if alive && self.broadcast.is_closed() {
-					self.follow(why, Ended::Vanished, restart)
-						.await
-						.map_err(Mend::message)?;
-				} else {
-					let window = if alive { restart } else { reconnect };
-					self.reconnect(why, window, None)
-						.await
-						.map_err(Mend::message)?;
-				}
-				continue;
-			}
-			produced |= self.release(&mut pads, self.over())?;
-			self.ask();
-			self.report();
+			produced |= self.hand_on_stills(&mut pads);
 			if produced {
 				return Ok(Some(into_pads(pads)));
 			}
-			if self.over() {
-				// Every track has finished and no answer is outstanding:
-				// whatever was held has just gone out. A publisher that
-				// finished may be followed by one that takes the broadcast
-				// up again, for as long as `restart_s` allows; otherwise
-				// this is the end of the run.
-				let window = Duration::from_secs(self.params.restart_s);
-				if !window.is_zero() {
-					match self
-						.follow("its tracks finished".to_string(), Ended::Finished, window)
-						.await
-					{
-						Ok(()) => continue,
-						Err(Mend::Refused(err)) => return Err(err),
-						Err(Mend::Spent(why)) => eprintln!("subscribe: {why}; ending"),
-					}
-				}
-				for rendition in &mut self.renditions {
-					rendition.queue.report(true);
-				}
-				return Ok(None);
+			let slice = self.slice();
+			if self.wait.is_some() {
+				tokio::time::sleep(slice).await;
+				continue;
 			}
 			// Nothing ready: wait for the wire, but only for a tick. The
 			// hold releases on a deadline as well as on an arrival, and a
 			// track that has gone quiet would otherwise sleep through it.
-			match tokio::time::timeout(TICK, self.frames.recv()).await {
+			match tokio::time::timeout(slice, self.frames.recv()).await {
 				Ok(Some(wire)) => self.hold(wire)?,
 				// Nothing holds a sender but this reader, so the channel
 				// closes only if it has been dropped out from under us.
 				Ok(None) => return Ok(None),
 				Err(_) => {}
 			}
+		}
+	}
+
+	/// The end of the run: every track's last row, and the stills going
+	/// out end with it.
+	fn end(&mut self) -> Option<Vec<PadPackets>> {
+		self.end_stills();
+		for rendition in &mut self.renditions {
+			rendition.queue.report(true);
+		}
+		None
+	}
+
+	/// The stills going out, if any, end with the run.
+	fn end_stills(&mut self) {
+		if let Some(spell) = self
+			.holding
+			.as_mut()
+			.and_then(|holding| holding.spell.take())
+		{
+			spell.say("the run ends");
+		}
+	}
+
+	/// Whether stills go out now: the query asked for them, and the reader
+	/// is waiting for its publisher or has heard no media for
+	/// [`still::QUIET`].
+	fn holds(&self, now: std::time::Instant) -> bool {
+		let Some(holding) = self.holding.as_ref() else {
+			return false;
+		};
+		self.wait.is_some()
+			|| holding
+				.heard
+				.is_some_and(|heard| now.saturating_duration_since(heard) >= still::QUIET)
+	}
+
+	/// The stills due, onto their pads, while the reader holds them; see
+	/// [`Holding`]. True when any went out.
+	fn hand_on_stills(&mut self, pads: &mut [Vec<Packet>]) -> bool {
+		let now = Instant::now();
+		if !self.holds(now) {
+			return false;
+		}
+		let Some(holding) = self.holding.as_mut() else {
+			return false;
+		};
+		let due = holding.stills.due(now);
+		if due.is_empty() {
+			return false;
+		}
+		if holding.spell.is_none() {
+			let why = match self.wait.as_ref() {
+				Some(wait) => wait.why.clone(),
+				None => {
+					let quiet = holding
+						.heard
+						.map_or(Duration::ZERO, |heard| now.saturating_duration_since(heard));
+					format!("no media for {:.1}s", quiet.as_secs_f64())
+				}
+			};
+			eprintln!("subscribe: {why}; holding a still until the publisher is back");
+			holding.spell = Some(Spell {
+				began: now,
+				pictures: 0,
+				frames: 0,
+			});
+		}
+		for (index, stamp) in due {
+			let picture = holding.stills.kind(index) == still::Kind::Picture;
+			self.timeline.still(index, stamp, picture);
+			pads[index].push(holding.packet(index, stamp));
+		}
+		true
+	}
+
+	/// How long a pull with nothing to hand on waits before it looks again:
+	/// a tick, or less when a still falls due sooner.
+	fn slice(&self) -> Duration {
+		let now = Instant::now();
+		match self.holding.as_ref() {
+			Some(holding) if self.holds(now) => holding
+				.stills
+				.next()
+				.map_or(TICK, |next| next.saturating_duration_since(now).min(TICK)),
+			_ => TICK,
 		}
 	}
 
@@ -1052,6 +1436,7 @@ impl Reader {
 				if self.renditions[index].passed_over(&frame) {
 					return Ok(());
 				}
+				self.heard(index);
 				self.timeline.new_frame(index);
 				self.resumed_at(index, &frame)?;
 				let rendition = &mut self.renditions[index];
@@ -1076,6 +1461,7 @@ impl Reader {
 			}
 			Wire::Group(index, sequence, frames) => {
 				if let Some(first) = frames.first() {
+					self.heard(index);
 					self.timeline.new_frame(index);
 					self.resumed_at(index, first)?;
 				}
@@ -1094,6 +1480,13 @@ impl Reader {
 			}
 		}
 		Ok(())
+	}
+
+	/// Media came off the wire for `track`: the publisher is there.
+	fn heard(&mut self, track: usize) {
+		if let (Some(holding), true) = (self.holding.as_mut(), self.renditions[track].media()) {
+			holding.heard = Some(Instant::now());
+		}
 	}
 
 	/// The first frame of a track taken up again, when nothing had shown
@@ -1153,11 +1546,16 @@ impl Reader {
 	/// then is tried again, a doubling wait apart, until the window is
 	/// spent. `ended` says how the broadcast had gone, when it went before
 	/// the session did.
-	async fn reconnect(
+	///
+	/// This starts the wait, which goes on across pulls (see [`Wait`]);
+	/// `ends` says what a window spent does. It fails at once on a refusal,
+	/// and with a window of nothing.
+	fn reconnect(
 		&mut self,
 		why: String,
 		window: Duration,
 		ended: Option<Ended>,
+		ends: bool,
 	) -> Result<(), Mend> {
 		if window.is_zero() {
 			return Err(Mend::Spent(why));
@@ -1170,47 +1568,22 @@ impl Reader {
 		)
 		.map_err(Mend::Refused)?;
 		eprintln!("subscribe: the session ended: {why}; connecting again");
-		let began = std::time::Instant::now();
-		let mut wait = RECONNECT_FIRST;
-		let mut attempts = 0u64;
-		loop {
-			attempts += 1;
-			let left = window.saturating_sub(began.elapsed());
-			let failure = match open_broadcast(&self.params, left.max(RECONNECT_FIRST), 1).await {
-				Ok(opened) => match self
-					.resume(
-						opened.broadcast,
-						opened.renditions,
-						Some(opened.dialed),
-						ended,
-					)
-					.await
-				{
-					Ok(()) => {
-						moq_core::order::report_reconnect(
-							attempts,
-							began.elapsed().as_millis() as u64,
-							&why,
-						);
-						return Ok(());
-					}
-					Err(Resume::Refused(err)) => return Err(Mend::Refused(err)),
-					Err(Resume::Again(err)) => err,
-				},
-				Err(err) => err,
-			};
-			let left = window.saturating_sub(began.elapsed());
-			if left.is_zero() {
-				return Err(Mend::Spent(format!(
-					"{why}; no new session took the tracks up within {}s ({attempts} tries, \
-					 the last: {failure})",
-					window.as_secs()
-				)));
-			}
-			eprintln!("subscribe: connecting again: {failure}; trying again");
-			tokio::time::sleep(wait.min(left)).await;
-			wait = (wait * 2).min(RECONNECT_MAX);
-		}
+		let began = Instant::now();
+		let search =
+			tokio::task::spawn_local(dial(self.params.clone(), Duration::ZERO, began, window));
+		self.wait = Some(Wait {
+			why,
+			ends,
+			began,
+			window,
+			stage: Stage::Dial {
+				ended,
+				attempts: 1,
+				backoff: RECONNECT_FIRST,
+				search,
+			},
+		});
+		Ok(())
 	}
 
 	/// The broadcast the tracks were on went away while the session under
@@ -1228,7 +1601,17 @@ impl Reader {
 	/// is a broadcast announced by another publisher; see
 	/// [`Reader::resume`]. A session that ends meanwhile is dialed again
 	/// within what is left of the window.
-	async fn follow(&mut self, why: String, ended: Ended, window: Duration) -> Result<(), Mend> {
+	///
+	/// This starts the wait, which goes on across pulls (see [`Wait`]);
+	/// `ends` says what a window spent does. It fails at once on a refusal,
+	/// and with a window of nothing.
+	fn follow(
+		&mut self,
+		why: String,
+		ended: Ended,
+		window: Duration,
+		ends: bool,
+	) -> Result<(), Mend> {
 		if window.is_zero() {
 			return Err(Mend::Spent(why));
 		}
@@ -1238,75 +1621,192 @@ impl Reader {
 			&self.params.broadcast,
 		)
 		.map_err(Mend::Refused)?;
-		let began = std::time::Instant::now();
-		let mut tried: Option<moq_net::broadcast::Consumer> = None;
-		loop {
-			let left = window.saturating_sub(began.elapsed());
-			let next = self.announced_again(ended, tried.as_ref());
-			let broadcast = match tokio::time::timeout(left, next).await {
-				Ok(Some(broadcast)) => broadcast,
-				Ok(None) => {
-					let left = window.saturating_sub(began.elapsed());
-					return self.reconnect(why, left, Some(ended)).await;
-				}
-				Err(_) => {
-					return Err(Mend::Spent(format!(
-						"{why}, and no publisher took the broadcast up again within {}s",
-						window.as_secs()
-					)))
-				}
-			};
-			tried = Some(broadcast.clone());
-			let wait = window.saturating_sub(began.elapsed()).min(OPEN_TIMEOUT);
-			let failure = match read_renditions(&broadcast, &self.params.broadcast, wait).await {
-				Err(err) => err,
-				Ok(renditions) => {
-					let resumed = self.resume(broadcast, renditions, None, Some(ended));
-					match resumed.await {
-						Ok(()) => return Ok(()),
-						Err(Resume::Refused(err)) => return Err(Mend::Refused(err)),
-						Err(Resume::Again(err)) => err,
-					}
-				}
-			};
-			eprintln!("subscribe: the broadcast came back and {failure}; waiting on");
-		}
+		let stage = self.search(ended, None);
+		self.wait = Some(Wait {
+			why,
+			ends,
+			began: Instant::now(),
+			window,
+			stage,
+		});
+		Ok(())
 	}
 
-	/// The next broadcast this session's relay announces at the path that
-	/// the tracks are not on already, and that is not `tried`. After a
-	/// publisher finished its tracks the relay goes on announcing that
-	/// broadcast for a while (moq-relay does until its publisher's session
-	/// closes and the linger after it), and a new session would be handed
-	/// it again, so one from the same publisher is passed over. None once
-	/// the session has ended.
-	async fn announced_again(
-		&mut self,
-		ended: Ended,
-		tried: Option<&moq_net::broadcast::Consumer>,
-	) -> Option<moq_net::broadcast::Consumer> {
-		loop {
-			if self.driver.is_finished() {
-				return None;
+	/// A search for the next broadcast announced at the path, other than
+	/// `tried`; see [`announced_again`]. It reads the session's
+	/// announcements, and hands them back when it is done.
+	fn search(&mut self, ended: Ended, tried: Option<moq_net::broadcast::Consumer>) -> Stage {
+		let search = match self.announced.take() {
+			Some(announced) => tokio::task::spawn_local(announced_again(
+				announced,
+				self.params.broadcast.clone(),
+				self.broadcast.clone(),
+				self.publisher,
+				ended,
+				tried,
+			)),
+			// Gone with a search the session's end cut short: the session is
+			// what has to be opened again.
+			None => tokio::task::spawn_local(async { (None, None) }),
+		};
+		Stage::Announced { ended, search }
+	}
+
+	/// One look at the wait for the tracks to be taken up again: true once
+	/// they are, false while it goes on, and why it ended without them.
+	///
+	/// A wait for the broadcast to be announced again on this session ends
+	/// when the window is spent, or turns into a wait for a new session when
+	/// this one ends. The catalog of a broadcast that was announced is read
+	/// whatever is left of the window, as is a try at a new session; a try
+	/// that fails is followed by the next a doubling wait later, while the
+	/// window lasts.
+	async fn advance(&mut self) -> Result<bool, Mend> {
+		let Some(Wait {
+			why,
+			ends,
+			began,
+			window,
+			stage,
+		}) = self.wait.take()
+		else {
+			return Ok(true);
+		};
+		let left = window.saturating_sub(began.elapsed());
+		let on = |stage| Wait {
+			why: why.clone(),
+			ends,
+			began,
+			window,
+			stage,
+		};
+		match stage {
+			Stage::Announced { ended, search } => {
+				if self.driver.is_finished() {
+					search.abort();
+					self.reconnect(why, left, Some(ended), ends)?;
+					return Ok(false);
+				}
+				if !search.is_finished() {
+					if left.is_zero() {
+						search.abort();
+						return Err(Mend::Spent(format!(
+							"{why}, and no publisher took the broadcast up again within {}s",
+							window.as_secs()
+						)));
+					}
+					self.wait = Some(on(Stage::Announced { ended, search }));
+					return Ok(false);
+				}
+				let (announced, found) = search.await.unwrap_or((None, None));
+				self.announced = announced;
+				let Some(broadcast) = found else {
+					self.reconnect(why, left, Some(ended), ends)?;
+					return Ok(false);
+				};
+				let path = self.params.broadcast.clone();
+				let reading = broadcast.clone();
+				let search = tokio::task::spawn_local(async move {
+					read_renditions(&reading, &path, left.min(OPEN_TIMEOUT)).await
+				});
+				self.wait = Some(on(Stage::Catalog {
+					ended,
+					broadcast,
+					search,
+				}));
+				Ok(false)
 			}
-			let update = match tokio::time::timeout(RECONNECT_FIRST, self.announced.next()).await {
-				Ok(Some(update)) => update,
-				Ok(None) => return None,
-				Err(_) => continue,
-			};
-			let Some(broadcast) = update.broadcast else {
-				continue;
-			};
-			let same_finished = ended == Ended::Finished
-				&& self.publisher.is_some()
-				&& publisher_of(&broadcast) == self.publisher;
-			if update.path.as_str() == self.params.broadcast
-				&& !broadcast.is_closed()
-				&& !broadcast.is_clone(&self.broadcast)
-				&& !tried.is_some_and(|tried| broadcast.is_clone(tried))
-				&& !same_finished
-			{
-				return Some(broadcast);
+			Stage::Catalog {
+				ended,
+				broadcast,
+				search,
+			} => {
+				if !search.is_finished() {
+					self.wait = Some(on(Stage::Catalog {
+						ended,
+						broadcast,
+						search,
+					}));
+					return Ok(false);
+				}
+				let read = search.await.unwrap_or_else(|err| Err(err.to_string()));
+				let failure = match read {
+					Err(err) => err,
+					Ok(renditions) => {
+						let resumed = self.resume(broadcast.clone(), renditions, None, Some(ended));
+						match resumed.await {
+							Ok(()) => return Ok(true),
+							Err(Resume::Refused(err)) => return Err(Mend::Refused(err)),
+							Err(Resume::Again(err)) => err,
+						}
+					}
+				};
+				eprintln!("subscribe: the broadcast came back and {failure}; waiting on");
+				let stage = self.search(ended, Some(broadcast));
+				self.wait = Some(on(stage));
+				Ok(false)
+			}
+			Stage::Dial {
+				ended,
+				attempts,
+				backoff,
+				search,
+			} => {
+				if !search.is_finished() {
+					self.wait = Some(on(Stage::Dial {
+						ended,
+						attempts,
+						backoff,
+						search,
+					}));
+					return Ok(false);
+				}
+				let opened = search.await.unwrap_or_else(|err| Err(err.to_string()));
+				let failure = match opened {
+					Ok(opened) => match self
+						.resume(
+							opened.broadcast,
+							opened.renditions,
+							Some(opened.dialed),
+							ended,
+						)
+						.await
+					{
+						Ok(()) => {
+							moq_core::order::report_reconnect(
+								attempts,
+								began.elapsed().as_millis() as u64,
+								&why,
+							);
+							return Ok(true);
+						}
+						Err(Resume::Refused(err)) => return Err(Mend::Refused(err)),
+						Err(Resume::Again(err)) => err,
+					},
+					Err(err) => err,
+				};
+				let left = window.saturating_sub(began.elapsed());
+				if left.is_zero() {
+					return Err(Mend::Spent(format!(
+						"{why}; no new session took the tracks up within {}s ({attempts} tries, \
+						 the last: {failure})",
+						window.as_secs()
+					)));
+				}
+				eprintln!("subscribe: connecting again: {failure}; trying again");
+				let search = tokio::task::spawn_local(dial(
+					self.params.clone(),
+					backoff.min(left),
+					began,
+					window,
+				));
+				self.wait = Some(on(Stage::Dial {
+					ended,
+					attempts: attempts + 1,
+					backoff: (backoff * 2).min(RECONNECT_MAX),
+					search,
+				}));
+				Ok(false)
 			}
 		}
 	}
@@ -1443,7 +1943,7 @@ impl Reader {
 			self.endpoint = dialed.endpoint;
 			self.session = Some(dialed.session);
 			self.driver = dialed.driver;
-			self.announced = dialed.announced;
+			self.announced = Some(dialed.announced);
 		}
 		self.broadcast = broadcast;
 		self.publisher = publisher;
@@ -1495,21 +1995,14 @@ impl Reader {
 			false => (moq_core::restart::SETTLE_LEAST, moq_core::restart::SETTLE),
 		};
 		self.timeline.settle(now, least, most);
-		for restart in self.timeline.take_restarts() {
-			moq_core::order::report_restart(&restart);
-			eprintln!(
-				"subscribe: the publisher started again ({}); the stream was away {:.1}s, and its \
-				 timestamps move by {:+.3}s to follow on",
-				restart.seen.as_str(),
-				restart.away.as_secs_f64(),
-				restart.shift_us as f64 / 1e6
-			);
-		}
 		for (index, rendition) in self.renditions.iter_mut().enumerate() {
 			rendition.queue.note_behind(self.timeline.behind(index));
 		}
 		let out = self.timeline.take_ready();
 		let any = !out.is_empty();
+		// Whether the publisher's media went on here, which ends a spell of
+		// stills.
+		let mut went_on = false;
 		for (index, stamp, mut packet) in out {
 			// A cue row carries its times inside it as well, and they move
 			// with the shift its pts gets.
@@ -1521,7 +2014,37 @@ impl Reader {
 			}
 			packet.pts = stamp.pts;
 			packet.dts = packet.dts.map(|_| stamp.dts);
+			if let Some(holding) = self.holding.as_mut() {
+				holding.carry_on(index, &packet, &mut pads[index], now);
+				went_on |= self.renditions[index].media();
+			}
 			pads[index].push(packet);
+		}
+		// A restart decided here says how long the still it ends was held.
+		let mut held = None;
+		if let (true, Some(holding)) = (went_on, self.holding.as_mut()) {
+			if let Some(spell) = holding.spell.take() {
+				spell.say("the publisher's media goes on");
+				held = Some((spell.began.elapsed(), spell.pictures + spell.frames));
+			}
+		}
+		for restart in self.timeline.take_restarts() {
+			moq_core::order::report_restart(&restart, held.take());
+			match restart.seen {
+				Seen::Overtaken => eprintln!(
+					"subscribe: the publisher's media came back behind the stills, {:.1}s after its \
+					 last packet; its timestamps move by {:+.3}s to follow them",
+					restart.away.as_secs_f64(),
+					restart.shift_us as f64 / 1e6
+				),
+				seen => eprintln!(
+					"subscribe: the publisher started again ({}); the stream was away {:.1}s, and \
+					 its timestamps move by {:+.3}s to follow on",
+					seen.as_str(),
+					restart.away.as_secs_f64(),
+					restart.shift_us as f64 / 1e6
+				),
+			}
 		}
 		Ok(any)
 	}
@@ -1958,17 +2481,19 @@ impl Node for Subscribe {
 					(names[index].clone(), data)
 				})
 				.collect();
-			let timeline = Timeline::new(renditions.iter().map(|rendition| {
-				let media = !matches!(rendition.body, Body::Data { .. } | Body::Text { .. });
-				(rendition.timescale(), media)
-			}));
+			let timeline = Timeline::new(
+				renditions
+					.iter()
+					.map(|rendition| (rendition.timescale(), rendition.media())),
+			);
+			let holding = params.still.then(|| Holding::new(&renditions));
 			Ok::<_, String>((
 				ports,
 				Reader {
 					endpoint: opened.dialed.endpoint,
 					session: Some(opened.dialed.session),
 					driver: opened.dialed.driver,
-					announced: opened.dialed.announced,
+					announced: Some(opened.dialed.announced),
 					lost: None,
 					params: params.clone(),
 					renditions,
@@ -1981,6 +2506,8 @@ impl Node for Subscribe {
 					asking: Vec::new(),
 					hold: Hold::new(hold_ms(&params, start), params.hold_mib, params.join_ms),
 					left: None,
+					wait: None,
+					holding,
 				},
 			))
 		})??;
@@ -2007,6 +2534,10 @@ impl Node for Subscribe {
 		}
 		let Some(pads) = pulled else {
 			let mut done = self.state.take().expect("the reader is here");
+			if let Some(wait) = done.reader.wait.take() {
+				wait.stage.abort();
+			}
+			done.reader.end_stills();
 			enter(async {
 				drop(done.reader.session.take());
 				done.reader.endpoint.wait_idle().await;

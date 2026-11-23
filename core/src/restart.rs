@@ -27,6 +27,18 @@
 //! a media track never goes back: a packet that would is dropped and
 //! counted, and the track starts again at a sync sample past its last
 //! packet.
+//!
+//! A reader that holds a still while its publisher is away (see
+//! [`crate::still`]) hands each still on through [`Timeline::still`]. A
+//! still counts as the track's last packet: the publisher's media that
+//! follows lands past its end and starts at a sync sample, and a shift
+//! places the new publisher after the stills on every track, not just
+//! after its old packets. The stills are not the publisher's, so its pace
+//! and the time it was away are still read off its own packets. A
+//! publisher whose clock carried on comes back behind the stills, which
+//! ran on in real time meanwhile; rather than lose its media to the rule
+//! above, the timeline holds it and gives it a shift past them as for a
+//! restart.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -67,6 +79,10 @@ pub enum Seen {
 	/// A track's first media packet came back with a decode time at or
 	/// below the last one handed on.
 	Rewound,
+	/// A track's first media packet came back past the publisher's last one
+	/// but behind the stills handed on while it was away: its clock carried
+	/// on, and the stills ran past it.
+	Overtaken,
 }
 
 impl Seen {
@@ -77,6 +93,7 @@ impl Seen {
 			Seen::Replaced => "replaced",
 			Seen::Renumbered => "renumbered",
 			Seen::Rewound => "rewound",
+			Seen::Overtaken => "overtaken",
 		}
 	}
 }
@@ -120,8 +137,13 @@ struct Clock {
 	/// waited for and decides; a data track may carry no message for
 	/// minutes, and two messages may share a pts.
 	media: bool,
-	/// The last packet handed on, in output ticks.
+	/// The last packet handed on, in output ticks, a still or not.
 	last: Option<Stamp>,
+	/// The last of the publisher's own packets handed on: what a gap is
+	/// measured from.
+	own: Option<Stamp>,
+	/// Whether the last packet handed on was a still.
+	still: bool,
 	/// While set, a packet goes out only past this decode time and at a
 	/// sync sample: the track starts again where a decoder can.
 	floor: Option<i64>,
@@ -131,6 +153,18 @@ struct Clock {
 	/// track since they were last taken up. Until one has, what it lets go
 	/// of is what it held of the publisher before.
 	taken_up: bool,
+}
+
+impl Clock {
+	/// The decode time a media packet has to land past: the last packet's,
+	/// or for a still the last tick it covers.
+	fn edge(&self) -> Option<i64> {
+		let last = self.last?;
+		Some(match self.still {
+			true => last.dts + last.duration.max(1) - 1,
+			false => last.dts,
+		})
+	}
 }
 
 /// One packet held: its times, whether a decoder can start at it, what
@@ -185,6 +219,8 @@ impl<T> Timeline<T> {
 					timescale: timescale.max(1),
 					media,
 					last: None,
+					own: None,
+					still: false,
 					floor: None,
 					behind: 0,
 					taken_up: true,
@@ -278,8 +314,16 @@ impl<T> Timeline<T> {
 	/// and goes out as one let out late, deciding nothing.
 	pub fn push(&mut self, track: usize, stamp: Stamp, sync: bool, payload: T, now: Instant) {
 		if self.held.is_none() {
-			self.emit(track, stamp, sync, payload, Some(now));
-			return;
+			// The publisher's media back behind the stills that went out while
+			// it was away is held and shifted past them, rather than dropped.
+			if !self.behind_stills(track, stamp) {
+				self.emit(track, stamp, sync, payload, Some(now));
+				return;
+			}
+			self.held = Some(Held {
+				seen: Some(self.why_back(track, stamp)),
+				packets: (0..self.clocks.len()).map(|_| Vec::new()).collect(),
+			});
 		}
 		if !self.clocks[track].taken_up {
 			self.emit(track, stamp, sync, payload, None);
@@ -287,18 +331,62 @@ impl<T> Timeline<T> {
 		}
 		let decides = self.decides(track);
 		let back = self.goes_back(track, stamp);
+		let why = self.why_back(track, stamp);
 		let held = self.held.as_mut().expect("just looked");
 		held.packets[track].push((stamp, sync, payload, now));
 		if held.seen.is_none() && decides {
 			// Not known whether the clock carried on: the first packet that
 			// decides says. Behind where its track had got, the publisher
-			// started again; otherwise it carried on, and what is held goes
-			// out at once.
+			// started again, or the stills ran past it; otherwise it carried
+			// on, and what is held goes out at once.
 			if back {
-				held.seen = Some(Seen::Rewound);
+				held.seen = Some(why);
 			} else {
 				self.conclude();
 			}
+		}
+	}
+
+	/// A still handed on in `track`'s place while its publisher is away, in
+	/// output ticks, past the track's last packet. It moves neither when the
+	/// last packet went nor the pace a shift is read from, and what the
+	/// publisher hands on next on the track lands past the still's end. A
+	/// `picture`'s still is a sync sample that the publisher's next pictures
+	/// do not refer to, so they start again at a sync sample of their own.
+	pub fn still(&mut self, track: usize, stamp: Stamp, picture: bool) {
+		let clock = &mut self.clocks[track];
+		clock.last = Some(stamp);
+		clock.still = true;
+		clock.floor = match picture {
+			true => clock.edge(),
+			false => None,
+		};
+	}
+
+	/// Whether a media packet of `track` lands behind the still the track
+	/// handed on last, while every media track's last packet is a still:
+	/// the publisher is back, and the stills ran past it.
+	fn behind_stills(&self, track: usize, stamp: Stamp) -> bool {
+		let clock = &self.clocks[track];
+		clock.media
+			&& clock.still
+			&& self
+				.clocks
+				.iter()
+				.all(|clock| !clock.media || clock.still || clock.last.is_none())
+			&& self.goes_back(track, stamp)
+	}
+
+	/// What a packet behind where its track had got says: a publisher that
+	/// started again when it lands at or before the publisher's own last
+	/// packet, and one the stills ran past when it lands behind a still
+	/// alone.
+	fn why_back(&self, track: usize, stamp: Stamp) -> Seen {
+		let clock = &self.clocks[track];
+		let landed = stamp.dts + ticks(self.shift_us, clock.timescale);
+		match (clock.still, clock.own) {
+			(true, Some(own)) if landed > own.dts => Seen::Overtaken,
+			_ => Seen::Rewound,
 		}
 	}
 
@@ -315,12 +403,12 @@ impl<T> Timeline<T> {
 	/// which may share a pts.
 	fn goes_back(&self, track: usize, stamp: Stamp) -> bool {
 		let clock = &self.clocks[track];
-		let Some(last) = clock.last else {
+		let (Some(last), Some(edge)) = (clock.last, clock.edge()) else {
 			return false;
 		};
 		let landed = stamp.dts + ticks(self.shift_us, clock.timescale);
 		match clock.media {
-			true => landed <= last.dts,
+			true => landed <= edge,
 			false => landed < last.dts,
 		}
 	}
@@ -333,9 +421,9 @@ impl<T> Timeline<T> {
 		if clock.media {
 			// A media track never goes back, and what follows a packet
 			// dropped for it starts at a sync sample.
-			if let (None, Some(last)) = (clock.floor, clock.last) {
-				if stamp.dts <= last.dts {
-					clock.floor = Some(last.dts);
+			if let (None, Some(edge)) = (clock.floor, clock.edge()) {
+				if stamp.dts <= edge {
+					clock.floor = Some(edge);
 				}
 			}
 			if let Some(floor) = clock.floor {
@@ -347,6 +435,8 @@ impl<T> Timeline<T> {
 			}
 		}
 		clock.last = Some(stamp);
+		clock.own = Some(stamp);
+		clock.still = false;
 		if let Some(at) = at {
 			let end = micros(stamp.dts + stamp.duration, clock.timescale);
 			self.recent.push_back((track, at, end));
@@ -430,8 +520,8 @@ impl<T> Timeline<T> {
 			.clocks
 			.iter()
 			.filter_map(|clock| {
-				let last = clock.last?;
-				Some(micros(last.dts + last.duration, clock.timescale))
+				let own = clock.own?;
+				Some(micros(own.dts + own.duration, clock.timescale))
 			})
 			.max()?;
 		// The tracks that decide, of those that brought something: the media
@@ -506,19 +596,19 @@ impl<T> Timeline<T> {
 			Some((lag, paced)) => paced + lag,
 			None => self.shift_us,
 		};
-		// Every media track's first packet lands after its own last one,
-		// even when the stream was away for less than the newest first
-		// packet is ahead of the oldest.
+		// Every media track's first packet lands after its own last one, and
+		// past the end of a still, even when the stream was away for less
+		// than the newest first packet is ahead of the oldest.
 		for _ in 0..self.clocks.len() {
 			let mut short = 0i64;
 			for (clock, packets) in self.clocks.iter().zip(&held.packets) {
 				if !clock.media {
 					continue;
 				}
-				if let (Some(last), Some((stamp, _, _, _))) = (clock.last, packets.first()) {
+				if let (Some(edge), Some((stamp, _, _, _))) = (clock.edge(), packets.first()) {
 					let landed = stamp.dts + ticks(shift_us, clock.timescale);
-					if landed <= last.dts {
-						let missing = i128::from(last.dts + 1 - landed);
+					if landed <= edge {
+						let missing = i128::from(edge + 1 - landed);
 						let timescale = i128::from(clock.timescale);
 						let us = (missing * 1_000_000 + timescale - 1) / timescale;
 						short = short.max(us as i64);
@@ -1177,5 +1267,99 @@ mod tests {
 		let (out, restart) = settled(&mut timeline, before, Duration::ZERO);
 		assert!(restart.is_none(), "no gap to say: {restart:?}");
 		assert_eq!(out[0].1.dts, 0);
+	}
+
+	/// Stills on both tracks of [`ran`]`(20, ..)` from the end of their last
+	/// packets up to `seconds`: a picture every half second, and silent
+	/// sound frame after frame.
+	fn held_still(timeline: &mut Timeline<u32>, seconds: i64) {
+		let mut dts = 20 * VIDEO;
+		while dts + VIDEO / 2 <= seconds * VIDEO {
+			dts += VIDEO / 2;
+			timeline.still(0, stamp(dts, 3000), true);
+		}
+		let mut dts = 20 * AUDIO;
+		while dts + 1024 <= seconds * AUDIO {
+			timeline.still(1, stamp(dts, 1024), false);
+			dts += 1024;
+		}
+	}
+
+	#[test]
+	fn a_new_publisher_follows_the_stills_on_every_track_under_one_shift() {
+		let before = Instant::now();
+		let mut timeline = ran(20, before);
+		held_still(&mut timeline, 25);
+		assert!(
+			timeline.take_ready().is_empty(),
+			"a still is the reader's to hand on"
+		);
+		resumed(&mut timeline, Some(Seen::Replaced));
+		let back = before + Duration::from_secs(5);
+		// The new publisher's keyframe, a second older than its newest sound.
+		timeline.push(0, stamp(0, 3000), true, 1, back);
+		timeline.push(1, stamp(AUDIO, 1024), true, 2, back);
+		let (out, restart) = settled(&mut timeline, back, Duration::ZERO);
+		let restart = restart.expect("a restart");
+		let video = find(&out, 0);
+		let audio = find(&out, 1);
+		// By the pace alone the picture would land at 24 s, behind the last
+		// still at 25 s. It lands one frame past that still instead, and the
+		// sound moves with it.
+		assert_eq!(video.dts, 25 * VIDEO + 3000);
+		let apart = micros(audio.dts, AUDIO as u32) - micros(video.dts, VIDEO as u32);
+		assert!((apart - 1_000_000).abs() <= 1, "{apart} us apart");
+		assert!(
+			audio.dts >= 20 * AUDIO + 234 * 1024,
+			"the sound overlaps the silence"
+		);
+		// The gap is read from the end of the publisher's own last packet, at
+		// 20 s, to the newest first packet, the sound a second in.
+		let away = 1_000_000 + restart.shift_us - 20_000_000;
+		assert_eq!(restart.away, Duration::from_micros(away as u64));
+		assert_eq!(timeline.behind(0) + timeline.behind(1), 0);
+	}
+
+	#[test]
+	fn a_publisher_that_carried_on_behind_the_stills_follows_them_rather_than_being_dropped() {
+		let before = Instant::now();
+		let mut timeline = ran(20, before);
+		held_still(&mut timeline, 23);
+		// Its media comes back three seconds late, where it left off, with
+		// nothing to say it went: behind the stills, which ran on meanwhile.
+		let back = before + Duration::from_secs(3);
+		timeline.push(1, stamp(20 * AUDIO, 1024), true, 1, back);
+		timeline.push(0, stamp(20 * VIDEO, 3000), true, 2, back);
+		assert!(timeline.take_ready().is_empty(), "held, not dropped");
+		let (out, restart) = settled(&mut timeline, back, Duration::ZERO);
+		let restart = restart.expect("a shift past the stills");
+		assert_eq!(restart.seen, Seen::Overtaken);
+		assert_eq!(find(&out, 0).dts, 23 * VIDEO + 3000);
+		assert!(find(&out, 1).dts >= 20 * AUDIO + 140 * 1024);
+		assert_eq!(timeline.behind(0) + timeline.behind(1), 0);
+	}
+
+	#[test]
+	fn after_a_still_a_picture_starts_at_a_sync_sample_and_sound_past_the_silence() {
+		let before = Instant::now();
+		let mut timeline = ran(20, before);
+		timeline.still(0, stamp(20 * VIDEO + VIDEO / 2, 3000), true);
+		timeline.still(1, stamp(20 * AUDIO, 1024), false);
+		// The publisher's clock is past the stills, so nothing is held; but a
+		// picture that leans on the ones before the still is no use, and
+		// sound inside the silent frame would overlap it.
+		let at = before + Duration::from_secs(1);
+		timeline.push(0, stamp(21 * VIDEO, 3000), false, 1, at);
+		timeline.push(0, stamp(21 * VIDEO + 3000, 3000), true, 2, at);
+		timeline.push(1, stamp(20 * AUDIO + 512, 1024), true, 3, at);
+		timeline.push(1, stamp(20 * AUDIO + 1024, 1024), true, 4, at);
+		let kept: Vec<u32> = timeline
+			.take_ready()
+			.iter()
+			.map(|(_, _, payload)| *payload)
+			.collect();
+		assert_eq!(kept, vec![2, 4]);
+		assert_eq!((timeline.behind(0), timeline.behind(1)), (1, 1));
+		assert!(timeline.take_restarts().is_empty());
 	}
 }
