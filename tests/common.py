@@ -347,7 +347,9 @@ def start_publish_node(module: Path, params: dict, feeds: list[dict], work: Path
 
 def nut_rows(path: Path, stream: str, deadline: int = 120) -> list[dict]:
     """The rows one data stream of a NUT carries: each packet's pts, in the
-    stream's ticks, the same in seconds, and the JSON object it holds."""
+    stream's ticks, the same in seconds, and the JSON object it holds. A
+    packet of white space alone is a progress mark the host wrote for an
+    empty message, and is no row."""
     done = run(["ffprobe", "-v", "error", "-select_streams", stream, "-show_packets",
                 "-show_data", "-show_entries", "packet=pts,pts_time,data", "-of", "json",
                 str(path)],
@@ -360,6 +362,8 @@ def nut_rows(path: Path, stream: str, deadline: int = 120) -> list[dict]:
         for line in packet.get("data", "").strip().splitlines():
             if ":" in line:
                 data += bytes.fromhex(line.split(":", 1)[1][:41].replace(" ", ""))
+        if not data.strip():
+            continue
         out.append({"pts": int(packet["pts"]), "time": float(packet["pts_time"]),
                     "row": json.loads(data)})
     return out

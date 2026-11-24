@@ -9,7 +9,10 @@
 //! new timestamps: the same bytes, which decode on their own and need no
 //! encoder. Sound gets silent frames one after another with no hole between
 //! them; [`silent_aac`] is the frame for AAC-LC. Data and text tracks get
-//! nothing.
+//! progress marks: empty messages that say how far the track's timeline
+//! has got, so a consumer that pairs their rows with the picture by time
+//! goes on with the picture rather than waiting for rows that are not
+//! coming.
 //!
 //! Each track's stills carry on from the last packet the track handed on,
 //! at the pace of the wall clock: a still is due once as much time has
@@ -19,7 +22,13 @@
 //! fills what is left between a track's last still and its next packet,
 //! to within an interval for a picture and a frame for sound. Where that
 //! next packet lands is the timeline's business; see
-//! [`crate::restart::Timeline::still`].
+//! [`crate::restart::Timeline::still`]. A data or text track's marks go
+//! on past the stills until the track hands on a row of its own: a text
+//! track runs seconds behind its picture, so the next publisher's first
+//! row comes that long after its first picture. They carry on from that
+//! first picture, or from its sound, when it lands past them
+//! ([`Stills::media_went_on`]), since the next publisher's rows start at
+//! its own first time.
 //!
 //! Timestamps here are the reader's output ticks, past whatever shift a
 //! restart gave; the bytes that ride with a still are the reader's own.
@@ -49,7 +58,10 @@ pub enum Kind {
 	/// Sound at `rate` samples a second: one silent frame of [`AAC_FRAME`]
 	/// samples after another.
 	Sound { rate: u32 },
-	/// No stills: a data or a text track, or sound with no silent frame.
+	/// A data or a text track: a progress mark every [`INTERVAL`] past its
+	/// last packet, the newest one due and no other.
+	Marks,
+	/// No stills: sound with no silent frame.
 	Nothing,
 }
 
@@ -69,6 +81,9 @@ struct Track {
 	step: i64,
 	/// Stills handed on since the anchor.
 	made: u64,
+	/// For marks: whether they go on whether or not the publisher is away,
+	/// from the first after the stills to the track's next row.
+	marking: bool,
 }
 
 fn ticks(us: i64, timescale: u32) -> i64 {
@@ -79,16 +94,29 @@ fn micros(ticks: i64, timescale: u32) -> i64 {
 	ffrwd_bmff::time::rescale(ticks, u64::from(timescale), 1_000_000)
 }
 
+/// How far past its anchor a picture's or a mark's still `n` is, in
+/// microseconds.
+fn after(n: u64) -> i64 {
+	INTERVAL.as_micros() as i64 * (n as i64 + 1)
+}
+
 impl Track {
 	/// The track's still `n` after its anchor, counting from 0, and when it
 	/// is due.
 	fn nth(&self, n: u64) -> Option<(Stamp, Instant)> {
 		let (anchor, at) = self.anchor?;
 		let stamp = match self.kind {
+			Kind::Marks => {
+				let dts = anchor.dts + ticks(after(n), self.timescale);
+				Stamp {
+					pts: dts,
+					dts,
+					duration: 0,
+				}
+			}
 			Kind::Picture => {
 				let offset = self.sync?;
-				let after = INTERVAL.as_micros() as i64 * (n as i64 + 1);
-				let dts = anchor.dts + ticks(after, self.timescale);
+				let dts = anchor.dts + ticks(after(n), self.timescale);
 				Stamp {
 					pts: dts + offset,
 					dts,
@@ -118,6 +146,12 @@ impl Track {
 		let since = micros(stamp.dts - anchor.dts, self.timescale).max(0);
 		Some((stamp, at + Duration::from_micros(since as u64)))
 	}
+
+	/// Whether the track's stills go out: while `holding`, and marks also
+	/// after it, until the track hands on a row of its own.
+	fn due(&self, holding: bool) -> bool {
+		holding || self.marking
+	}
 }
 
 /// Every track's stills; see the module's own words.
@@ -142,6 +176,7 @@ impl Stills {
 					sync: None,
 					step: 0,
 					made: 0,
+					marking: false,
 				})
 				.collect(),
 		}
@@ -159,9 +194,15 @@ impl Stills {
 
 	/// A packet of the publisher's went out on `track` at `now`, in output
 	/// ticks; `sync` is whether a decoder can start at it. The track's
-	/// stills carry on from it.
+	/// stills carry on from it. A data or text track's packet behind the one
+	/// its marks carry on from, a row let out late, moves nothing.
 	pub fn handed_on(&mut self, track: usize, stamp: Stamp, sync: bool, now: Instant) {
 		let track = &mut self.tracks[track];
+		if let (Kind::Marks, Some((anchor, _))) = (track.kind, track.anchor) {
+			if stamp.dts < anchor.dts {
+				return;
+			}
+		}
 		if track.kind == Kind::Picture {
 			let step = match (stamp.duration, track.anchor) {
 				(0, Some((last, _))) => stamp.dts - last.dts,
@@ -176,28 +217,81 @@ impl Stills {
 		}
 		track.anchor = Some((stamp, now));
 		track.made = 0;
+		track.marking = false;
 	}
 
-	/// Every still due by `now`, each track's in order of decode time. Each
-	/// one returned is counted as handed on.
-	pub fn due(&mut self, now: Instant) -> Vec<(usize, Stamp)> {
+	/// The publisher's media went on after a still with `track`'s packet at
+	/// `stamp`, at `now`. A data or text track's marks carry on from there
+	/// when it is past the last of them: the next publisher's rows start no
+	/// earlier than its first media, and a reader that writes its ports in
+	/// time order holds that media back behind marks that lag it.
+	pub fn media_went_on(&mut self, track: usize, stamp: Stamp, now: Instant) {
+		let at = micros(stamp.pts.min(stamp.dts), self.tracks[track].timescale);
+		for marks in self.tracks.iter_mut() {
+			if marks.kind != Kind::Marks || !marks.marking {
+				continue;
+			}
+			let Some((anchor, _)) = marks.anchor else {
+				continue;
+			};
+			let last = anchor.dts + ticks(after(marks.made.saturating_sub(1)), marks.timescale);
+			let floor = ticks(at, marks.timescale);
+			if floor <= last {
+				continue;
+			}
+			// The anchor an interval before, so the first mark is the
+			// media's own time, due now.
+			let back = ticks(after(0), marks.timescale);
+			let Some(then) = now.checked_sub(INTERVAL) else {
+				continue;
+			};
+			marks.anchor = Some((
+				Stamp {
+					pts: floor - back,
+					dts: floor - back,
+					duration: 0,
+				},
+				then,
+			));
+			marks.made = 0;
+		}
+	}
+
+	/// Every still due by `now`, each track's in order of decode time, while
+	/// `holding` says the publisher is away. A data or text track's marks
+	/// are due then too, and after it until the track hands on a row of its
+	/// own, and only the newest of them: a mark stands for every one before
+	/// it. Each one returned is counted as handed on.
+	pub fn due(&mut self, now: Instant, holding: bool) -> Vec<(usize, Stamp)> {
 		let mut out = Vec::new();
 		for (index, track) in self.tracks.iter_mut().enumerate() {
+			if !track.due(holding) {
+				continue;
+			}
+			let mut newest = None;
 			while let Some((stamp, due)) = track.nth(track.made) {
 				if due > now {
 					break;
 				}
-				out.push((index, stamp));
+				match track.kind {
+					Kind::Marks => newest = Some(stamp),
+					_ => out.push((index, stamp)),
+				}
 				track.made += 1;
+			}
+			if let Some(stamp) = newest {
+				track.marking = true;
+				out.push((index, stamp));
 			}
 		}
 		out
 	}
 
-	/// When the next still of any track is due.
-	pub fn next(&self) -> Option<Instant> {
+	/// When the next still of any track is due, as [`Self::due`] counts it.
+	pub fn next(&self, holding: bool) -> Option<Instant> {
 		self.tracks
 			.iter()
+			.filter(|track| track.due(holding))
 			.filter_map(|track| Some(track.nth(track.made)?.1))
 			.min()
 	}
@@ -206,11 +300,12 @@ impl Stills {
 	/// publisher's landing at decode time `next`: a picture's every
 	/// [`INTERVAL`] that ends before it, a sound's silent frames up to where
 	/// the next frame starts. Nothing when the track's last packet was the
-	/// publisher's own. Each one returned is counted as handed on.
+	/// publisher's own, and nothing for marks, which the packet stands in
+	/// for. Each one returned is counted as handed on.
 	pub fn bridge(&mut self, track: usize, next: i64) -> Vec<Stamp> {
 		let track = &mut self.tracks[track];
 		let mut out = Vec::new();
-		if track.made == 0 {
+		if track.made == 0 || track.kind == Kind::Marks {
 			return out;
 		}
 		while let Some((stamp, _)) = track.nth(track.made) {
@@ -342,8 +437,8 @@ mod tests {
 	fn a_picture_repeats_every_interval_and_the_sound_follows_on_without_a_hole() {
 		let at = Instant::now();
 		let mut stills = running(at);
-		assert!(stills.due(at).is_empty(), "nothing is due at once");
-		let due = stills.due(at + Duration::from_secs(1));
+		assert!(stills.due(at, true).is_empty(), "nothing is due at once");
+		let due = stills.due(at + Duration::from_secs(1), true);
 		let pictures: Vec<i64> = due
 			.iter()
 			.filter(|(track, _)| *track == 0)
@@ -369,7 +464,7 @@ mod tests {
 		}
 		assert!(
 			due.iter().all(|(track, _)| *track != 2),
-			"a data track gets nothing"
+			"a track with no stills gets nothing"
 		);
 		assert!(stills.after_still(0) && stills.after_still(1));
 	}
@@ -381,7 +476,7 @@ mod tests {
 		let mut count = 0;
 		for tenth in 1..=100 {
 			count += stills
-				.due(at + Duration::from_millis(tenth * 100))
+				.due(at + Duration::from_millis(tenth * 100), true)
 				.iter()
 				.filter(|(track, _)| *track == 0)
 				.count();
@@ -389,7 +484,7 @@ mod tests {
 		assert_eq!(count, 20, "ten seconds of pictures every 500 ms");
 		// The sound's next frame, the 469th after the one that went out, is
 		// what comes next.
-		let next = stills.next().expect("a still to come");
+		let next = stills.next(true).expect("a still to come");
 		let sound = micros(469 * 1024, AUDIO) as u64;
 		assert_eq!(next, at + Duration::from_micros(sound));
 	}
@@ -399,9 +494,9 @@ mod tests {
 		let at = Instant::now();
 		let mut stills = Stills::new([(VIDEO, Kind::Picture)]);
 		stills.handed_on(0, stamp(3000, 3000), false, at);
-		assert!(stills.due(at + Duration::from_secs(5)).is_empty());
+		assert!(stills.due(at + Duration::from_secs(5), true).is_empty());
 		stills.handed_on(0, stamp(6000, 3000), true, at);
-		assert_eq!(stills.due(at + Duration::from_secs(1)).len(), 2);
+		assert_eq!(stills.due(at + Duration::from_secs(1), true).len(), 2);
 	}
 
 	#[test]
@@ -421,7 +516,7 @@ mod tests {
 			at,
 		);
 		stills.handed_on(0, stamp(33_333, 0), false, at);
-		let due = stills.due(at + INTERVAL);
+		let due = stills.due(at + INTERVAL, true);
 		assert_eq!(due.len(), 1);
 		assert_eq!(due[0].1.dts, 533_333);
 		assert_eq!(due[0].1.pts, 533_333 + 66_667);
@@ -433,7 +528,7 @@ mod tests {
 		let at = Instant::now();
 		let mut stills = Stills::new([(90_000, Kind::Sound { rate: 44_100 })]);
 		stills.handed_on(0, stamp(0, 2090), true, at);
-		let due = stills.due(at + Duration::from_secs(10));
+		let due = stills.due(at + Duration::from_secs(10), true);
 		for (a, b) in due.iter().zip(&due[1..]) {
 			assert_eq!(a.1.dts + a.1.duration, b.1.dts);
 		}
@@ -448,7 +543,7 @@ mod tests {
 	fn the_bridge_fills_to_within_an_interval_and_a_frame() {
 		let at = Instant::now();
 		let mut stills = running(at);
-		stills.due(at + Duration::from_secs(2));
+		stills.due(at + Duration::from_secs(2), true);
 		// The publisher's picture lands 1.7 s after the last still.
 		let picture = stills.bridge(0, 10 * 90_000 + 4 * 45_000 + 153_000);
 		assert_eq!(picture.len(), 3, "{picture:?}");
@@ -474,6 +569,115 @@ mod tests {
 		let mut stills = running(at);
 		assert!(stills.bridge(0, 20 * 90_000).is_empty());
 		assert!(stills.bridge(1, 20 * 48_000).is_empty());
+	}
+
+	/// A picture and a text track in milliseconds, each with one packet
+	/// handed on at `at`: the picture a sync sample at 10 s, the text a
+	/// sample ending at 7 s, the text track running 3 s behind.
+	fn captioned(at: Instant) -> Stills {
+		let mut stills = Stills::new([(VIDEO, Kind::Picture), (1000, Kind::Marks)]);
+		stills.handed_on(0, stamp(10 * VIDEO as i64, 3000), true, at);
+		stills.handed_on(1, stamp(7000, 0), true, at);
+		stills
+	}
+
+	fn marks(due: &[(usize, Stamp)]) -> Vec<i64> {
+		due.iter()
+			.filter(|(track, _)| *track == 1)
+			.map(|(_, stamp)| stamp.pts)
+			.collect()
+	}
+
+	#[test]
+	fn a_text_track_marks_its_progress_at_the_stills_pace_the_newest_mark_alone() {
+		let at = Instant::now();
+		let mut stills = captioned(at);
+		assert!(stills.due(at, true).is_empty());
+		assert_eq!(marks(&stills.due(at + INTERVAL, true)), vec![7500]);
+		// A pull that comes 1.2 s late hands on one mark, where the track's
+		// timeline has got, not the three it passed.
+		let due = stills.due(at + Duration::from_millis(1700), true);
+		assert_eq!(marks(&due), vec![8500]);
+		let mark = due.iter().find(|(track, _)| *track == 1).expect("a mark").1;
+		assert_eq!((mark.dts, mark.duration), (8500, 0));
+		// The pictures went out as ever, one for every interval.
+		assert_eq!(due.iter().filter(|(track, _)| *track == 0).count(), 2);
+		assert_eq!(
+			stills.next(true),
+			Some(at + Duration::from_millis(2000)),
+			"the next picture and the next mark"
+		);
+	}
+
+	#[test]
+	fn a_row_let_out_late_behind_the_marks_moves_them_nowhere() {
+		let at = Instant::now();
+		let mut stills = captioned(at);
+		assert_eq!(marks(&stills.due(at + Duration::from_secs(1), true)), vec![8000]);
+		// A row of the publisher that went, let out behind where the marks
+		// carry on from, leaves them where they were.
+		stills.handed_on(1, stamp(6500, 0), true, at + Duration::from_secs(1));
+		assert_eq!(
+			marks(&stills.due(at + Duration::from_millis(1500), true)),
+			vec![8500]
+		);
+		// The track's own next row is where they carry on from.
+		stills.handed_on(1, stamp(9000, 0), true, at + Duration::from_millis(1600));
+		assert_eq!(
+			marks(&stills.due(at + Duration::from_millis(2100), true)),
+			vec![9500]
+		);
+		assert!(stills.bridge(1, 20_000).is_empty(), "marks bridge nothing");
+	}
+
+	#[test]
+	fn marks_go_on_past_the_stills_until_the_track_hands_on_its_own_row() {
+		let at = Instant::now();
+		let mut stills = captioned(at);
+		assert_eq!(marks(&stills.due(at + Duration::from_secs(1), true)), vec![8000]);
+		// The publisher is back: the stills stop, the marks do not.
+		let due = stills.due(at + Duration::from_secs(3), false);
+		assert_eq!(marks(&due), vec![10_000]);
+		assert!(due.iter().all(|(track, _)| *track == 1), "{due:?}");
+		assert_eq!(stills.next(false), Some(at + Duration::from_millis(3500)));
+		// The track's own next row is where they end.
+		stills.handed_on(1, stamp(10_200, 0), true, at + Duration::from_millis(3600));
+		assert!(stills.due(at + Duration::from_secs(9), false).is_empty());
+		assert_eq!(stills.next(false), None);
+	}
+
+	#[test]
+	fn marks_carry_on_from_the_next_publishers_first_media_when_it_is_past_them() {
+		let at = Instant::now();
+		let mut stills = captioned(at);
+		stills.due(at + Duration::from_secs(2), true);
+		// The next publisher's first picture lands at 12.5 s, past the marks'
+		// 9 s: they go on from it, the first at once.
+		let back = at + Duration::from_secs(2);
+		stills.media_went_on(0, stamp(12 * VIDEO as i64 + 45_000, 3000), back);
+		assert_eq!(marks(&stills.due(back, false)), vec![12_500]);
+		assert_eq!(
+			marks(&stills.due(back + Duration::from_millis(500), false)),
+			vec![13_000]
+		);
+		// Media behind them moves them nowhere.
+		stills.media_went_on(0, stamp(5 * VIDEO as i64, 3000), back + INTERVAL);
+		assert_eq!(
+			marks(&stills.due(back + Duration::from_secs(1), false)),
+			vec![13_500]
+		);
+		// Nor does media while no mark is going out.
+		let mut quiet = captioned(at);
+		quiet.media_went_on(0, stamp(20 * VIDEO as i64, 3000), at);
+		assert!(quiet.due(at + Duration::from_secs(1), false).is_empty());
+	}
+
+	#[test]
+	fn no_marks_before_the_track_has_a_packet() {
+		let at = Instant::now();
+		let mut stills = Stills::new([(1000, Kind::Marks)]);
+		assert!(stills.due(at + Duration::from_secs(5), true).is_empty());
+		assert_eq!(stills.next(true), None);
 	}
 
 	#[test]

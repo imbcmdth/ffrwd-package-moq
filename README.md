@@ -878,7 +878,14 @@ hands on:
   1024-sample frames in mono or stereo; other sound (HE-AAC, 960-sample
   frames, more channels) has no still, and the reader says so once on
   stderr when it starts.
-- for messages and cues, nothing.
+- for messages and cues, a progress mark every 500 ms: an empty
+  message, which the host never delivers as a row and which says how
+  far the port's timeline has got. A consumer that pairs the rows with
+  the picture by time, as ffrwd/cea608's `captions` pairs `cues`, waits
+  for a port's progress to pass each picture's time, so without the
+  marks it would hold the stills back until the publisher's rows came
+  again. Only the newest mark due goes out: a pull that comes late
+  hands on one mark, not one for every interval it passed.
 
 The stills start at once while the reader waits for a publisher it
 knows has gone (its tracks finished, or its broadcast dropped) or for a
@@ -909,6 +916,17 @@ sound, so after a restart the output can run ahead of the wall clock by
 up to a GOP. Whatever is left between a track's last still and the
 publisher's first packet on it is filled before that packet goes out,
 to within 500 ms on a picture and within a frame on sound.
+
+A data or text port's marks go on past the stills until the port hands
+on a row of its own. A text track runs seconds behind its picture (see
+"Publishing captions"), so the next publisher's first row comes that
+long after its first picture; a reader in a sidecar of its own writes
+its ports to the next process in time order, so without the marks that
+picture would wait there for the row. When the publisher's media goes
+on past the marks, they carry on from the earliest of it, since the
+next publisher's rows start at its own first time. A row that lands
+behind a mark goes out at the mark's time, as a message's pts never
+goes back on its port; its `start_t` and `end_t` are its own still.
 
 A publisher whose clock carried on, after a stall or after its own
 session was replaced, comes back behind the stills, which ran on in
@@ -1225,6 +1243,18 @@ sample that carries a cue, with the cue's own `start_t` each time and
 as ffrwd/cea608's `cues` or ffrwd/blitz's, has the text from the cue's
 first sample. The rows with `final` true are the cues that went in, their
 text as the track carries it, `voice` back out of its `<v>` span.
+
+Each sample ends with an empty message at the sample's end, a sample
+with nothing shown as well. The host never delivers it as a row: it is
+the port's progress, which a consumer pairing the rows with the picture
+by time waits for, and it says the track's timeline has got that far
+whether or not a cue is on screen. A reader in a sidecar of its own
+hands its ports to the next process over one connection, written in
+time order, so there the picture goes no further than the text port's
+progress either. Samples come at least once a second, so the port moves
+on at least that often, `text_hold_ms` and up to a second more behind
+the picture. With `still` at 1 the port also moves on while the
+publisher is away; see "A still while the publisher is away".
 
 A reader that joins with a cue on screen starts that cue at the sample it
 joined at. A session the relay dropped, and a publisher that started

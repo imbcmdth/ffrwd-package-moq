@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use tokio::sync::mpsc;
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"hold_ms":{"type":"integer","minimum":0,"description":"how long a hole in a track's group sequence is held open for the group that would fill it before the relay is asked for it, in milliseconds; left out, 1000 on a live join, which has given up the past already, and 30000 on a backlog join, the subscription's own latency window"},"hold_mib":{"type":"integer","minimum":1,"default":64,"description":"how much one track holds meanwhile, in MiB; 64 covers a 30s window up to about 17 Mbit/s"},"join_ms":{"type":"integer","minimum":0,"default":2000,"description":"how long a joining reader waits for a lower group sequence before it fixes its cursor on a backlog join, in milliseconds; 0 starts at the first group that arrives, and a live join never waits at all"},"reconnect_s":{"type":"integer","minimum":0,"default":60,"description":"how long a reader whose session the relay dropped keeps trying to open a new one and take its tracks up again at the live edge, in seconds; 0 ends the run on the first drop"},"restart_s":{"type":"integer","minimum":0,"default":0,"description":"how long a reader whose publisher finished its tracks waits for a publisher of the same broadcast to take it up again, in seconds; a program that starts again finishes its tracks first when its run ends. 0 ends the run when the tracks finish, as at the end of a file. A broadcast the relay dropped without its tracks finishing is waited for as long as this or reconnect_s allows, whichever is longer"},"still":{"type":["integer","boolean"],"minimum":0,"maximum":1,"default":0,"description":"1 (or true) to go on handing media on while the publisher the reader reads is away, so that a destination which closes a connection that carries nothing, an RTMP push for one, never goes without: each picture's last keyframe again every 500 ms and silent AAC frames with no hole between them, from a second after the last media, or at once while the reader waits for a publisher it knows has gone, until the publisher's media is back or the wait ends. Data and text tracks get nothing. 0, the default, hands nothing on meanwhile"},"start":{"type":"string","enum":["live","backlog"],"default":"live","description":"where to join a broadcast already running: 'live' at the publisher's newest group, starting at the first group a decoder can begin at - a keyframe group for video, any group for audio - or 'backlog' at the oldest group the relay still holds, which reads the whole cache before the first packet comes out"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"relay":{"type":"string","description":"relay URL, e.g. moqt://relay.example.net:4443 - the host by name or IP, and a path the session opens under, which is where a relay's own address carries a token: https://relay.example/<JWT>"},"broadcast":{"type":"string","description":"broadcast path on the relay"},"cert":{"type":"string","default":"","description":"a private relay's certificate, DER as hex; empty trusts the webpki roots"},"token":{"type":"string","default":"","description":"an auth token the relay demands, sent as the SETUP request path; empty sends none, and a token already in the relay URL needs none"},"hold_ms":{"type":"integer","minimum":0,"description":"how long a hole in a track's group sequence is held open for the group that would fill it before the relay is asked for it, in milliseconds; left out, 1000 on a live join, which has given up the past already, and 30000 on a backlog join, the subscription's own latency window"},"hold_mib":{"type":"integer","minimum":1,"default":64,"description":"how much one track holds meanwhile, in MiB; 64 covers a 30s window up to about 17 Mbit/s"},"join_ms":{"type":"integer","minimum":0,"default":2000,"description":"how long a joining reader waits for a lower group sequence before it fixes its cursor on a backlog join, in milliseconds; 0 starts at the first group that arrives, and a live join never waits at all"},"reconnect_s":{"type":"integer","minimum":0,"default":60,"description":"how long a reader whose session the relay dropped keeps trying to open a new one and take its tracks up again at the live edge, in seconds; 0 ends the run on the first drop"},"restart_s":{"type":"integer","minimum":0,"default":0,"description":"how long a reader whose publisher finished its tracks waits for a publisher of the same broadcast to take it up again, in seconds; a program that starts again finishes its tracks first when its run ends. 0 ends the run when the tracks finish, as at the end of a file. A broadcast the relay dropped without its tracks finishing is waited for as long as this or reconnect_s allows, whichever is longer"},"still":{"type":["integer","boolean"],"minimum":0,"maximum":1,"default":0,"description":"1 (or true) to go on handing media on while the publisher the reader reads is away, so that a destination which closes a connection that carries nothing, an RTMP push for one, never goes without: each picture's last keyframe again every 500 ms and silent AAC frames with no hole between them, from a second after the last media, or at once while the reader waits for a publisher it knows has gone, until the publisher's media is back or the wait ends. Data and text ports get an empty message every 500 ms, which says how far their timeline has got, until they hand on a row of their own. 0, the default, hands nothing on meanwhile"},"start":{"type":"string","enum":["live","backlog"],"default":"live","description":"where to join a broadcast already running: 'live' at the publisher's newest group, starting at the first group a decoder can begin at - a keyframe group for video, any group for audio - or 'backlog' at the oldest group the relay still holds, which reads the whole cache before the first packet comes out"}},"required":["relay","broadcast"],"additionalProperties":false}"#;
 
 /// How long the relay gets to announce the broadcast, and then to hand
 /// over its catalog, before the call gives up.
@@ -538,13 +538,17 @@ impl Stage {
 }
 
 /// The stills a reader hands on while its publisher is away, when the query
-/// asks for them (`still`): each picture's last sync sample again, and
-/// silent sound. They go out while the reader waits for a publisher it
-/// knows has gone, and once it has heard no media for [`still::QUIET`],
-/// which is all a publisher lost outright says until the relay times it
-/// out. They stop when the publisher's media comes again. When and with
-/// what timestamps is [`moq_core::still`]'s; the timeline places the
-/// publisher's media after them (see [`Timeline::still`]).
+/// asks for them (`still`): each picture's last sync sample again, silent
+/// sound, and progress marks on the data and text ports. They go out while
+/// the reader waits for a publisher it knows has gone, and once it has
+/// heard no media for [`still::QUIET`], which is all a publisher lost
+/// outright says until the relay times it out. They stop when the
+/// publisher's media comes again, and a data or text port's marks when it
+/// hands on a row of its own. When and with what timestamps is
+/// [`moq_core::still`]'s; the timeline places the publisher's media after
+/// the stills (see [`Timeline::still`]). Marks do not pass through the
+/// timeline; a packet that lands behind one goes out at the mark's time,
+/// since a port's times never go back.
 struct Holding {
 	stills: Stills,
 	/// Each picture's last sync sample, the bytes its stills carry.
@@ -585,7 +589,7 @@ impl Holding {
 		let mut silent = Vec::with_capacity(renditions.len());
 		for rendition in renditions {
 			let (kind, frame) = match rendition.kind {
-				_ if !rendition.media() => (still::Kind::Nothing, None),
+				_ if !rendition.media() => (still::Kind::Marks, None),
 				moq_core::catalog::Kind::Video { .. } => (still::Kind::Picture, None),
 				moq_core::catalog::Kind::Audio { sample_rate, .. } => {
 					match still::silent_aac(&rendition.entry.config) {
@@ -623,23 +627,25 @@ impl Holding {
 		}
 	}
 
-	/// The still of `track` at `stamp`, counted in the spell.
+	/// The still of `track` at `stamp`, a picture or sound counted in the
+	/// spell, and a mark an empty message.
 	fn packet(&mut self, track: usize, stamp: Stamp) -> Packet {
-		let picture = self.stills.kind(track) == still::Kind::Picture;
-		if let Some(spell) = self.spell.as_mut() {
-			match picture {
-				true => spell.pictures += 1,
-				false => spell.frames += 1,
+		let kind = self.stills.kind(track);
+		if let (Some(spell), false) = (self.spell.as_mut(), kind == still::Kind::Marks) {
+			match kind {
+				still::Kind::Picture => spell.pictures += 1,
+				_ => spell.frames += 1,
 			}
 		}
-		let data = match picture {
-			true => self.sync[track].clone().unwrap_or_default(),
-			false => self.silent[track].unwrap_or_default().to_vec(),
+		let data = match kind {
+			still::Kind::Picture => self.sync[track].clone().unwrap_or_default(),
+			still::Kind::Marks => Vec::new(),
+			_ => self.silent[track].unwrap_or_default().to_vec(),
 		};
 		Packet {
 			pts: stamp.pts,
 			dts: Some(stamp.dts),
-			duration: Some(stamp.duration),
+			duration: Some(stamp.duration).filter(|ticks| *ticks > 0),
 			keyframe: true,
 			data,
 		}
@@ -1336,21 +1342,23 @@ impl Reader {
 				.is_some_and(|heard| now.saturating_duration_since(heard) >= still::QUIET)
 	}
 
-	/// The stills due, onto their pads, while the reader holds them; see
-	/// [`Holding`]. True when any went out.
+	/// The stills due, onto their pads, while the reader holds them, and the
+	/// marks a data or text port goes on with after them; see [`Holding`].
+	/// True when any went out.
 	fn hand_on_stills(&mut self, pads: &mut [Vec<Packet>]) -> bool {
 		let now = Instant::now();
-		if !self.holds(now) {
-			return false;
-		}
+		let holds = self.holds(now);
 		let Some(holding) = self.holding.as_mut() else {
 			return false;
 		};
-		let due = holding.stills.due(now);
+		let due = holding.stills.due(now, holds);
 		if due.is_empty() {
 			return false;
 		}
-		if holding.spell.is_none() {
+		let media = due
+			.iter()
+			.any(|(index, _)| holding.stills.kind(*index) != still::Kind::Marks);
+		if media && holding.spell.is_none() {
 			let why = match self.wait.as_ref() {
 				Some(wait) => wait.why.clone(),
 				None => {
@@ -1368,21 +1376,23 @@ impl Reader {
 			});
 		}
 		for (index, stamp) in due {
-			let picture = holding.stills.kind(index) == still::Kind::Picture;
-			self.timeline.still(index, stamp, picture);
+			match holding.stills.kind(index) {
+				still::Kind::Marks => {}
+				kind => self.timeline.still(index, stamp, kind == still::Kind::Picture),
+			}
 			pads[index].push(holding.packet(index, stamp));
 		}
 		true
 	}
 
 	/// How long a pull with nothing to hand on waits before it looks again:
-	/// a tick, or less when a still falls due sooner.
+	/// a tick, or less when a still or a mark falls due sooner.
 	fn slice(&self) -> Duration {
 		let now = Instant::now();
 		match self.holding.as_ref() {
-			Some(holding) if self.holds(now) => holding
+			Some(holding) => holding
 				.stills
-				.next()
+				.next(self.holds(now))
 				.map_or(TICK, |next| next.saturating_duration_since(now).min(TICK)),
 			_ => TICK,
 		}
@@ -2000,14 +2010,34 @@ impl Reader {
 		}
 		let out = self.timeline.take_ready();
 		let any = !out.is_empty();
+		// The publisher's media going on after a still: the data and text
+		// ports' marks carry on from the earliest of it.
+		if let Some(holding) = self.holding.as_mut() {
+			let first = out
+				.iter()
+				.filter(|(index, _, _)| {
+					holding.stills.kind(*index) != still::Kind::Marks
+						&& holding.stills.after_still(*index)
+				})
+				.min_by_key(|(index, stamp, _)| {
+					ffrwd_bmff::time::rescale(
+						stamp.pts.min(stamp.dts),
+						u64::from(self.renditions[*index].timescale()),
+						1_000_000,
+					)
+				});
+			if let Some((index, stamp, _)) = first {
+				holding.stills.media_went_on(*index, *stamp, now);
+			}
+		}
 		// Whether the publisher's media went on here, which ends a spell of
 		// stills.
 		let mut went_on = false;
 		for (index, stamp, mut packet) in out {
 			// A cue row carries its times inside it as well, and they move
-			// with the shift its pts gets.
+			// with the shift its pts gets. A progress mark carries nothing.
 			if let Body::Text { track, .. } = &self.renditions[index].body {
-				if stamp.pts != packet.pts {
+				if stamp.pts != packet.pts && !packet.data.is_empty() {
 					let seconds = (stamp.pts - packet.pts) as f64 / f64::from(track.timescale.max(1));
 					packet.data = moq_core::text::shifted(&packet.data, seconds)?;
 				}
@@ -2244,6 +2274,9 @@ fn take_legacy(
 /// One text fragment's cue rows onto a pad: each sample's cues, followed
 /// from the samples before it, as the rows [`moq_core::text::Reassembly`]
 /// makes of them, each at the time it applies in the track's own ticks.
+/// Each sample ends with an empty message at its end, a sample with nothing
+/// shown as well, which a consumer pairing the rows by time reads as how
+/// far the track has got.
 fn take_text(
 	rendition: &mut Rendition,
 	index: usize,
@@ -2265,8 +2298,16 @@ fn take_text(
 			.map_err(|err| format!("track {index}, group {}: {err}", frame.group))?;
 		for row in cues.sample(sample.pts, sample.duration, shown) {
 			pad.push(text_packet(&row, timescale));
-			any = true;
 		}
+		let end = sample.pts + sample.duration.max(0);
+		pad.push(Packet {
+			pts: end,
+			dts: Some(end),
+			duration: None,
+			keyframe: true,
+			data: Vec::new(),
+		});
+		any = true;
 	}
 	Ok(any)
 }

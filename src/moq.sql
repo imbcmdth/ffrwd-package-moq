@@ -127,7 +127,10 @@ RETURNS sink
 -- one, times in seconds, time base 1/1000. A cue comes out as a streaming
 -- transcriber writes one: a row with final false for each sample that
 -- carries it, its own start_t each time, and a row with final true at its
--- end. The rows with final true are the cues that went in.
+-- end. The rows with final true are the cues that went in. Each sample
+-- ends with an empty message at its end, a sample with nothing shown as
+-- well, which a consumer pairing the rows with the picture by time reads
+-- as how far the track has got; it is never delivered as a row.
 --
 -- The catalog is read at compile time, so the broadcast must be on
 -- the relay before the query compiles. Each rendition's init segment
@@ -217,13 +220,17 @@ RETURNS sink
 -- media lands on the same connection. With still at 1 each picture's
 -- last keyframe goes out again every 500 ms under new timestamps, the
 -- same bytes, and AAC-LC sound in mono or stereo gets silent frames with
--- no hole between them; other sound, messages and cues get nothing. The
--- stills start a second after the last media, or at once while the
--- reader waits for a publisher it knows has gone, and carry on from each
--- track's last packet at the pace of the wall clock. They stop when the
--- publisher's media comes again, which lands after them on every track
--- under one shift, or when the wait for it ends. A row with kind
--- 'restart' says how long the still was held across the gap.
+-- no hole between them; other sound gets nothing. A data or text port
+-- gets an empty message every 500 ms, which says how far its timeline
+-- has got and is never delivered as a row, so a consumer pairing its rows
+-- with the picture goes on with the stills. The stills start a second
+-- after the last media, or at once while the reader waits for a
+-- publisher it knows has gone, and carry on from each track's last
+-- packet at the pace of the wall clock. They stop when the publisher's
+-- media comes again, which lands after them on every track under one
+-- shift, or when the wait for it ends; a data or text port's marks go
+-- on until the port hands on a row of its own. A row with kind 'restart'
+-- says how long the still was held across the gap.
 CREATE FUNCTION subscribe(relay text, broadcast text,
                           cert text DEFAULT '', token text DEFAULT '',
                           start text DEFAULT 'live',
